@@ -106,6 +106,8 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 ## Release model
 
+The selected owner source explicitly declares its compiled E2E helper inventory in `release/helper-inputs.json`. The current inventory is empty. Future helpers and their build recipe belong in this owner declaration; aggregate packaging discovers them without a platform filename list.
+
 Build from the selected source with the component Makefile. `release.sh package`
 uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
 it collects materials and creates the bundle without rebuilding those binaries
