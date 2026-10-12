@@ -100,6 +100,7 @@ type checkedReader struct {
 	ctx      context.Context
 	r        io.Reader
 	h        hash.Hash
+	skipHash bool // plain layers reuse the compressed stream hash
 	n, limit int64
 	label    string
 	err      error
@@ -124,7 +125,9 @@ func (r *checkedReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.r.Read(p)
 	if n > 0 {
-		r.h.Write(p[:n])
+		if !r.skipHash {
+			r.h.Write(p[:n])
+		}
 		if int64(n) > left {
 			r.err = fmt.Errorf("flatten: %s byte limit exceeded", r.label)
 			return n, r.err
@@ -209,6 +212,12 @@ func openLayer(ctx context.Context, in LayerInput, limits LayerLimits) (_ *layer
 		decoder, s.decoderClose = z, func() error { z.Close(); return nil }
 	}
 	s.decoded = &checkedReader{ctx: ctx, r: decoder, h: sha256.New(), limit: limits.DecodedBytes, label: "decoded layer"}
+	if decoder == s.compressed {
+		// With an explicit plain-tar media type both identities cover exactly
+		// the same bytes. Retain independent limits, counts and identity checks
+		// while computing their SHA-256 once. Encoded layers keep two hashes.
+		s.decoded.h, s.decoded.skipHash = s.compressed.h, true
+	}
 	return s, nil
 }
 
