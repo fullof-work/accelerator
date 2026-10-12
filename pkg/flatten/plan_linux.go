@@ -465,7 +465,14 @@ func (p *erofsPlan) chunk(ctx context.Context, rec chunkRecord) ([]byte, error) 
 		}
 		p.currentID, p.dataValid = 0, 0
 		var err error
-		p.current, err = p.root.Open(f.name)
+		// A replaced FIFO must not block source opening outside cancellation.
+		// Avoid dirtying source atime where permitted; non-owners still retain
+		// normal read access. Identity and SHA-256 checks are unchanged.
+		flags := os.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK
+		p.current, err = p.root.OpenFile(f.name, flags|unix.O_NOATIME, 0)
+		if errors.Is(err, unix.EPERM) {
+			p.current, err = p.root.OpenFile(f.name, flags, 0)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("flatten: open planned source %q: %w", f.name, err)
 		}

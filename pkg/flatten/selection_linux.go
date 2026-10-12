@@ -108,11 +108,13 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 	}
 	h.Write([]byte(rel))
 	h.Write([]byte{0})
-	for _, n := range []uint64{id.dev, id.ino, id.size, id.nlink, uint64(id.mtime), uint64(id.ctime), uint64(id.mtimeNS), uint64(id.ctimeNS), uint64(id.mode), uint64(id.uid), uint64(id.gid), uint64(st.Rdev)} {
-		var b [8]byte
-		binary.LittleEndian.PutUint64(b[:], n)
-		h.Write(b[:])
+	// Serialize the same identity once, avoiding twelve tiny hash writes and
+	// escaping buffers per inode on wide source trees.
+	var encoded [12 * 8]byte
+	for i, n := range [...]uint64{id.dev, id.ino, id.size, id.nlink, uint64(id.mtime), uint64(id.ctime), uint64(id.mtimeNS), uint64(id.ctimeNS), uint64(id.mode), uint64(id.uid), uint64(id.gid), uint64(st.Rdev)} {
+		binary.LittleEndian.PutUint64(encoded[i*8:], n)
 	}
+	h.Write(encoded[:])
 	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
 		target, err := os.Readlink(name)
 		if err != nil {
