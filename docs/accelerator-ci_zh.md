@@ -107,3 +107,39 @@ sudo unshare --mount --propagation private env \
 Builder 测试入口，以精确 source/artifact set 验证。接收工件字节与 scratch 分开记录，
 计入索引/decoder 内存及自有资源退出清理。包级测试或上述挂载夹具不能替代真实 VM
 证据。
+
+### 同条件展平测量
+
+`test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
+artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch
+实际分配块/inode、已删除但仍打开的文件，并等待自有生产进程组退出后清理 scratch。
+接收 artifact P 与可选 fsync 分开计量。部分宿主不提供 child rusage I/O 计数；
+采样 RSS 与块峰值受记录的采样间隔限制。
+
+在相同 CPU、内存、存储和缓存条件下，对比原实现、正确 applier 加旧 mkfs，以及 Plan。
+中间对照仅在独立的所选 accelerator 源码副本上应用
+`test/fixtures/flatten-old-layout.patch`，使用相同的所选 guest CLI，以及包含 exact-read
+修复的旧维护版 mkfs 构建。构建记录须包含全部 source commit 和补丁摘要。该补丁只作
+测量夹具，正常产品构建使用 Plan 路径。
+
+在既有 Workbench 中使用 Python 3.11 或更新版本。输入、scratch parent 与 output root
+须互不包含，output root 须不存在。Registry 输入必须固定 SHA-256 digest。提供按相对
+路径索引的预期内容 JSON：每项包含 `type`、`mode`、`uid`、`gid`，文件另含
+`size`/`sha256`，符号链接含 `target`，特殊文件含 `device`。每个首次出现的 artifact
+身份都经所选 native fsck 提取，核验实际内容和元数据；额外提取在测量区间外执行。
+
+```bash
+python3 test/scripts/bench_flatten.py \
+  --variant baseline,baseline/flatten-ctl,baseline/mkfs.erofs \
+  --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
+  --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
+  --input fixtures/image.tar --expected fixtures/expected.json \
+  --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
+  --scratch-parent scratch --output-root results --trials 3 --fsync
+```
+
+正常语义夹具在不同实现间必须具有相同 artifact 身份。低/高重复、多层覆盖、小文件、
+受限网络与显式缓存分别使用固定夹具。通过 `--config` 使用持久缓存时，其占用与
+生命周期另计，不视作临时 scratch。全链耗时包含并行重叠工作，不简单相加重叠阶段。
+这些宿主测量不能证明 Guest ext4 或 Host COW 峰值；后两项须在实际 Guest/Builder
+链路中计量，并覆盖接收端和自有资源清理。

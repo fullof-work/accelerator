@@ -123,3 +123,47 @@ matched end-to-end performance require the existing prepared-product and Builder
 test paths with the exact source/artifact set. Record receiving artifact bytes
 separately from scratch; include index/decoder memory and owned teardown. Package
 tests or these mount fixtures do not replace real VM evidence.
+
+### Matched flatten measurements
+
+`test/scripts/bench_flatten.py` uses prebuilt native producers, a real stdout
+pipe and the current artifact reader. It alternates variant order for three
+trials by default, records executable hashes, sampled process-tree RSS, allocated
+scratch blocks/inodes and deleted-open files, and waits for the owned producer
+session before cleaning scratch. Receiving artifact P and its optional fsync are
+reported separately. Child rusage I/O counters may be unavailable on some hosts;
+sampled RSS and block peaks have the recorded sampling resolution.
+
+Compare the previous implementation, the selected correct applier with old mkfs,
+and Plan on the same CPU/memory/storage/cache conditions. For the middle control,
+apply `test/fixtures/flatten-old-layout.patch` only to an isolated copy of the
+selected accelerator source, and build it with the same selected guest CLI and
+the old maintained mkfs including the exact-read fix. Record all source commits
+and the patch digest with the build receipts. This patch is a measurement fixture;
+normal product builds use the Plan path.
+
+Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent and
+output root must be disjoint; the output root must not exist. A Registry input
+must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
+by relative path: each entry includes `type`, `mode`, `uid`, `gid`, plus file
+`size`/`sha256`, symlink `target` or special-file `device`. The first occurrence of
+each artifact identity is extracted with the selected native fsck, and its actual
+contents and metadata must match. This extra extraction is outside measurement.
+
+```bash
+python3 test/scripts/bench_flatten.py \
+  --variant baseline,baseline/flatten-ctl,baseline/mkfs.erofs \
+  --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
+  --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
+  --input fixtures/image.tar --expected fixtures/expected.json \
+  --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
+  --scratch-parent scratch --output-root results --trials 3 --fsync
+```
+
+Normal-corpus artifact identities must match across variants. Cover low/high
+repetition, layer overwrites, small files, constrained network and explicit cache
+as separate fixed fixtures. Record persistent cache occupancy/lifetime separately
+when supplying `--config`; it is never temporary scratch. End-to-end elapsed time
+includes overlapped work; do not add overlapping stage durations. These host
+measurements do not establish Guest ext4 or Host COW peaks. Measure those through
+the real Guest/Builder path, including the receiver and owned teardown.

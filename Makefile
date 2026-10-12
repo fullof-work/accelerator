@@ -170,6 +170,7 @@ test-e2e-scripts:
 	bash test/scripts/test_port_lease.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_cache.py
+	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_bench_flatten.py
 
 VERSION ?= v0.1.0
 
