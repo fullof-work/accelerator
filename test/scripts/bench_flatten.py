@@ -22,27 +22,36 @@ import time
 
 
 def process_tree(root):
+    # Minimal Guest/host kernels need not expose task/TID/children. Build the
+    # descendant set from procfs PPIDs instead of silently missing subprocesses.
+    rows, children = {}, {}
+    page_size = os.sysconf('SC_PAGE_SIZE')
+    for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = path.read_text().rsplit(') ', 1)[1].split()
+            pid, parent = int(path.parent.name), int(fields[1])
+            rows[pid] = int(fields[21]) * page_size
+            children.setdefault(parent, []).append(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
     pending, result, seen = [root], [], set()
     while pending:
         pid = pending.pop()
         if pid in seen:
             continue
         seen.add(pid)
-        try:
-            base = pathlib.Path('/proc') / str(pid)
-            stat = (base / 'stat').read_text().split(') ', 1)[1].split()
-            result.append((pid, int(stat[21]) * os.sysconf('SC_PAGE_SIZE')))
-            for task in (base / 'task').iterdir():
-                pending.extend(int(p) for p in (task / 'children').read_text().split())
-        except (FileNotFoundError, ProcessLookupError):
-            pass
-    return list(dict(result).items())
+        if pid in rows:
+            result.append((pid, rows[pid]))
+            pending.extend(children.get(pid, []))
+    return result
 
 
 def scratch_usage(scratch, processes):
     objects = {}
-    for directory, _, files in os.walk(scratch):
-        for name in ['.', *files]:
+    for directory, directories, files in os.walk(scratch):
+        # os.walk lists symlinked directories but does not descend into them.
+        links = [name for name in directories if (pathlib.Path(directory) / name).is_symlink()]
+        for name in ['.', *files, *links]:
             try:
                 st = (pathlib.Path(directory) / name).lstat()
                 objects[(st.st_dev, st.st_ino)] = (st.st_blocks * 512, False)

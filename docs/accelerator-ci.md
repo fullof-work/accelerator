@@ -137,7 +137,8 @@ ends before the artifact writer can emit its header. Child rusage I/O counters m
 sampled RSS and block peaks have the recorded sampling resolution.
 
 Walking a wide tree for block/inode samples can perturb the pipe receiver and
-source I/O. Pair the resource pass with `--timing-only` under the same resource,
+source I/O. Process enumeration follows procfs parent PIDs and does not require
+the optional per-task `children` interface. Pair the resource pass with `--timing-only` under the same resource,
 storage and cache conditions to measure that effect. Timing-only results keep
 identity/content checks, child CPU/I/O accounting and owned teardown, but record
 sampled peaks and the sampling interval as null. Retain both results; a timing

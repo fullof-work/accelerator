@@ -8,9 +8,24 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+import bench_flatten
 
 
 class BenchmarkLifecycle(unittest.TestCase):
+    def test_scratch_counts_symlink_directories_and_deduplicates_hardlinks(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root = pathlib.Path(directory)
+            (root/'directory').mkdir()
+            (root/'payload').write_bytes(b'payload')
+            (root/'alias').symlink_to('directory', target_is_directory=True)
+            os.link(root/'payload', root/'hardlink')
+            measured = bench_flatten.scratch_usage(root, [])
+            self.assertEqual(measured['scratch_inodes'], 4)
+            self.assertEqual(measured['scratch_blocks'], sum(path.lstat().st_blocks*512 for path in
+                             [root, root/'directory', root/'payload', root/'alias']))
+
     def test_cancel_joins_background_writer_and_preserves_unrelated_process(self):
         self.cancel_measurement(False)
 
@@ -59,6 +74,18 @@ with (scratch/'active').open('wb') as out:
                         self.fail('measurement fixture did not become ready')
                     time.sleep(0.02)
                 pids = [int(value) for value in (root/'writers').read_text().split()]
+                # Even without task/children, collect the live producer and
+                # its actual subprocess. This caught undercounting on the
+                # maintained Guest kernel; no synthetic process tree is used.
+                original_read = pathlib.Path.read_text
+                def without_children(path, *args, **kwargs):
+                    if path.name == 'children':
+                        raise FileNotFoundError(path)
+                    return original_read(path, *args, **kwargs)
+                with mock.patch.object(pathlib.Path, 'read_text', without_children):
+                    observed = dict(bench_flatten.process_tree(pids[0]))
+                self.assertTrue(set(pids).issubset(observed), observed)
+                self.assertTrue(all(observed[pid] > 0 for pid in pids), observed)
                 harness.send_signal(signal.SIGTERM)
                 _, errors = harness.communicate(timeout=20)
                 self.assertNotEqual(harness.returncode, 0, errors)
