@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
+
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -27,9 +29,10 @@ import (
 // HMAC; id is the accelerator manifest content key; valid_at records the import
 // time and an optional expiry.
 const (
-	AnnOwner   = "vnd.kuasar.flatten-manifest.owner"
-	AnnID      = "vnd.kuasar.flatten-manifest.id"
-	AnnValidAt = "vnd.kuasar.flatten-manifest.valid_at"
+	AnnOwner      = "vnd.kuasar.flatten-manifest.owner"
+	AnnID         = "vnd.kuasar.flatten-manifest.id"
+	AnnValidAt    = "vnd.kuasar.flatten-manifest.valid_at"
+	AnnConversion = "vnd.kuasar.flatten-manifest.conversion"
 )
 
 // The OCI 1.1 "empty descriptor" layer carried by the referrer artifact: the
@@ -76,7 +79,8 @@ func (o Owner) ownerValue(customerKey []byte) string { return o.OwnerValue(custo
 
 // FindReferrer looks for a flatten-manifest referrer on the subject image
 // whose owner matches this owner (HMAC over customerKey) and whose valid_at
-// has not expired. On a match it returns the stored manifest id and ok=true,
+// has not expired and whose conversion semantics match this generator. On a
+// match it returns the stored manifest id and ok=true,
 // letting the caller skip pull + flatten + upload entirely. No matching
 // referrer yields ok=false, nil. Lookup/transport failures are returned so the
 // caller can decide (typically warn and fall back to a full export).
@@ -143,7 +147,7 @@ func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 				continue // unreadable / not an image manifest — skip
 			}
 		}
-		if anns[AnnOwner] != ownerValue {
+		if anns[AnnOwner] != ownerValue || anns[AnnConversion] != image.ConversionSemantics {
 			continue
 		}
 		imported, valid := parseValidAt(anns[AnnValidAt], now)
@@ -237,6 +241,8 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 
 // PutReferrerByOwner writes a flatten-manifest referrer using a precomputed
 // owner annotation value. This keeps manifest customer keys out of build guests.
+// id must have been produced by the generator with image.ConversionSemantics;
+// callers must check the actual generator, rather than label old artifacts.
 func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, ownerValue string) error {
 	if strings.TrimSpace(ownerValue) == "" {
 		return errors.New("remote: referrer owner is empty")
@@ -249,9 +255,10 @@ func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, own
 		return err
 	}
 	anns := map[string]string{
-		AnnOwner:   ownerValue,
-		AnnID:      id,
-		AnnValidAt: validAt,
+		AnnOwner:      ownerValue,
+		AnnID:         id,
+		AnnValidAt:    validAt,
+		AnnConversion: image.ConversionSemantics,
 	}
 
 	// Subject descriptor = the platform-selected image manifest.

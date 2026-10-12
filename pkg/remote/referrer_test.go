@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1/random"
+	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
 
 func TestOwnerValueDeterministicAndKeyed(t *testing.T) {
@@ -188,6 +190,87 @@ func TestReferrerRoundTrip(t *testing.T) {
 	// A different customer key yields a different owner → no match.
 	if _, ok, _ := cfg.FindReferrer(ctx, res, bytes.Repeat([]byte{9}, 32)); ok {
 		t.Fatal("a different customer key must not match the owner")
+	}
+}
+
+func TestReferrerConversionPolicyMissAndWriteback(t *testing.T) {
+	host := startRegistry(t)
+	img, err := random.Image(512, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/test/conversion:v1"
+	pushImage(t, ref, img)
+	cfg := &Config{Insecure: true, Referer: RefererConfig{Desc: "owner"}}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := cfg.Resolve(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{7}, 32)
+	owner := cfg.refererOwner().OwnerValue(key)
+	subject, err := ggcrremote.Get(res.Digest, cfg.remoteOpts(ctx)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := strings.Repeat("1", 64)
+	for _, policy := range []string{"", "legacy-erofs-v0"} {
+		anns := map[string]string{AnnOwner: owner, AnnID: oldID, AnnValidAt: time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)}
+		if policy != "" {
+			anns[AnnConversion] = policy
+		}
+		artifact, err := referrerArtifact(anns, subject.Descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest, err := artifact.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ggcrremote.Write(res.Repo.Digest(digest.String()), artifact, cfg.remoteOpts(ctx)...); err != nil {
+			t.Fatal(err)
+		}
+		if id, hit, err := cfg.FindReferrer(ctx, res, key); err != nil || hit || id != "" {
+			t.Fatalf("accepted policy %q: %q %v %v", policy, id, hit, err)
+		}
+		// The old artifact is still present and readable by an explicit digest.
+		if _, err := ggcrremote.Get(res.Repo.Digest(digest.String()), cfg.remoteOpts(ctx)...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newID := strings.Repeat("2", 64)
+	if err := cfg.PutReferrer(ctx, res, newID, key); err != nil {
+		t.Fatal(err)
+	}
+	if id, hit, err := cfg.FindReferrer(ctx, res, key); err != nil || !hit || id != newID {
+		t.Fatalf("writeback mismatch: %q %v %v", id, hit, err)
+	}
+	idx, err := ggcrremote.Referrers(res.Digest, cfg.remoteOpts(ctx)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range im.Manifests {
+		anns, err := cfg.manifestAnnotations(ctx, res.Repo, d.Digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if anns[AnnID] == newID {
+			found = true
+			if anns[AnnConversion] != image.ConversionSemantics {
+				t.Fatal("writeback omitted actual conversion policy")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing referrer")
 	}
 }
 

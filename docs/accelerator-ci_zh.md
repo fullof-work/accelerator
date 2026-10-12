@@ -72,3 +72,38 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 发布测试使用合成 binary/link-map fixture 与模拟 API 响应。脚本测试验证 fixture
 和生命周期边界，不会完成真实 E2E 的编号断言。这些检查通过不能证明真实 RocksDB
 构建、prepared 产品 E2E 或云端资格验证已通过。
+
+## 流式展平回归覆盖
+
+运行 flatten 和 remote 测试前，先构建所选 guest-runtime 的 native 配方，并将
+`MKFS_EROFS_PATH` 指向该精确 `mkfs.erofs`。Plan 测试要求工具报告 v1 能力，
+不支持此能力的系统 mkfs 不能代替。[展平指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md)
+定义输入、源生命周期、原生计划和工件完成合同。
+
+| 要求 | 实现 | 维护中的检查及证据范围 |
+|---|---|---|
+| 固定输入身份及完整校验 | `pkg/flatten/input.go`、`layer_stream.go`；`pkg/remote/stream.go` | 层 media/size/digest/DiffID/trailer/Close 与取消用例；实际本地 Registry → umoci → Plan → pipe → 当前工件 reader。 |
+| 层文件系统语义 | `pkg/flatten/layer_apply_linux.go` | 实际 umoci 的 late whiteout/opaque、类型替换、implicit parent、链接、属性及空层；权限不足仍报错。 |
+| 原生布局与顺序输出 | Guest native patch series；`pkg/flatten/plan_linux.go` | Raw/Plan 身份及提取内容；损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾前失败。Native exact-read 注入沿用 guest-runtime 的 `test-erofs`。 |
+| 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
+| 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
+| 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及打开/已删除 FD 检查。 |
+
+最后一行包含显式启用的真实挂载测试。普通用户编译测试程序，再在新的私有 mount
+namespace 中以挂载权限仅运行这些用例。将 `TMPDIR` 设为私有测试目录，
+`MKFS_EROFS_PATH` 指向所选 native 工具；全部挂载位于测试自有路径，在删除目录前
+卸载。小容量 tmpfs 产生真实 ENOSPC，不会填满宿主文件系统。
+
+```bash
+CGO_ENABLED=0 go test -c -o /path/to/private/flatten-mount.test ./pkg/flatten
+sudo unshare --mount --propagation private env \
+  FLATTEN_TEST_MOUNTS=1 TMPDIR=/path/to/private/scratch \
+  MKFS_EROFS_PATH=/path/to/selected/mkfs.erofs \
+  /path/to/private/flatten-mount.test -test.v -test.run '^TestMounted'
+```
+
+这些测试建立本地合同。实际 runtime bundle/Guest 消费、Builder Phase A/B、静态包
+校验、Guest ext4/Host COW 峰值及相同条件的全链性能仍须通过既有 prepared 产品与
+Builder 测试入口，以精确 source/artifact set 验证。接收工件字节与 scratch 分开记录，
+计入索引/decoder 内存及自有资源退出清理。包级测试或上述挂载夹具不能替代真实 VM
+证据。

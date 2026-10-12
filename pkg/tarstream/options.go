@@ -31,6 +31,22 @@ type writeOptions struct {
 	codec        Codec
 	codecSet     bool
 	beforeCommit func(context.Context) error
+	indexMemory  uint64
+}
+
+type indexMemoryOption uint64
+
+// WithIndexMemoryLimit bounds the writer's extent indexes, sparse-map encoding,
+// metadata tail and working buffers. The budget is checked before emitting any
+// bytes. Omission preserves the existing writer behavior.
+func WithIndexMemoryLimit(bytes uint64) WriteOption { return indexMemoryOption(bytes) }
+
+func (o indexMemoryOption) applyWrite(dst *writeOptions) error {
+	if o == 0 || dst.indexMemory != 0 {
+		return fmt.Errorf("%w: invalid or duplicate index memory limit", ErrInvalidOption)
+	}
+	dst.indexMemory = uint64(o)
+	return nil
 }
 
 type beforeCommitOption struct{ check func(context.Context) error }

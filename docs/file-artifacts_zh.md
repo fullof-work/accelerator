@@ -322,6 +322,8 @@ writer 保持历史确定性 entry 名称、STORED method、时间戳和字节�
 
 ### 共享 reader/writer 与严格 profile
 
+`WithIndexMemoryLimit(bytes)` 可选地在首字节输出之前限制 writer 规划预算。它计入 2 MiB 基础开销，并为每个不连续 Data extent 计入 512 字节，以覆盖切片扩容、sparse map 编码和元数据副本。超限会在读取 payload 或写出 envelope 之前失败。此预算单独覆盖 writer 索引，不替代源、native 和 decoder 预算，也不限制调用方分配的源对象。省略此限制时保持原行为和 artifact 身份。
+
 `tarstream.WriteTo` 接受 `WithBeforeCommit(check)`，用于调用方负责的最终源校验。它在消费全部 payload 和 metadata tail 字节之后、写出 carrier digest marker、归档尾和最终加密记录之前调用一次 check。空源、全 Hole 和全 Zero 源同样执行，不依赖额外 EOF 读取。更早的读写错误会跳过 check；check 错误会保留并使 artifact 不完整。调用方须让源在返回前保持稳定且打开，失败时丢弃输出，不发布文件、上传结果或转换缓存结果。接收方同时要求完整有效的 artifact 和生产者成功结束。此校验不提供原子快照或目标持久性。未配置此选项的 writer 保持原有字节和身份；`CarrierDigest` 不消费 payload，因此拒绝此选项。
 
 `pkg/manifest/transfer.Reader` 打开选定的逻辑 source，并保留源所有权和验证能力。`transfer.Write` 接受 sparse source 与 `WriteOptions`；`BeforeCommit` 在写出 Store 根之前完成调用方源/输出校验。`manifest.RefLocations` 为 manifest-ctl 和 sandboxer 提供统一的合法 location 映射。

@@ -1,9 +1,9 @@
 // Package remote pulls OCI images straight from a registry and adapts them
 // into a flatten.Source, so flatten-ctl can flatten `repo:tag` without an
 // intermediate `docker save`. It is the single home of the
-// go-containerregistry dependency — pkg/flatten and pkg/image stay
-// stdlib-only so runtime code can read flattened-image metadata without pulling
-// registry dependencies.
+// go-containerregistry dependency. Runtime code can read flattened-image
+// metadata through pkg/image without pulling in registry or layer-application
+// dependencies.
 //
 // Responsibilities: reference resolution + platform selection (pull.go),
 // env-based credentials (auth.go), a shared OCI-layout blob cache with
@@ -52,7 +52,9 @@ type Config struct {
 	Platform string `yaml:"platform"`
 	// Insecure allows plain-HTTP / skip-TLS registries (dev / private).
 	Insecure bool `yaml:"insecure"`
-	// PullJobs bounds concurrent layer downloads. <1 → defaultPullJobs.
+	// PullJobs bounds legacy Pull's complete downloads. Streaming Prepare uses
+	// at most one future layer and Cache.InFlightBytes, with the current layer
+	// admitted first. <1 → defaultPullJobs.
 	PullJobs int           `yaml:"pull_jobs"`
 	TLS      TLSConfig     `yaml:"tls"`
 	Cache    CacheConfig   `yaml:"cache"`
@@ -66,9 +68,10 @@ type Config struct {
 	// OnPullRetry reports each outer retry, including resolve/config retries.
 	OnPullRetry func(PullRetryEvent) `yaml:"-"`
 
-	platform  v1.Platform       // parsed from Platform in normalize
-	maxSize   int64             // parsed from Cache.MaxSize (bytes; 0 = unlimited)
-	transport http.RoundTripper // built from TLS in normalize; nil = ggcr default
+	platform      v1.Platform       // parsed from Platform in normalize
+	maxSize       int64             // parsed from Cache.MaxSize (bytes; 0 = unlimited)
+	cacheInFlight int64             // maximum bytes in pending streaming cache writes
+	transport     http.RoundTripper // built from TLS in normalize; nil = ggcr default
 }
 
 // TLSConfig tunes how the HTTPS transport verifies certificates when pulling.
@@ -95,6 +98,12 @@ type CacheConfig struct {
 	// MaxSize caps the cache (human size, e.g. "10GiB"). "" → default,
 	// "0" → unlimited (prune only via `cache gc`).
 	MaxSize string `yaml:"max_size"`
+	// InFlightBytes bounds pending compressed cache data in streaming export.
+	// Empty selects 256 MiB. Larger layers bypass the cache, unless Required.
+	InFlightBytes string `yaml:"in_flight_bytes,omitempty"`
+	// Required rejects a layer that cannot fit the streaming cache budget.
+	// It requires an explicit persistent Dir; it does not affect legacy Pull.
+	Required bool `yaml:"required,omitempty"`
 }
 
 // RefererConfig configures OCI Referrers helpers. The artifact type is fixed
@@ -136,8 +145,8 @@ func (c *Config) normalize() error {
 	if c.PullJobs < 1 {
 		c.PullJobs = defaultPullJobs
 	}
-	// Cache is opt-in: an empty cache.dir means "no persistent cache". OpenCache
-	// then uses an ephemeral scratch dir under tmpdir, removed after the run.
+	// Cache is opt-in: streaming Prepare stores no compressed layers without
+	// cache.dir. Legacy Pull/OpenCache retain the complete-download contract.
 	switch c.Cache.MaxSize {
 	case "":
 		c.maxSize = defaultMaxSize
@@ -145,7 +154,10 @@ func (c *Config) normalize() error {
 		c.maxSize = 0
 	default:
 		v, err := util.ParseSize(c.Cache.MaxSize)
-		if err != nil {
+		if err != nil || v > 1<<63-1 {
+			if err == nil {
+				err = fmt.Errorf("size exceeds int64")
+			}
 			return fmt.Errorf("remote: cache.max_size: %w", err)
 		}
 		c.maxSize = int64(v)
@@ -158,6 +170,17 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("remote: platform %q: %w", c.Platform, err)
 		}
 		c.platform = *p
+	}
+	c.cacheInFlight = 256 << 20
+	if c.Cache.InFlightBytes != "" {
+		v, err := util.ParseSize(c.Cache.InFlightBytes)
+		if err != nil || v == 0 || v > 1<<63-1 {
+			return fmt.Errorf("remote: cache.in_flight_bytes must be a positive byte limit")
+		}
+		c.cacheInFlight = int64(v)
+	}
+	if c.Cache.Required && c.Cache.Dir == "" {
+		return fmt.Errorf("remote: cache.required needs an explicit cache.dir")
 	}
 	if c.Referer.Key == "" {
 		c.Referer.Key = c.Referer.Desc

@@ -42,6 +42,9 @@ func (c *Cache) scanBlobs() ([]blobInfo, int64, error) {
 		if fi.IsDir() {
 			return nil
 		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
 		if strings.HasPrefix(filepath.Base(path), ".tmp-") {
 			return nil // in-flight write, not a committed blob
 		}
@@ -117,6 +120,20 @@ func (c *Cache) evictTo(target int64) error {
 		return err
 	}
 	defer unlock()
+	if err := filepath.Walk(filepath.Join(c.dir, "blobs"), func(path string, fi os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode().IsRegular() && strings.HasPrefix(fi.Name(), ".tmp-") {
+			_, err = removeIdleBlob(path, time.Now().Add(-evictGracePeriod))
+		}
+		return err
+	}); err != nil {
+		return err
+	}
 
 	infos, total, err := c.scanBlobs()
 	if err != nil {
@@ -134,10 +151,13 @@ func (c *Cache) evictTo(target int64) error {
 		if b.mtime.After(cutoff) {
 			continue // within grace period — a concurrent pull may need it
 		}
-		if err := os.Remove(b.path); err != nil && !os.IsNotExist(err) {
+		removed, err := removeIdleBlob(b.path, cutoff)
+		if err != nil {
 			return err
 		}
-		total -= b.size
+		if removed {
+			total -= b.size
+		}
 	}
 	return nil
 }

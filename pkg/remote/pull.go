@@ -73,7 +73,7 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 	}
 	var resolved *Resolved
 	err = c.retryPull(ctx, "resolve "+ref, metadataRetryDelay, func() error {
-		desc, err := ggcrremote.Get(r, c.remoteOpts(ctx)...)
+		desc, err := ggcrremote.Get(r, c.metadataOpts(ctx)...)
 		if err != nil {
 			return err
 		}

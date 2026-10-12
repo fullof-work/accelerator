@@ -84,3 +84,42 @@ workspace and ABI contracts. Release tests use synthetic binaries/link maps and
 mocked API responses. Script tests exercise fixtures and lifecycle boundaries;
 they do not complete the numbered real E2E assertions. Passing these checks is
 not evidence of a real RocksDB build, prepared product E2E or cloud qualification.
+
+## Streaming flatten regression coverage
+
+Build the selected guest-runtime native recipe before running the flatten and
+remote suites, and set `MKFS_EROFS_PATH` to that exact `mkfs.erofs`. Plan tests
+require the reported v1 capability; a system mkfs without it is not a substitute.
+The [flatten guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md)
+defines input, source lifetime, native plan and artifact completion contracts.
+
+| Requirement | Implementation | Maintained checks and evidence scope |
+|---|---|---|
+| Fixed input identity and complete validation | `pkg/flatten/input.go`, `layer_stream.go`; `pkg/remote/stream.go` | Layer media/size/digest/DiffID/trailer/Close and cancellation cases; actual local Registry → umoci → Plan → pipe → current artifact reader. |
+| Layer filesystem semantics | `pkg/flatten/layer_apply_linux.go` | Actual umoci late whiteout/opaque, replacements, implicit parents, links, attributes and empty-layer cases; permission failures remain errors. |
+| Native layout and sequential emission | Guest native patch series; `pkg/flatten/plan_linux.go` | Raw/Plan identity and extracted contents; corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail failure. Native exact-read injection runs in guest-runtime's existing `test-erofs` target. |
+| Archive and entry-point equivalence | `pkg/flatten/archive_linux.go`, `raw_linux.go` | Seekable archive, pipe spool and directory comparisons; truncated/concatenated archive and index-budget rejection. Guest CLI tests cover file, stdout and upload/error paths. |
+| Persistent cache publication and ownership | `pkg/remote/prepare_linux.go`, `prefetch_linux.go`, cache/GC | Unverified EOF is not a hit; explicit byte budget, bypass, current-layer priority, duplicates, concurrent GC leases and joined cancellation. Conversion-policy tests retain explicit old-artifact reading while rejecting stale conversion hits. |
+| Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file preservation and open/deleted FD checks. |
+
+The last row includes opt-in real mount tests. Compile the test executable as an
+ordinary user, then run only those cases with mount privilege in a new private
+mount namespace. Set `TMPDIR` to a private test directory and `MKFS_EROFS_PATH`
+to the selected native tool; all mounts are on test-owned paths and are removed
+before their directories. The small tmpfs limits create real ENOSPC without
+filling the host filesystem.
+
+```bash
+CGO_ENABLED=0 go test -c -o /path/to/private/flatten-mount.test ./pkg/flatten
+sudo unshare --mount --propagation private env \
+  FLATTEN_TEST_MOUNTS=1 TMPDIR=/path/to/private/scratch \
+  MKFS_EROFS_PATH=/path/to/selected/mkfs.erofs \
+  /path/to/private/flatten-mount.test -test.v -test.run '^TestMounted'
+```
+
+These tests establish local contracts. Actual runtime bundle/Guest consumption,
+Builder Phase A/B, static package validation, Guest ext4/Host COW peaks and
+matched end-to-end performance require the existing prepared-product and Builder
+test paths with the exact source/artifact set. Record receiving artifact bytes
+separately from scratch; include index/decoder memory and owned teardown. Package
+tests or these mount fixtures do not replace real VM evidence.
