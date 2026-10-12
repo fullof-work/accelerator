@@ -83,6 +83,9 @@ func CarrierDigest(name string, src sparse.Source, options ...WriteOption) (stri
 	if err != nil {
 		return "", "", err
 	}
+	if opts.beforeCommit != nil {
+		return "", "", fmt.Errorf("%w: WithBeforeCommit requires WriteTo", ErrInvalidOption)
+	}
 	provider, ok := src.(IdentityProvider)
 	if !ok {
 		return "", "", fmt.Errorf("tarstream: source carrier does not provide a digest")
