@@ -184,7 +184,7 @@ def check(platform):
     assert "env" not in step and "GH_TOKEN" not in step["with"]["run"]
     assert "restore-or-build rocksdb" in step["with"]["run"]
     assert "restore-or-build erofs" in step["with"]["run"]
-    assert step["with"]["run"].index('"$MKFS_EROFS" --plan-version') < step["with"]["run"].index('make test')
+    assert step["with"]["run"].index('"$MKFS_EROFS_PATH" --plan-version') < step["with"]["run"].index('make test')
     assert step["with"]["cache-coverage"] == "release-accelerator-build"
     assert step["with"]["outputs"].splitlines() == ["accelerator/bin", "accelerator/release-bundle"]
     assert "NO_ROCKSDB" not in str(jobs["build"])
@@ -240,8 +240,8 @@ def check_build_shell(steps):
         make = tools / "make"
         make.write_text(f"#!{sys.executable}\nimport os, sys\n"
                         "from pathlib import Path\n"
-                        "assert Path(os.environ['MKFS_EROFS']).is_file()\n"
-                        "assert Path(os.environ['MKFS_EROFS']).parent == Path(os.environ['PATH'].split(':')[0])\n"
+                        "assert Path(os.environ['MKFS_EROFS_PATH']).is_file()\n"
+                        "assert Path(os.environ['MKFS_EROFS_PATH']).parent == Path(os.environ['PATH'].split(':')[0])\n"
                         "with open(os.environ['MAKE_LOG'], 'a') as log:\n"
                         "    print(sys.argv[1:], os.getcwd(), file=log)\n"
                         "sys.exit(72 if sys.argv[1] == os.environ.get('FAIL_GOAL') else 0)\n")
@@ -274,6 +274,9 @@ def check_build_shell(steps):
         plan_tool = tools / "plan-tool"
         plan_tool.write_text('#!/bin/sh\n[ "$*" = --plan-version ] || exit 90\nexit "${PLAN_EXIT:-0}"\n')
         plan_tool.chmod(0o755)
+        stale_tool = root / "stale-mkfs.erofs"
+        stale_tool.write_text('#!/bin/sh\nexit 91\n')
+        stale_tool.chmod(0o755)
         command = steps["Build, test and package accelerator"]["with"]["run"].replace("/inputs/release", str(framework))
         command = command.replace("${{ needs.preflight.outputs.version }}", "v0.1.6-preview.20261009")
         command = command.replace("${{ needs.preflight.outputs.source_sha }}", "a" * 40)
@@ -282,7 +285,8 @@ def check_build_shell(steps):
             cache_log = root / f"cache-{arch}.log"
             release_log = root / f"release-{arch}.log"
             env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40, PLAN_TOOL=str(plan_tool))
+                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40, PLAN_TOOL=str(plan_tool),
+                       MKFS_EROFS_PATH=str(stale_tool))
             subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
                            cwd=source.parent, env=env, check=True)
             goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)

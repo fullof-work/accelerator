@@ -190,9 +190,9 @@ jobs:
             umask 022
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build rocksdb
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build erofs
-            export MKFS_EROFS="$PWD/guest-runtime/native-deps/bin/$TARGET_ARCH/mkfs.erofs"
+            export MKFS_EROFS_PATH="$PWD/guest-runtime/native-deps/bin/$TARGET_ARCH/mkfs.erofs"
             export PATH="$PWD/guest-runtime/native-deps/bin/$TARGET_ARCH:$PATH"
-            "$MKFS_EROFS" --plan-version
+            "$MKFS_EROFS_PATH" --plan-version
             cd accelerator
             if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
             make build
