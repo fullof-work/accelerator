@@ -131,7 +131,9 @@ pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated
 scratch blocks/inodes and deleted-open files, and waits for the owned producer
 session before cleaning scratch. Receiving artifact P and its optional fsync are
-reported separately. Child rusage I/O counters may be unavailable on some hosts;
+reported separately. Optional `--progress-timing` timestamps existing CLI progress
+lines and the first available stdout bytes for phase attribution; preparation
+ends before the artifact writer can emit its header. Child rusage I/O counters may be unavailable on some hosts;
 sampled RSS and block peaks have the recorded sampling resolution.
 
 Compare the previous implementation, the selected correct applier with old mkfs,

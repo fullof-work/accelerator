@@ -12,6 +12,12 @@ import unittest
 
 class BenchmarkLifecycle(unittest.TestCase):
     def test_cancel_joins_background_writer_and_preserves_unrelated_process(self):
+        self.cancel_measurement(False)
+
+    def test_cancel_joins_progress_reader_and_background_writer(self):
+        self.cancel_measurement(True)
+
+    def cancel_measurement(self, progress):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root = pathlib.Path(directory)
             scratch = root / 'scratch'
@@ -38,6 +44,8 @@ with (scratch/'active').open('wb') as out:
                        '--variant', f'fixture,{producer},/bin/true', '--input', str(input_file),
                        '--consumer', '/bin/true', '--fsck', '/bin/true', '--expected', str(expected),
                        '--scratch-parent', str(scratch), '--output-root', str(root/'results'), '--trials', '1']
+            if progress:
+                command.append('--progress-timing')
             harness = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic()+10

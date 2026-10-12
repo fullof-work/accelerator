@@ -113,7 +113,8 @@ Builder 测试入口，以精确 source/artifact set 验证。接收工件字节
 `test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
 artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch
 实际分配块/inode、已删除但仍打开的文件，并等待自有生产进程组退出后清理 scratch。
-接收 artifact P 与可选 fsync 分开计量。部分宿主不提供 child rusage I/O 计数；
+接收 artifact P 与可选 fsync 分开计量。可选 `--progress-timing` 为既有 CLI 进度行与
+stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 writer 才能输出 artifact 头。部分宿主不提供 child rusage I/O 计数；
 采样 RSS 与块峰值受记录的采样间隔限制。
 
 在相同 CPU、内存、存储和缓存条件下，对比原实现、正确 applier 加旧 mkfs，以及 Plan。

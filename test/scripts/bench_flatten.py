@@ -150,7 +150,9 @@ def one(args, variant, trial, result_root, verified):
     started = time.monotonic()
     samples, failures = [], []
     done = threading.Event()
-    command = [cli, 'export', '--no-progress', '--tmpdir', str(scratch), '--output', '-']
+    command = [cli, 'export', '--tmpdir', str(scratch), '--output', '-']
+    if not args.progress_timing:
+        command.append('--no-progress')
     if args.config:
         command += ['--config', str(args.config)]
     command.append(args.input)
@@ -159,9 +161,28 @@ def one(args, variant, trial, result_root, verified):
     producer = None
     leader_start = None
     sampler = None
+    stderr_reader = None
+    progress_events = []
+    first_output_seconds = None
+    output_read = None
     try:
         with (run / 'producer.stderr').open('wb') as errors:
-            producer = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, env=environment, start_new_session=True)
+            producer = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE if args.progress_timing else errors,
+                                        env=environment, start_new_session=True)
+            if args.progress_timing:
+                def read_progress():
+                    try:
+                        while line := producer.stderr.readline(65536):
+                            errors.write(line)
+                            progress_events.append({'seconds': time.monotonic()-started,
+                                                    'message': line[:8192].decode(errors='replace').rstrip()})
+                    except Exception as error:
+                        failures.append('progress reader: '+str(error))
+                    finally:
+                        producer.stderr.close()
+                stderr_reader = threading.Thread(target=read_progress)
+                stderr_reader.start()
             leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
             if not stat.S_ISFIFO(os.fstat(producer.stdout.fileno()).st_mode):
                 raise RuntimeError('producer output is not a real pipe')
@@ -181,7 +202,12 @@ def one(args, variant, trial, result_root, verified):
             digest, size = hashlib.sha256(), 0
             try:
                 with artifact.open('xb', buffering=0) as output:
-                    while block := producer.stdout.read(1 << 20):
+                    # read1 observes the first available pipe bytes for phase
+                    # diagnosis, without waiting for a full MiB or carrier EOF.
+                    output_read = producer.stdout.read1 if args.progress_timing else producer.stdout.read
+                    while block := output_read(1 << 20):
+                        if first_output_seconds is None:
+                            first_output_seconds = time.monotonic()-started
                         output.write(block)
                         digest.update(block)
                         size += len(block)
@@ -195,6 +221,8 @@ def one(args, variant, trial, result_root, verified):
                 finally:
                     done.set()
                     sampler.join()
+                    if stderr_reader is not None:
+                        stderr_reader.join()
         if code:
             raise RuntimeError(f'{name}: producer exit {code}; see {run / "producer.stderr"}')
         if failures:
@@ -221,6 +249,8 @@ def one(args, variant, trial, result_root, verified):
                   'artifact_sha256': digest.hexdigest(), 'artifact_bytes': size,
                   'artifact_blocks': artifact.stat().st_blocks*512,
                   'producer_eof_seconds': eof-started, 'accepted_seconds': accepted-started,
+                  'first_output_seconds': first_output_seconds if args.progress_timing else None,
+                  'progress_events': progress_events,
                   'receiver_validation_seconds': accepted-eof, 'receiver_fsync_seconds': fsync_seconds,
                   'child_cpu_user_seconds': usage.ru_utime-baseline_usage.ru_utime,
                   'child_cpu_system_seconds': usage.ru_stime-baseline_usage.ru_stime,
@@ -251,6 +281,8 @@ def one(args, variant, trial, result_root, verified):
                 if sampler is not None:
                     sampler.join()
                 producer.stdout.close()
+                if stderr_reader is not None:
+                    stderr_reader.join()
         if stopped or producer is None:
             shutil.rmtree(scratch)
 
@@ -268,6 +300,7 @@ def main():
     parser.add_argument('--trials', type=int, default=3)
     parser.add_argument('--interval', type=float, default=0.1)
     parser.add_argument('--fsync', action='store_true')
+    parser.add_argument('--progress-timing', action='store_true', help='timestamp existing CLI progress lines for stage attribution')
     parser.add_argument('--keep-artifacts', action='store_true')
     args = parser.parse_args()
     variants = [value.split(',') for value in args.variant]
