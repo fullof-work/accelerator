@@ -106,11 +106,11 @@ index d917be5..93d5f46 100644
  		p.mu.Unlock()
  		p.writeMu.Lock()
  		defer p.writeMu.Unlock()
--		p.closeErr = errors.Join(p.plan.Close(), os.RemoveAll(p.work))
+-		p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
 +		if p.controlRaw != nil {
-+			p.closeErr = errors.Join(p.controlRaw.Close(), os.RemoveAll(p.work))
++			p.closeErr = errors.Join(p.controlRaw.Close(), removeOwnedWork(p.work))
 +		} else {
-+			p.closeErr = errors.Join(p.plan.Close(), os.RemoveAll(p.work))
++			p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
 +		}
  	})
  	return p.closeErr

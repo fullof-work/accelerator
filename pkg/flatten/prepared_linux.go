@@ -102,7 +102,7 @@ func PrepareDir(ctx context.Context, root string, opts Options, dopts DirOptions
 	}
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, os.RemoveAll(work))
+			retErr = errors.Join(retErr, removeOwnedWork(work))
 		}
 	}()
 	owned := append(append([]string(nil), dopts.OutputPaths...), work)
@@ -158,7 +158,7 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 	}
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, os.RemoveAll(work))
+			retErr = errors.Join(retErr, removeOwnedWork(work))
 		}
 	}()
 	root := filepath.Join(work, "rootfs")
@@ -358,7 +358,7 @@ func (p *PreparedImage) Close() error {
 		p.mu.Unlock()
 		p.writeMu.Lock()
 		defer p.writeMu.Unlock()
-		p.closeErr = errors.Join(p.plan.Close(), os.RemoveAll(p.work))
+		p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
 	})
 	return p.closeErr
 }
