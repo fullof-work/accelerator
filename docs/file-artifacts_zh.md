@@ -322,6 +322,8 @@ writer 保持历史确定性 entry 名称、STORED method、时间戳和字节�
 
 ### 共享 reader/writer 与严格 profile
 
+`tarstream.WriteTo` 接受 `WithBeforeCommit(check)`，用于调用方负责的最终源校验。它在消费全部 payload 和 metadata tail 字节之后、写出 carrier digest marker、归档尾和最终加密记录之前调用一次 check。空源、全 Hole 和全 Zero 源同样执行，不依赖额外 EOF 读取。更早的读写错误会跳过 check；check 错误会保留并使 artifact 不完整。调用方须让源在返回前保持稳定且打开，失败时丢弃输出，不发布文件、上传结果或转换缓存结果。接收方同时要求完整有效的 artifact 和生产者成功结束。此校验不提供原子快照或目标持久性。未配置此选项的 writer 保持原有字节和身份；`CarrierDigest` 不消费 payload，因此拒绝此选项。
+
 `pkg/manifest/transfer.Reader` 打开选定的逻辑 source，并保留源所有权和验证能力。`transfer.Write` 接受 sparse source 与 `WriteOptions`；`BeforeCommit` 在写出 Store 根之前完成调用方源/输出校验。`manifest.RefLocations` 为 manifest-ctl 和 sandboxer 提供统一的合法 location 映射。
 
 `tailzip.ReadCanonical` 与 `EncodeCanonical` 实现 S/E 使用的固定 raw-header profile；`ReadFooter` 和 `Names` 提供有界几何信息与角色探测元数据。应用模块传入有序条目名、大小上限，并负责配置/schema 校验。`tailzip.Section` 保持 borrowed run 生命周期及未偏移 prefix 的 ChunkRun 能力；`Append` 保留权威 payload 边界和可复用的摘要 commitment。

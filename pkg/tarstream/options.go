@@ -1,6 +1,7 @@
 package tarstream
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
@@ -27,8 +28,37 @@ type CodecOption interface {
 }
 
 type writeOptions struct {
-	codec    Codec
-	codecSet bool
+	codec        Codec
+	codecSet     bool
+	beforeCommit func(context.Context) error
+}
+
+type beforeCommitOption struct{ check func(context.Context) error }
+
+// WithBeforeCommit runs check once after all source payload bytes have been
+// consumed, before the carrier digest marker, archive trailer, and final
+// encrypted record are written. It also runs for empty and all-Hole/Zero sources;
+// no extra EOF read is required. An earlier read/write failure skips check.
+//
+// The caller retains ownership of the source and must keep it stable and open
+// until WriteTo returns. check must not modify it. A failed check leaves an
+// incomplete output; the caller must discard it and must not commit a file,
+// upload, or conversion-cache result. This hook does not make a mutable source
+// an atomic snapshot, or confer durability on the destination. CarrierDigest
+// rejects this option because deriving an identity does not consume the source.
+func WithBeforeCommit(check func(context.Context) error) WriteOption {
+	return beforeCommitOption{check: check}
+}
+
+func (o beforeCommitOption) applyWrite(dst *writeOptions) error {
+	if o.check == nil {
+		return fmt.Errorf("%w: WithBeforeCommit requires a non-nil check", ErrInvalidOption)
+	}
+	if dst.beforeCommit != nil {
+		return fmt.Errorf("%w: duplicate WithBeforeCommit", ErrInvalidOption)
+	}
+	dst.beforeCommit = o.check
+	return nil
 }
 
 type readOptions struct {

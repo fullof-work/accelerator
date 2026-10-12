@@ -56,7 +56,7 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 		artifactWriter = records
 	}
 
-	plainDigest, err := emitPlan(ctx, artifactWriter, plan, src)
+	plainDigest, err := emitPlan(ctx, artifactWriter, plan, src, opts.beforeCommit)
 	if err != nil {
 		return "", "", err
 	}
@@ -256,7 +256,7 @@ func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseE
 // emitPlan writes the planned canonical plaintext stream exactly once. The
 // destination may be the caller's plaintext writer or the encrypted record
 // writer. Data extents are read once; Zero extents are synthesized.
-func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source) ([32]byte, error) {
+func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source, beforeCommit func(context.Context) error) ([32]byte, error) {
 	identity := newIdentityAccumulator(
 		uint64(plan.payloadSize), plan.payloadExtents, plan.payloadPacked, plan.logical-plan.payloadSize,
 	)
@@ -270,6 +270,11 @@ func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Sour
 			if err := copyExtent(ctx, payloadWriter, src, e, plan.name, buf); err != nil {
 				return [32]byte{}, err
 			}
+		}
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(ctx); err != nil {
+			return [32]byte{}, fmt.Errorf("tarstream: %s: before commit: %w", plan.name, err)
 		}
 	}
 	if plan.payloadPad > 0 {
