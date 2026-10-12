@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +89,61 @@ func archiveFixture(t *testing.T, codec string) ([]byte, *ImageInput) {
 		t.Fatal(err)
 	}
 	return outer.Bytes(), in
+}
+
+func TestArchiveLegacySkopeoAlias(t *testing.T) {
+	requirePlan(t)
+	layer := testLayerTar(t, layerEntry{name: "payload", body: "legacy save contents"})
+	digest := fmt.Sprintf("%x", sha256.Sum256(layer))
+	config := []byte(fmt.Sprintf(`{"rootfs":{"type":"layers","diff_ids":["sha256:%s"]}}`, digest))
+	layerName := digest + ".tar"
+	aliasName := strings.Repeat("a", 64) + "/layer.tar"
+	for _, tc := range []struct {
+		name, link, selected string
+		ok                   bool
+	}{
+		{"regular-selected", "../" + layerName, layerName, true},
+		{"alias-selected", "../" + layerName, aliasName, false},
+		{"missing-target", "../" + strings.Repeat("b", 64) + ".tar", layerName, false},
+		{"absolute-target", "/" + layerName, layerName, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest, err := json.Marshal([]dockerManifestEntry{{Config: "config.json", Layers: []string{tc.selected}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var archive bytes.Buffer
+			tw := tar.NewWriter(&archive)
+			if err := tw.WriteHeader(&tar.Header{Name: aliasName, Typeflag: tar.TypeSymlink, Linkname: tc.link}); err != nil {
+				t.Fatal(err)
+			}
+			for name, b := range map[string][]byte{"config.json": config, "manifest.json": manifest, layerName: layer} {
+				if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(b))}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tw.Write(b); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			p, err := PrepareArchive(context.Background(), io.NopCloser(bytes.NewReader(archive.Bytes())), Options{TmpDir: t.TempDir()})
+			if (err == nil) != tc.ok {
+				t.Fatalf("legacy alias result: %v", err)
+			}
+			if p != nil {
+				defer p.Close()
+				assertLayerFile(t, p.selection.root, "payload", "legacy save contents")
+				if _, err := os.Lstat(filepath.Join(p.selection.root, aliasName)); !os.IsNotExist(err) {
+					t.Fatal("outer alias was extracted:", err)
+				}
+				if err := p.WriteRaw(context.Background(), io.Discard); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {

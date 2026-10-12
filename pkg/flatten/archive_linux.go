@@ -17,7 +17,10 @@ import (
 	"sync"
 )
 
-type archiveMember struct{ offset, size int64 }
+type archiveMember struct {
+	offset, size int64
+	alias        string // validated legacy Skopeo alias, never followed
+}
 type archiveInput struct {
 	reader  io.ReaderAt
 	size    int64
@@ -248,12 +251,12 @@ func (a *archiveInput) index(ctx context.Context, limits ArchiveLimits) error {
 		if _, ok := a.members[name]; ok {
 			return fmt.Errorf("flatten: duplicate archive member %q", name)
 		}
-		charge := int64(256 + 2*len(name))
+		charge := int64(256 + 2*len(name) + 2*len(h.Linkname))
 		if charge > remaining {
 			return fmt.Errorf("flatten: archive index budget exceeded")
 		}
 		remaining -= charge
-		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir {
+		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir && h.Typeflag != tar.TypeSymlink {
 			return fmt.Errorf("flatten: unsupported outer archive member type for %q", name)
 		}
 		for k := range h.PAXRecords {
@@ -269,13 +272,25 @@ func (a *archiveInput) index(ctx context.Context, limits ArchiveLimits) error {
 			return fmt.Errorf("flatten: truncated archive member %q", name)
 		}
 		lastEnd = off + h.Size + (512-h.Size%512)%512
-		if h.Typeflag == tar.TypeDir {
+		if h.Typeflag == tar.TypeSymlink {
+			// Match the platform's existing Docker-save compatibility contract:
+			// Skopeo may include <hex>/layer.tar -> ../<diff-id>.tar alongside
+			// the manifest-selected regular layer. Do not follow arbitrary links.
+			parts := strings.Split(name, "/")
+			target := strings.TrimPrefix(h.Linkname, "../")
+			if h.Size != 0 || len(parts) != 2 || parts[1] != "layer.tar" ||
+				!sha256Identity("sha256:"+parts[0]) || h.Linkname != "../"+target ||
+				!strings.HasSuffix(target, ".tar") || !sha256Identity("sha256:"+strings.TrimSuffix(target, ".tar")) {
+				return fmt.Errorf("flatten: unsupported outer archive link %q", name)
+			}
+			a.members[name] = archiveMember{offset: -1, alias: target}
+		} else if h.Typeflag == tar.TypeDir {
 			if h.Size != 0 {
 				return fmt.Errorf("flatten: outer archive directory has data")
 			}
 			a.members[name] = archiveMember{offset: -1}
 		} else {
-			a.members[name] = archiveMember{off, h.Size}
+			a.members[name] = archiveMember{offset: off, size: h.Size}
 		}
 	}
 	return a.stable()
@@ -325,6 +340,7 @@ func (a *archiveInput) image(ctx context.Context) (*ImageInput, error) {
 		return nil, fmt.Errorf("flatten: archive layer/DiffID count mismatch")
 	}
 	layers := make([]LayerInput, len(entry.Layers))
+	selected := make(map[string]bool, len(entry.Layers))
 	for i, name := range entry.Layers {
 		name, err = archivePath(name)
 		if err != nil {
@@ -334,6 +350,7 @@ func (a *archiveInput) image(ctx context.Context) (*ImageInput, error) {
 		if !ok || m.offset < 0 {
 			return nil, fmt.Errorf("flatten: missing archive layer %q", name)
 		}
+		selected[name] = true
 		media := "application/vnd.oci.image.layer.v1.tar"
 		// Docker-save has no layer media-type field. Retain its established
 		// gzip archive compatibility (including ggcr's .tar.gz dialect), and
@@ -367,6 +384,11 @@ func (a *archiveInput) image(ctx context.Context) (*ImageInput, error) {
 			}
 			return io.NopCloser(io.NewSectionReader(a.reader, m.offset, m.size)), nil
 		}}
+	}
+	for name, m := range a.members {
+		if m.alias != "" && !selected[m.alias] {
+			return nil, fmt.Errorf("flatten: archive alias %q does not name a selected regular layer", name)
+		}
 	}
 	if err = a.stable(); err != nil {
 		return nil, err
