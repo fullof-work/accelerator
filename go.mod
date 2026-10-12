@@ -8,16 +8,30 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.100.1
 	github.com/aws/smithy-go v1.25.1
+	github.com/cyphar/filepath-securejoin v0.5.0
 	github.com/golang/protobuf v1.5.4
 	github.com/golang/snappy v1.0.0
 	github.com/google/go-containerregistry v0.20.6
 	github.com/klauspost/compress v1.18.0
 	github.com/klauspost/reedsolomon v1.13.3
 	github.com/linxGnu/grocksdb v1.9.6
+	github.com/opencontainers/umoci v0.6.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
+	github.com/AdaLogics/go-fuzz-headers v0.0.0-20230106234847-43070de90fa1 // indirect
+	github.com/apex/log v1.9.0 // indirect
+	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/klauspost/pgzip v1.2.6 // indirect
+	github.com/moby/sys/user v0.4.0 // indirect
+	github.com/moby/sys/userns v0.1.0 // indirect
+	github.com/opencontainers/runtime-spec v1.2.1 // indirect
+	github.com/rootless-containers/proto/go-proto v0.0.0-20230421021042-4cd87ebadd67 // indirect
+	github.com/vbatts/go-mtree v0.6.1-0.20250911112631-8307d76bc1b9 // indirect
 )
 
 require (

@@ -7,9 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
+
+var unixEpoch = time.Unix(0, 0)
 
 func TestNormalizeSkip(t *testing.T) {
 	cases := map[string]string{

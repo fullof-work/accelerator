@@ -36,7 +36,7 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 	if err != nil {
 		return "", "", err
 	}
-	plan, err := makeWritePlan(name, src)
+	plan, err := makeWritePlanLimited(ctx, name, src, opts.indexMemory)
 	if err != nil {
 		return "", "", err
 	}
@@ -86,6 +86,13 @@ type writePlan struct {
 }
 
 func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
+	return makeWritePlanLimited(context.Background(), name, src, 0)
+}
+
+func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, memoryLimit uint64) (*writePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	name = normalizeName(name)
 	if name == "" {
 		return nil, fmt.Errorf("tarstream: empty entry name")
@@ -97,12 +104,28 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 		return nil, fmt.Errorf("tarstream: %s: size %d overflows", name, src.Size())
 	}
 	size := int64(src.Size())
+	// Conservative charge covers slice growth/copies, prefixExtents, decimal
+	// map construction and its copied carrier prefix, plus payload buffers.
+	indexMemory := uint64(2 << 20)
+	charge := func(n uint64) error {
+		if memoryLimit != 0 && (indexMemory > memoryLimit || n > memoryLimit-indexMemory) {
+			return fmt.Errorf("tarstream: writer index memory limit exceeded")
+		}
+		indexMemory += n
+		return nil
+	}
+	if err := charge(uint64(len(name)) * 8); err != nil {
+		return nil, err
+	}
 
 	// Metadata sweep: data extents = Zero|Data runs, merged across
 	// kind changes; holes are everything else.
 	var extents []extent
 	hasHole := false
 	for off := uint64(0); off < uint64(size); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		run, err := src.RunAt(off, uint64(size)-off)
 		if err != nil {
 			return nil, fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
@@ -119,6 +142,9 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 		} else if n := len(extents); n > 0 && uint64(extents[n-1].Offset+extents[n-1].Size) == off {
 			extents[n-1].Size += int64(end - off)
 		} else {
+			if err := charge(512); err != nil {
+				return nil, err
+			}
 			extents = append(extents, extent{Offset: int64(off), Size: int64(end - off)})
 		}
 		off = end
@@ -144,6 +170,9 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 	}
 	if size-payloadSize > maxMetadataTailSize {
 		return nil, fmt.Errorf("tarstream: %s: metadata tail size %d exceeds %d", name, size-payloadSize, maxMetadataTailSize)
+	}
+	if err := charge(uint64(size - payloadSize)); err != nil {
+		return nil, err
 	}
 
 	var sparseMap []byte
