@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -49,7 +50,12 @@ func TestPreparedReadOnlyTreeCleanup(t *testing.T) {
 					}
 					return nil
 				}
-				applyTestLayer(t, root, layerEntry{name: "readonly/file", body: "payload"}, layerEntry{name: "readonly", kind: tar.TypeDir, mode: 0500}, layerEntry{name: "external", kind: tar.TypeSymlink, link: outside})
+				entries := []layerEntry{{name: "readonly/file", body: "payload"}}
+				for j := 0; j < 260; j++ {
+					entries = append(entries, layerEntry{name: fmt.Sprintf("readonly/child-%03d/file", j), body: "payload"})
+				}
+				entries = append(entries, layerEntry{name: "readonly", kind: tar.TypeDir, mode: 0500}, layerEntry{name: "external", kind: tar.TypeSymlink, link: outside})
+				applyTestLayer(t, root, entries...)
 				return nil
 			}, nil)
 			if failed {
