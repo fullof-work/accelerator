@@ -117,6 +117,12 @@ artifact reader，默认交替顺序执行三轮。记录工具摘要、进程�
 stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 writer 才能输出 artifact 头。部分宿主不提供 child rusage I/O 计数；
 采样 RSS 与块峰值受记录的采样间隔限制。
 
+宽目录的块数/inode 遍历可能干扰管道接收和源文件 I/O。资源采样轮次之外，再在相同
+资源、存储和缓存条件下使用 `--timing-only` 测量该影响。此模式仍核验身份和实际内容、
+记录子进程 CPU/I/O 并等待自有资源清理，但将采样峰值和采样间隔记为 null。两类结果
+都应保留；计时轮次不能作为内存、块数、inode 或打开文件的上界证据。
+
+
 在相同 CPU、内存、存储和缓存条件下，对比原实现、正确 applier 加旧 mkfs，以及 Plan。
 中间对照仅在独立的所选 accelerator 源码副本上应用
 `test/fixtures/flatten-old-layout.patch`，使用相同的所选 guest CLI，以及包含 exact-read

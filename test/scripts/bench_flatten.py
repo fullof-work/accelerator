@@ -197,8 +197,12 @@ def one(args, variant, trial, result_root, verified):
                         failures.append(str(error))
                         return
                     done.wait(args.interval)
-            sampler = threading.Thread(target=monitor)
-            sampler.start()
+            # Resource scans touch every selected inode and contend with the
+            # Python pipe receiver. Use a separate timing pass for wide trees;
+            # its result explicitly has no sampled resource measurements.
+            if not args.timing_only:
+                sampler = threading.Thread(target=monitor)
+                sampler.start()
             digest, size = hashlib.sha256(), 0
             try:
                 with artifact.open('xb', buffering=0) as output:
@@ -220,7 +224,8 @@ def one(args, variant, trial, result_root, verified):
                     stopped = True
                 finally:
                     done.set()
-                    sampler.join()
+                    if sampler is not None:
+                        sampler.join()
                     if stderr_reader is not None:
                         stderr_reader.join()
         if code:
@@ -256,12 +261,13 @@ def one(args, variant, trial, result_root, verified):
                   'child_cpu_system_seconds': usage.ru_stime-baseline_usage.ru_stime,
                   'child_io_input_512blocks': usage.ru_inblock-baseline_usage.ru_inblock,
                   'child_io_output_512blocks': usage.ru_oublock-baseline_usage.ru_oublock,
-                  'peak': {key: max((s[key] for s in samples), default=0) for key in
+                  'peak': {key: None if args.timing_only else max((s[key] for s in samples), default=0) for key in
                            ['process_rss','scratch_blocks','scratch_inodes','deleted_open_files','deleted_open_blocks']},
-                  'sampling_interval_seconds': args.interval, 'scratch_clean': True,
+                  'sampling_interval_seconds': None if args.timing_only else args.interval, 'scratch_clean': True,
+                  'timing_only': args.timing_only,
                   'content_verification': verified[identity],
                   'expected_content_sha256': file_digest(args.expected),
-                  'measurement_scope': 'host producer private scratch and sampled process RSS; receiver P separate; rusage I/O may be unavailable; not Guest ext4 or Host COW'}
+                  'measurement_scope': ('timing only; no sampled scratch or process RSS; receiver P separate' if args.timing_only else 'host producer private scratch and sampled process RSS; receiver P separate; rusage I/O may be unavailable; not Guest ext4 or Host COW')}
         (run / 'samples.json').write_text(json.dumps(samples)+'\n')
         (run / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
         if not args.keep_artifacts:
@@ -302,6 +308,7 @@ def main():
     parser.add_argument('--fsync', action='store_true')
     parser.add_argument('--progress-timing', action='store_true', help='timestamp existing CLI progress lines for stage attribution')
     parser.add_argument('--keep-artifacts', action='store_true')
+    parser.add_argument('--timing-only', action='store_true', help='omit intrusive inode/FD/RSS sampling; run resource measurements separately')
     args = parser.parse_args()
     variants = [value.split(',') for value in args.variant]
     if args.trials < 1 or not 0.01 <= args.interval <= 1:

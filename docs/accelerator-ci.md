@@ -136,6 +136,13 @@ lines and the first available stdout bytes for phase attribution; preparation
 ends before the artifact writer can emit its header. Child rusage I/O counters may be unavailable on some hosts;
 sampled RSS and block peaks have the recorded sampling resolution.
 
+Walking a wide tree for block/inode samples can perturb the pipe receiver and
+source I/O. Pair the resource pass with `--timing-only` under the same resource,
+storage and cache conditions to measure that effect. Timing-only results keep
+identity/content checks, child CPU/I/O accounting and owned teardown, but record
+sampled peaks and the sampling interval as null. Retain both results; a timing
+pass cannot establish a memory, block, inode or open-file bound.
+
 Compare the previous implementation, the selected correct applier with old mkfs,
 and Plan on the same CPU/memory/storage/cache conditions. For the middle control,
 apply `test/fixtures/flatten-old-layout.patch` only to an isolated copy of the
