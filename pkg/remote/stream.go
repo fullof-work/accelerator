@@ -67,7 +67,9 @@ func (c *Config) Stream(ctx context.Context, res *Resolved) (*flatten.ImageInput
 	if err := json.NewDecoder(bytes.NewReader(config)).Decode(&cfg); err != nil {
 		return nil, err
 	}
-	if cfg.OS != c.platform.OS || cfg.Architecture != c.platform.Architecture || c.platform.Variant != "" && cfg.Variant != c.platform.Variant {
+	// Variant is optional in an OCI config; Resolve already selected the
+	// index descriptor. Reject a stated conflict, not an omitted field.
+	if cfg.OS != c.platform.OS || cfg.Architecture != c.platform.Architecture || c.platform.Variant != "" && cfg.Variant != "" && cfg.Variant != c.platform.Variant {
 		return nil, fmt.Errorf("remote: image config platform %s/%s/%s does not match selected %s", cfg.OS, cfg.Architecture, cfg.Variant, c.platform)
 	}
 	if len(manifest.Layers) != len(cfg.RootFS.DiffIDs) {

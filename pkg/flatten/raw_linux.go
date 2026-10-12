@@ -5,6 +5,7 @@ package flatten
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -123,7 +124,7 @@ func BuildFromDir(root, outputPath string, opts Options, dopts DirOptions) error
 }
 
 func writeRawFile(ctx context.Context, output string, prepare func(string) (*PreparedImage, error)) (retErr error) {
-	f, err := os.CreateTemp(filepath.Dir(output), ".flatten-output-*")
+	f, err := createPendingOutput(output, ".flatten-output-")
 	if err != nil {
 		return err
 	}
@@ -148,5 +149,50 @@ func writeRawFile(ctx context.Context, output string, prepare func(string) (*Pre
 	if err != nil {
 		return err
 	}
+	if _, _, err = outputPermissions(output); err != nil {
+		return err
+	}
 	return os.Rename(pending, output)
+}
+
+// outputPermissions accepts only ordinary destination files. Atomic replacement
+// must not unlink a device, directory or symlink. Check again at commit time.
+func outputPermissions(output string) (os.FileMode, bool, error) {
+	st, err := os.Lstat(output)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0666, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !st.Mode().IsRegular() {
+		return 0, false, fmt.Errorf("destination is not a regular file: %s", output)
+	}
+	return st.Mode().Perm(), true, nil
+}
+
+func createPendingOutput(output, prefix string) (*os.File, error) {
+	mode, exists, err := outputPermissions(output)
+	if err != nil {
+		return nil, err
+	}
+	for range 10 {
+		name := filepath.Join(filepath.Dir(output), prefix+rand.Text())
+		// A new output keeps normal 0666 & umask semantics. Existing output
+		// permissions are restored explicitly, unaffected by this process's umask.
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			if err = f.Chmod(mode); err != nil {
+				return nil, errors.Join(err, f.Close(), os.Remove(name))
+			}
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("reserve pending output: %w", os.ErrExist)
 }

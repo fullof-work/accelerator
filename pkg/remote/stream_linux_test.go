@@ -16,10 +16,12 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -335,4 +337,49 @@ func (i wrongDiffIDImage) LayerByDiffID(h v1.Hash) (v1.Layer, error) {
 		return i.layers[0], nil
 	}
 	return i.Image.LayerByDiffID(h)
+}
+
+func TestStreamOptionalConfigVariant(t *testing.T) {
+	for _, variant := range []string{"", "v7", "v6"} {
+		t.Run("config-"+variant, func(t *testing.T) {
+			img := streamingImage(t, "arm")
+			config, err := img.ConfigFile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.Architecture, config.Variant = "arm", variant
+			img, err = mutate.ConfigFile(img, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+				Add: img, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}},
+			})
+			srv := httptest.NewServer(registry.New())
+			defer srv.Close()
+			ref, err := name.NewTag(strings.TrimPrefix(srv.URL, "http://")+"/variant/image:tag", name.Insecure)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = ggcrremote.WriteIndex(ref, index); err != nil {
+				t.Fatal(err)
+			}
+			c := testConfig(t)
+			if err = c.SetPlatform("linux/arm/v7"); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := c.Resolve(context.Background(), ref.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := img.Digest()
+			if resolved.Hash != want {
+				t.Fatalf("did not pin selected manifest: %v", resolved.Hash)
+			}
+			_, err = c.Stream(context.Background(), resolved)
+			if (err != nil) != (variant == "v6") {
+				t.Fatalf("variant %q: %v", variant, err)
+			}
+		})
+	}
 }
