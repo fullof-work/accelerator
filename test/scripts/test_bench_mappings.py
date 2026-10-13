@@ -623,7 +623,9 @@ try:
  (nodes[-1]/'external').symlink_to(outside)
  if limit:resource.setrlimit(resource.RLIMIT_NOFILE,(limit,old[1]))
  descriptors=len(os.listdir('/proc/self/fd'))
- if operation=='scan':
+ if operation=='contents':
+  result=b.tree_contents(tree);assert len(result)==depth+2,result
+ elif operation=='scan':
   result=b.scratch_usage(tree,[]);assert result['scratch_inodes']==depth+2,result
  else:
   for path in reversed(nodes):path.chmod(0)
@@ -650,3 +652,25 @@ finally:
 
     def test_verification_cleanup_has_bounded_descriptor_depth(self):
         self.check_depth('cleanup')
+
+
+class VerificationTreeMeasurements(unittest.TestCase):
+    check_depth = MeasurementScanLifetime.check_depth
+
+    def test_deep_content_verification(self):
+        self.check_depth('contents')
+
+    @unittest.skipIf(os.geteuid() == 0, 'requires ordinary UID for denied directory scan')
+    def test_unreadable_verification_directory_rejects_incomplete_tree(self):
+        with tempfile.TemporaryDirectory(prefix='verify-unreadable-') as directory:
+            tree = pathlib.Path(directory)
+            hidden = tree/'hidden'; hidden.mkdir()
+            (hidden/'payload').write_bytes(b'content must be inspected')
+            for inaccessible in [hidden, tree]:
+                with self.subTest(root=inaccessible == tree):
+                    inaccessible.chmod(0)
+                    try:
+                        with self.assertRaises(PermissionError):
+                            bench_flatten.tree_contents(tree)
+                    finally:
+                        inaccessible.chmod(0o700)

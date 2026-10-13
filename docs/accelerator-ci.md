@@ -188,7 +188,9 @@ by relative path, including `.` for the root directory: each entry includes `typ
 `size`/`sha256`, symlink `target` or special-file `device` and numeric `kind` (`stat.S_IFMT(st_mode)`, distinguishing
 FIFO, socket, character and block device). For each non-directory
 hard-link group (including symlinks and special files) in the selected tree, the lexicographically first relative path
-is canonical; other members include `hardlink_to` naming that path. The first occurrence of
+is canonical; other members include `hardlink_to` naming that path. Content enumeration
+is iterative on Python 3.11 and newer and reports directory scan errors; an unreadable
+subtree invalidates verification instead of being treated as empty. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
 contents and metadata must match. This extra extraction is outside measurement. After verification, only the owned
 extraction tree has directory access restored for removal; external symlink

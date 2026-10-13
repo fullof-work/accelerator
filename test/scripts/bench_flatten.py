@@ -10,7 +10,6 @@ import argparse
 import contextlib
 import ctypes
 import hashlib
-import itertools
 import json
 import os
 import pathlib
@@ -355,7 +354,9 @@ def stop_owned_group(producer, leader_start):
 
 def tree_contents(tree):
     actual, links = {}, {}
-    for path in itertools.chain((tree,), tree.rglob('*')):
+    pending = [tree]
+    while pending:
+        path = pending.pop()
         name = str(path.relative_to(tree))
         info = path.lstat()
         row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid,
@@ -364,6 +365,10 @@ def tree_contents(tree):
             row.update(type='file', size=info.st_size, sha256=file_digest(path))
         elif stat.S_ISDIR(info.st_mode):
             row.update(type='directory')
+            # iterdir reports unreadable directories instead of silently
+            # omitting descendants; explicit pending paths avoid rglob's
+            # recursive implementation on supported Python 3.11.
+            pending.extend(path.iterdir())
         elif stat.S_ISLNK(info.st_mode):
             row.update(type='symlink', target=os.readlink(path))
         else:
