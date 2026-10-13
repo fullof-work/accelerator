@@ -122,7 +122,7 @@ sys.exit(17)
                 outside.mkdir();outside.chmod(0o555)
                 run=root/'run';run.mkdir()
                 expected=root/'expected.json'
-                common={'uid':os.getuid(),'gid':os.getgid()}
+                common={'uid':os.getuid(),'gid':os.getgid(),'mtime_ns':0}
                 rows={'.':dict(common,type='directory',mode=0o555 if not mismatch else 0o755),
                       'child':dict(common,type='directory',mode=0o555),
                       'child/file':dict(common,type='file',mode=0o444,size=1,sha256=hashlib.sha256(b'x').hexdigest()),
@@ -136,6 +136,8 @@ sys.exit(17)
                         tree=run/'verify-root';child=tree/'child';child.mkdir()
                         (child/'file').write_bytes(b'x');(child/'file').chmod(0o444)
                         (tree/'external').symlink_to(outside,target_is_directory=True)
+                        for path in [*tree.rglob('*'),tree]:
+                            os.utime(path,ns=(0,0),follow_symlinks=False)
                         child.chmod(0o555);tree.chmod(0o555)
                     return subprocess.CompletedProcess(command,0)
                 try:
@@ -344,13 +346,71 @@ print('fixture')
         with mock.patch.object(os, 'walk', side_effect=vanished):
             self.assertEqual(bench_flatten.scratch_usage(pathlib.Path('/unused'), [])['scratch_inodes'], 0)
 
+    def test_content_fingerprint_records_mtime_without_atime(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-time-test-') as directory:
+            tree = pathlib.Path(directory)
+            (tree/'directory').mkdir()
+            (tree/'file').write_bytes(b'unchanged')
+            os.link(tree/'file', tree/'hardlink')
+            (tree/'symlink').symlink_to('file')
+            os.mkfifo(tree/'fifo')
+            paths = [tree, *tree.rglob('*')]
+            for path in paths:
+                os.utime(path, ns=(0, 0), follow_symlinks=False)
+            fixed = bench_flatten.tree_contents(tree)
+            self.assertTrue(all(row['mtime_ns'] == 0 for row in fixed.values()))
+            for path in paths:
+                with self.subTest(path=str(path.relative_to(tree))):
+                    os.utime(path, ns=(123, 0), follow_symlinks=False)
+                    self.assertEqual(bench_flatten.tree_contents(tree), fixed)
+                    os.utime(path, ns=(123, 1), follow_symlinks=False)
+                    changed = bench_flatten.tree_contents(tree)
+                    self.assertNotEqual(changed, fixed)
+                    self.assertEqual(changed[str(path.relative_to(tree))]['mtime_ns'], 1)
+                    os.utime(path, ns=(0, 0), follow_symlinks=False)
+
+    def test_content_verification_rejects_noncanonical_mtime(self):
+        for changed in [None, '.', 'file']:
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix='flatten-time-test-') as directory:
+                root = pathlib.Path(directory)
+                run = root/'run';run.mkdir()
+                common = {'uid': os.getuid(), 'gid': os.getgid(), 'mtime_ns': 0}
+                expected = root/'expected.json'
+                expected.write_text(json.dumps({
+                    '.': dict(common, type='directory', mode=0o755),
+                    'file': dict(common, type='file', mode=0o644, size=1, sha256=hashlib.sha256(b'x').hexdigest())}))
+                args = SimpleNamespace(expected=expected, consumer='consumer', fsck='fsck')
+                def extract(command, **kwargs):
+                    if command[0] == 'consumer':
+                        (run/'verify.erofs').write_bytes(b'raw')
+                    else:
+                        tree = run/'verify-root'
+                        (tree/'file').write_bytes(b'x')
+                        (tree/'file').chmod(0o644);tree.chmod(0o755)
+                        for path in [tree, tree/'file']:
+                            os.utime(path, ns=(0, 0))
+                        if changed is not None:
+                            os.utime(tree/changed, ns=(0, 1))
+                    return subprocess.CompletedProcess(command, 0)
+                with mock.patch.object(bench_flatten.subprocess, 'run', side_effect=extract):
+                    if changed is None:
+                        bench_flatten.verify_contents(args, root/'artifact', run)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'content or metadata differs'):
+                            bench_flatten.verify_contents(args, root/'artifact', run)
+                        actual = json.loads((run/'actual-content.json').read_text())
+                        self.assertEqual(actual[changed]['mtime_ns'], 1)
+                self.assertFalse((run/'verify-root').exists())
+                self.assertFalse((run/'verify.erofs').exists())
+
     def test_content_fingerprint_includes_root_metadata(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             tree = pathlib.Path(directory)
             (tree/'file').write_bytes(b'unchanged')
             before = bench_flatten.tree_contents(tree)
             self.assertEqual(before['.'], {'type': 'directory', 'mode': 0o700,
-                                          'uid': os.getuid(), 'gid': os.getgid()})
+                                          'uid': os.getuid(), 'gid': os.getgid(),
+                                          'mtime_ns': tree.stat().st_mtime_ns})
             tree.chmod(0o750)
             after = bench_flatten.tree_contents(tree)
             self.assertEqual(before['file'], after['file'])
@@ -365,6 +425,8 @@ print('fixture')
             (tree/'z').write_bytes(b'payload')
             os.link(tree/'z', tree/'a')
             (tree/'copy').write_bytes(b'payload')
+            for path in tree.iterdir():
+                os.utime(path, ns=(0, 0))
             linked = bench_flatten.tree_contents(tree)
             self.assertEqual(linked['z']['hardlink_to'], 'a')
             self.assertNotIn('hardlink_to', linked['a'])
@@ -372,6 +434,7 @@ print('fixture')
             self.assertEqual(linked['a'], linked['copy'])
             (tree/'z').unlink()
             (tree/'z').write_bytes(b'payload')
+            os.utime(tree/'z', ns=(0, 0))
             copied = bench_flatten.tree_contents(tree)
             self.assertEqual({k: v for k, v in linked['z'].items() if k != 'hardlink_to'}, copied['z'])
             self.assertNotEqual(linked, copied)
@@ -381,11 +444,13 @@ print('fixture')
             tree = pathlib.Path(directory)
             node = tree/'node'
             os.mkfifo(node, 0o600)
+            os.utime(node, ns=(0, 0))
             fifo = bench_flatten.tree_contents(tree)['node']
             node.unlink()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
                 endpoint.bind(str(node))
                 node.chmod(0o600)
+                os.utime(node, ns=(0, 0))
                 unix_socket = bench_flatten.tree_contents(tree)['node']
             self.assertEqual(fifo['kind'], stat.S_IFIFO)
             self.assertEqual(unix_socket['kind'], stat.S_IFSOCK)
@@ -402,7 +467,7 @@ print('fixture')
             # to cover identical major/minor values through the real fingerprint.
             for kind in [stat.S_IFCHR, stat.S_IFBLK]:
                 info = SimpleNamespace(st_mode=kind | 0o600, st_uid=1000,
-                                       st_gid=1000, st_rdev=os.makedev(1, 3))
+                                       st_gid=1000, st_mtime_ns=0, st_rdev=os.makedev(1, 3))
                 with mock.patch.object(pathlib.Path, 'lstat', return_value=info):
                     row = bench_flatten.tree_contents(tree)['node']
                 self.assertEqual(row['kind'], kind)

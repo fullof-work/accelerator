@@ -178,7 +178,7 @@ normal product builds use the Plan path.
 Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent and
 output root must be disjoint; the output root must not exist. A Registry input
 must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
-by relative path, including `.` for the root directory: each entry includes `type`, `mode`, `uid`, `gid`, plus file
+by relative path, including `.` for the root directory: each entry includes `type`, `mode`, `uid`, `gid`, and `mtime_ns` (0 under the fixed output timestamp policy), plus file
 `size`/`sha256`, symlink `target` or special-file `device` and numeric `kind` (`stat.S_IFMT(st_mode)`, distinguishing
 FIFO, socket, character and block device). For each regular-file
 hard-link group in the selected tree, the lexicographically first relative path

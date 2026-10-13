@@ -174,7 +174,8 @@ def tree_contents(tree):
     for path in itertools.chain((tree,), tree.rglob('*')):
         name = str(path.relative_to(tree))
         info = path.lstat()
-        row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
+        row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid,
+               'mtime_ns': info.st_mtime_ns}
         if stat.S_ISREG(info.st_mode):
             row.update(type='file', size=info.st_size, sha256=file_digest(path))
             links.setdefault((info.st_dev, info.st_ino), []).append(name)

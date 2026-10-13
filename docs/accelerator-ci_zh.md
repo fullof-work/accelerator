@@ -148,7 +148,7 @@ CPU/I/O。所有写入活动结束后，包括失败或取消路径，仅在自�
 
 在既有 Workbench 中使用 Python 3.11 或更新版本。输入、scratch parent 与 output root
 须互不包含，output root 须不存在。Registry 输入必须固定 SHA-256 digest。提供按相对
-路径索引的预期内容 JSON，其中 `.` 表示根目录：每项包含 `type`、`mode`、`uid`、`gid`，文件另含
+路径索引的预期内容 JSON，其中 `.` 表示根目录：每项包含 `type`、`mode`、`uid`、`gid`、`mtime_ns`（固定输出时间政策下为 0），文件另含
 `size`/`sha256`，符号链接含 `target`，特殊文件含 `device` 以及数值 `kind`（`stat.S_IFMT(st_mode)`，
 区分 FIFO、socket、字符设备和块设备）。对选集内每组普通文件
 硬链接，以字典序最小的相对路径为规范路径，其他成员用 `hardlink_to` 指向该路径。
