@@ -3,12 +3,15 @@
 import os
 import pathlib
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import bench_flatten
 
@@ -44,6 +47,86 @@ class BenchmarkLifecycle(unittest.TestCase):
             copied = bench_flatten.tree_contents(tree)
             self.assertEqual({k: v for k, v in linked['z'].items() if k != 'hardlink_to'}, copied['z'])
             self.assertNotEqual(linked, copied)
+
+    def test_content_fingerprint_distinguishes_fifo_from_socket(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            tree = pathlib.Path(directory)
+            node = tree/'node'
+            os.mkfifo(node, 0o600)
+            fifo = bench_flatten.tree_contents(tree)['node']
+            node.unlink()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
+                endpoint.bind(str(node))
+                node.chmod(0o600)
+                unix_socket = bench_flatten.tree_contents(tree)['node']
+            self.assertEqual(fifo['kind'], stat.S_IFIFO)
+            self.assertEqual(unix_socket['kind'], stat.S_IFSOCK)
+            self.assertNotEqual(fifo, unix_socket)
+            self.assertEqual({k: v for k, v in fifo.items() if k != 'kind'},
+                             {k: v for k, v in unix_socket.items() if k != 'kind'})
+
+    def test_content_fingerprint_distinguishes_device_kinds(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            tree = pathlib.Path(directory)
+            (tree/'node').touch()
+            rows = []
+            # Device creation needs privileges; inject only lstat's type bits
+            # to cover identical major/minor values through the real fingerprint.
+            for kind in [stat.S_IFCHR, stat.S_IFBLK]:
+                info = SimpleNamespace(st_mode=kind | 0o600, st_uid=1000,
+                                       st_gid=1000, st_rdev=os.makedev(1, 3))
+                with mock.patch.object(pathlib.Path, 'lstat', return_value=info):
+                    row = bench_flatten.tree_contents(tree)['node']
+                self.assertEqual(row['kind'], kind)
+                rows.append(row)
+            self.assertNotEqual(*rows)
+            self.assertEqual({k: v for k, v in rows[0].items() if k != 'kind'},
+                             {k: v for k, v in rows[1].items() if k != 'kind'})
+
+    def test_receiver_timing_excludes_post_eof_teardown(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root = pathlib.Path(directory)
+            scratch, results = root/'scratch', root/'results'
+            scratch.mkdir()
+            results.mkdir()
+            producer = root/'producer.py'
+            producer.write_text('#!/usr/bin/env python3\nimport sys,time\n'
+                                'time.sleep(0.02)\nsys.stdout.buffer.write(b"fixture")\n')
+            producer.chmod(0o755)
+            expected = root/'expected.json'
+            expected.write_text('{}')
+            args = SimpleNamespace(scratch_parent=scratch, progress_timing=False,
+                                   config=None, input='fixture', timing_only=True,
+                                   consumer='/bin/true', fsync=False, expected=expected,
+                                   keep_artifacts=False)
+            clock = time.monotonic
+            stop = bench_flatten.stop_owned_group
+            run = subprocess.run
+            offset = 0
+
+            def delayed_stop(*args):
+                nonlocal offset
+                stop(*args)
+                # Account for a long owned cleanup without slowing the suite.
+                offset += 100
+
+            def timed_consumer(*args, **kwargs):
+                nonlocal offset
+                result = run(*args, **kwargs)
+                offset += 2
+                return result
+
+            with mock.patch.object(bench_flatten.time, 'monotonic', side_effect=lambda: clock()+offset), \
+                 mock.patch.object(bench_flatten, 'stop_owned_group', side_effect=delayed_stop), \
+                 mock.patch.object(bench_flatten.subprocess, 'run', side_effect=timed_consumer), \
+                 mock.patch.object(bench_flatten, 'verify_contents'):
+                result = bench_flatten.one(args, ('fixture', str(producer), '/bin/true'), 1, results, {})
+            self.assertGreaterEqual(result['post_eof_teardown_seconds'], 100)
+            self.assertGreaterEqual(result['receiver_validation_seconds'], 2)
+            self.assertLess(result['receiver_validation_seconds'], result['post_eof_teardown_seconds'])
+            self.assertAlmostEqual(result['accepted_seconds'], result['producer_eof_seconds'] +
+                                   result['post_eof_teardown_seconds'] + result['receiver_validation_seconds'])
+            self.assertEqual(list(scratch.iterdir()), [])
 
     def test_cancel_joins_writer_in_another_owned_process_group(self):
         self.cancel_measurement(True, timing_only=True, new_group=True)

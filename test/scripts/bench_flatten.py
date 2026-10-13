@@ -133,7 +133,7 @@ def tree_contents(tree):
         elif stat.S_ISLNK(info.st_mode):
             row.update(type='symlink', target=os.readlink(path))
         else:
-            row.update(type='special', device=info.st_rdev)
+            row.update(type='special', kind=stat.S_IFMT(info.st_mode), device=info.st_rdev)
         actual[name] = row
     for names in links.values():
         canonical = min(names)
@@ -259,6 +259,7 @@ def one(args, variant, trial, result_root, verified):
         if failures:
             raise RuntimeError(f'measurement failed: {failures}')
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        validation_started = time.monotonic()
         with (run / 'consumer.json').open('wb') as output:
             subprocess.run([args.consumer, 'info', str(artifact)], stdout=output, check=True)
         accepted = time.monotonic()
@@ -282,7 +283,9 @@ def one(args, variant, trial, result_root, verified):
                   'producer_eof_seconds': eof-started, 'accepted_seconds': accepted-started,
                   'first_output_seconds': first_output_seconds if args.progress_timing else None,
                   'progress_events': progress_events,
-                  'receiver_validation_seconds': accepted-eof, 'receiver_fsync_seconds': fsync_seconds,
+                  'post_eof_teardown_seconds': validation_started-eof,
+                  'receiver_validation_seconds': accepted-validation_started,
+                  'receiver_fsync_seconds': fsync_seconds,
                   'child_cpu_user_seconds': usage.ru_utime-baseline_usage.ru_utime,
                   'child_cpu_system_seconds': usage.ru_stime-baseline_usage.ru_stime,
                   'child_io_input_512blocks': usage.ru_inblock-baseline_usage.ru_inblock,

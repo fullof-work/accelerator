@@ -131,7 +131,12 @@ pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated
 scratch blocks/inodes and deleted-open files, and waits for the owned producer
 session, including children in different process groups, before cleaning scratch. Receiving artifact P and its optional fsync are
-reported separately. Optional `--progress-timing` timestamps existing CLI progress
+reported separately. `post_eof_teardown_seconds` measures the interval from producer
+completion through owned process/thread cleanup to the start of consumer validation;
+`receiver_validation_seconds` measures the consumer validation interval.
+`accepted_seconds` retains the full interval including both. Older records without
+`post_eof_teardown_seconds` include both intervals in `receiver_validation_seconds`;
+they cannot be split retrospectively. Optional `--progress-timing` timestamps existing CLI progress
 lines and the first available stdout bytes for phase attribution; preparation
 ends before the artifact writer can emit its header. Child rusage I/O counters may be unavailable on some hosts;
 sampled RSS and block peaks have the recorded sampling resolution.
@@ -156,7 +161,8 @@ Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent a
 output root must be disjoint; the output root must not exist. A Registry input
 must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
 by relative path: each entry includes `type`, `mode`, `uid`, `gid`, plus file
-`size`/`sha256`, symlink `target` or special-file `device`. For each regular-file
+`size`/`sha256`, symlink `target` or special-file `device` and numeric `kind` (`stat.S_IFMT(st_mode)`, distinguishing
+FIFO, socket, character and block device). For each regular-file
 hard-link group in the selected tree, the lexicographically first relative path
 is canonical; other members include `hardlink_to` naming that path. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
