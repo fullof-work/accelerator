@@ -26,10 +26,11 @@ func removeOwnedWork(work string) error {
 	if err != nil {
 		return errors.Join(original, err)
 	}
-	// Keep cleanup memory bounded on wide read-only trees; WalkDir would
-	// allocate a complete directory listing before removing any entries.
-	var makeRemovable func(string) error
-	makeRemovable = func(name string) (retErr error) {
+	// Read each directory in batches and retain only pending directory paths.
+	// Close its scan before visiting children: permission recovery must not
+	// retain a descriptor for every ancestor of a deep image directory.
+	pending := []string{"."}
+	scan := func(name string) (retErr error) {
 		info, err := root.Lstat(name)
 		if err != nil {
 			return err
@@ -49,9 +50,7 @@ func removeOwnedWork(work string) error {
 			entries, err := directory.ReadDir(128)
 			for _, entry := range entries {
 				if entry.IsDir() {
-					if childErr := makeRemovable(path.Join(name, entry.Name())); childErr != nil {
-						return childErr
-					}
+					pending = append(pending, path.Join(name, entry.Name()))
 				}
 			}
 			if err == io.EOF {
@@ -62,7 +61,16 @@ func removeOwnedWork(work string) error {
 			}
 		}
 	}
-	walkErr := makeRemovable(".")
+	var walkErr error
+	for len(pending) != 0 {
+		last := len(pending) - 1
+		name := pending[last]
+		pending[last] = ""
+		pending = pending[:last]
+		if walkErr = scan(name); walkErr != nil {
+			break
+		}
+	}
 	closeErr := root.Close()
 	removeErr := os.RemoveAll(work)
 	if walkErr != nil || closeErr != nil || removeErr != nil {
