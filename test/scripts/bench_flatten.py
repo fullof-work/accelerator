@@ -289,6 +289,17 @@ def producer_config(path):
 def child_subreaper():
     # This private Linux harness adopts orphaned helpers so wait accounts their
     # CPU/I/O. Never waitpid(-1): unrelated children remain caller-owned.
+    # Check the harness's identity-bound cleanup support before launching any
+    # producer. Unsupported hosts fail without leaving work to terminate.
+    fd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(fd, 0)
+        try:
+            os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+        except ChildProcessError:
+            pass
+    finally:
+        os.close(fd)
     libc = ctypes.CDLL(None, use_errno=True)
     previous = ctypes.c_int()
     def prctl(option, argument):
@@ -303,48 +314,59 @@ def child_subreaper():
         prctl(36, previous.value)
 
 
+def signal_owned_process(path, observed, producer_pid, sig):
+    # A numeric PID/PGID can be reused after enumeration. Bind before the
+    # second identity check and use this handle for both signaling and reaping.
+    try:
+        pid = int(path.parent.name)
+        fd = os.pidfd_open(pid)
+        try:
+            fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+            identity = fields[19], fields[3]
+            if identity != (observed[19], observed[3]):
+                return False
+            if pid != producer_pid and int(fields[1]) == os.getpid():
+                try:
+                    if os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG) is not None:
+                        return False
+                except ChildProcessError:
+                    pass
+            if fields[0] in ('Z', 'X', 'x') and not live_task_stats(path.parent, identity):
+                return False
+            if sig is not None:
+                signal.pidfd_send_signal(fd, sig)
+            return True
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 def stop_owned_group(producer, leader_start):
-    def active_groups():
-        groups = set()
+    def active_members(sig):
+        active = 0
         for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
             try:
                 fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
                 if int(path.parent.name) == producer.pid and fields[19] != leader_start:
-                    raise RuntimeError('producer PID was reused; refusing group termination')
+                    raise RuntimeError('producer PID was reused; refusing session termination')
                 if int(fields[3]) == producer.pid:
-                    group = int(fields[2])
-                    if group <= 1 or int(fields[19]) < int(leader_start):
+                    if int(fields[2]) <= 1 or int(fields[19]) < int(leader_start):
                         raise RuntimeError('unexpected member of owned producer session')
-                    pid = int(path.parent.name)
-                    if pid != producer.pid and int(fields[1]) == os.getpid():
-                        # Only adopted members of this exact session are ours
-                        # to reap. The leader remains managed by Popen.
-                        try:
-                            waited, _ = os.waitpid(pid, os.WNOHANG)
-                            if waited:
-                                continue
-                        except ChildProcessError:
-                            pass
-                    if fields[0] not in ('Z', 'X', 'x') or live_task_stats(path.parent, (fields[19], fields[3])):
-                        groups.add(group)
+                    active += signal_owned_process(path, fields, producer.pid, sig)
             except (FileNotFoundError, ProcessLookupError):
                 pass
-        return groups
+        return active
 
     for sig, seconds in [(signal.SIGTERM, 10), (signal.SIGKILL, 5)]:
         deadline = time.monotonic() + seconds
         while True:
-            groups = active_groups()
-            if not groups and producer.poll() is not None:
+            active = active_members(sig)
+            if not active and producer.poll() is not None:
                 producer.wait()
-                if not active_groups():
+                if not active_members(None):
                     return
                 continue
-            for group in groups:
-                try:
-                    os.killpg(group, sig)
-                except ProcessLookupError:
-                    pass
             producer.poll()
             if time.monotonic() >= deadline:
                 break

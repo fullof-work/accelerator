@@ -47,6 +47,9 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		}
 	}()
 	if previous != nil {
+		if err := checkMountedOutput(fd, filepath.Base(output)); err != nil {
+			return nil, err
+		}
 		if err := checkStickyReplacement(fd, previous.Uid); err != nil {
 			return nil, err
 		}
@@ -376,6 +379,36 @@ func checkStickyReplacement(parentFD int, owner uint32) error {
 	}
 	if caps[0].Effective&(1<<unix.CAP_FOWNER) == 0 {
 		return fmt.Errorf("atomic output replacement in a sticky directory requires ownership of the directory or destination, or CAP_FOWNER: %w", unix.EPERM)
+	}
+	return nil
+}
+
+// A mounted regular file can be writable while rename over it is forbidden.
+// Compare mount identities relative to the bound parent before preparation.
+// Older kernels without mount IDs retain rename's authoritative final check.
+func checkMountedOutput(parentFD int, name string) error {
+	var parent, output unix.Statx_t
+	for _, item := range []struct {
+		name   string
+		flags  int
+		result *unix.Statx_t
+	}{
+		{"", unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW, &parent},
+		{name, unix.AT_SYMLINK_NOFOLLOW, &output},
+	} {
+		err := unix.Statx(parentFD, item.name, item.flags, unix.STATX_MNT_ID, item.result)
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if item.result.Mask&unix.STATX_MNT_ID == 0 {
+			return nil
+		}
+	}
+	if parent.Mnt_id != output.Mnt_id {
+		return fmt.Errorf("atomic output replacement cannot replace a mounted file: %w", unix.EBUSY)
 	}
 	return nil
 }

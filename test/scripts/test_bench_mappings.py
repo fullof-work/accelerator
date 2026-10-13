@@ -338,9 +338,35 @@ class ProcessNameEncoding(unittest.TestCase):
 
     def test_teardown_accepts_non_utf8_names_and_preserves_unrelated_session(self):
         with self.processes_with_byte_names() as (owned, unrelated, started):
-            bench_flatten.stop_owned_group(owned, started)
+            with mock.patch.object(os, 'killpg', side_effect=AssertionError('numeric group signaling is not identity-bound')):
+                bench_flatten.stop_owned_group(owned, started)
             self.assertIsNotNone(owned.poll())
             self.assertIsNone(unrelated.poll(), 'unrelated session was terminated')
+
+
+    def test_bound_termination_rechecks_identity(self):
+        with self.processes_with_byte_names() as (owned, unrelated, started):
+            path = pathlib.Path('/proc')/str(owned.pid)/'stat'
+            fields = path.read_text(errors='surrogateescape').rsplit(') ',1)[1].split()
+            fields[19] = str(int(started)+1)
+            with mock.patch.object(signal, 'pidfd_send_signal', side_effect=AssertionError('signaled a changed identity')):
+                self.assertFalse(bench_flatten.signal_owned_process(path, fields, owned.pid, signal.SIGTERM))
+            self.assertIsNone(owned.poll())
+            self.assertIsNone(unrelated.poll())
+
+    def test_bound_termination_tolerates_exit_after_check(self):
+        with self.processes_with_byte_names() as (owned, unrelated, started):
+            path = pathlib.Path('/proc')/str(owned.pid)/'stat'
+            fields = path.read_text(errors='surrogateescape').rsplit(') ',1)[1].split()
+            send = signal.pidfd_send_signal
+            def exited(fd, sig, *args):
+                owned.terminate();owned.wait(timeout=5)
+                return send(fd, sig, *args)
+            before = len(os.listdir('/proc/self/fd'))
+            with mock.patch.object(signal, 'pidfd_send_signal', new=exited):
+                self.assertFalse(bench_flatten.signal_owned_process(path, fields, owned.pid, signal.SIGTERM))
+            self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+            self.assertIsNone(unrelated.poll())
 
 
 class BoundMeasurementReferences(unittest.TestCase):

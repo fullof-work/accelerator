@@ -133,7 +133,7 @@ scratch blocks/inodes and deleted-open files, and waits for the owned producer
 session, including children in different process groups, before cleaning scratch.
 The Linux harness temporarily acts as a child subreaper and waits only adopted
 members of that owned session, so their CPU/I/O is included in child rusage;
-unrelated children are not reaped. Records from older harnesses may omit orphan
+unrelated children are not reaped. Termination and adopted-child waits use pidfds after rechecking process identity, with repeated session enumeration; numeric process-group IDs are not signal targets. The measurement host must support pidfd signaling and waits, checked before launching a producer. Records from older harnesses may omit orphan
 helpers' CPU/I/O. After all writers stop, cleanup restores deletion access only
 within owned scratch, including failure/cancellation paths. A cleanup error is
 attached to the original failure instead of replacing it. Receiving artifact P and its optional fsync are
