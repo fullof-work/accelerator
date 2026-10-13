@@ -35,7 +35,10 @@ def process_tree(root, leader_start=None):
         try:
             fields = path.read_text().rsplit(') ', 1)[1].split()
             pid, parent = int(path.parent.name), int(fields[1])
-            rows[pid] = int(fields[21]) * page_size
+            # Exited rows have no resident memory to measure. Keep their
+            # edges below so an observed descendant is still traversed.
+            if fields[0] not in ('Z', 'X', 'x'):
+                rows[pid] = int(fields[21]) * page_size
             children.setdefault(parent, []).append(pid)
             if leader_start is not None:
                 if pid == root and fields[19] != leader_start:
@@ -52,7 +55,7 @@ def process_tree(root, leader_start=None):
         seen.add(pid)
         if pid in rows:
             result.append((pid, rows[pid]))
-            pending.extend(children.get(pid, []))
+        pending.extend(children.get(pid, []))
     return result
 
 

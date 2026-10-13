@@ -186,6 +186,33 @@ while not (root/'exit').exists():time.sleep(0.01)
                 except ProcessLookupError:pass
                 parent.wait(timeout=5)
 
+    def test_exited_process_is_not_a_memory_observation(self):
+        child=subprocess.Popen(['/bin/true'],start_new_session=True)
+        try:
+            # WNOWAIT leaves an actual exited child visible in procfs without
+            # relying on scheduler timing or reaping it before observation.
+            os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOWAIT)
+            fields=(pathlib.Path('/proc')/str(child.pid)/'stat').read_text().rsplit(') ',1)[1].split()
+            self.assertEqual(fields[0],'Z')
+            self.assertEqual(bench_flatten.process_tree(child.pid,fields[19]),[])
+        finally:
+            child.wait(timeout=5)
+
+    def test_process_walk_preserves_edges_of_exited_rows(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-proc-test-') as directory:
+            root=pathlib.Path(directory)
+            rows=[]
+            # procfs enumeration is not atomic. Preserve a live descendant
+            # even if its recorded parent has exited by the time it is read.
+            for pid,parent,state,rss in [(100,1,'Z',0),(101,100,'X',0),(102,101,'S',7)]:
+                entry=root/str(pid);entry.mkdir()
+                fields=[state,str(parent),'0','100']+['0']*18
+                fields[21]=str(rss)
+                path=entry/'stat';path.write_text(f'{pid} (fixture) '+ ' '.join(fields))
+                rows.append(path)
+            with mock.patch.object(pathlib.Path,'glob',return_value=rows):
+                self.assertEqual(bench_flatten.process_tree(100),[(102,7*os.sysconf('SC_PAGE_SIZE'))])
+
     def test_resource_pass_without_observed_process_is_invalid(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root=pathlib.Path(directory)
