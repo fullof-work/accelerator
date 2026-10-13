@@ -186,7 +186,7 @@ is canonical; other members include `hardlink_to` naming that path. The first oc
 each artifact identity is extracted with the selected native fsck, and its actual
 contents and metadata must match. This extra extraction is outside measurement. After verification, only the owned
 extraction tree has directory access restored for removal; external symlink
-targets remain untouched. Scratch permission or I/O errors fail the measurement; directories removed by the producer during sampling are tolerated.
+targets remain untouched. Scratch permission or I/O errors, including denied inspection of an owned process's open files, fail the measurement; directories removed by the producer and processes or file descriptors that disappear during sampling are tolerated.
 
 ```bash
 python3 test/scripts/bench_flatten.py \

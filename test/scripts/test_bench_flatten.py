@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise measurement cancellation with live owned/background writers."""
 import os
+import contextlib
 import io
 import json
 import hashlib
@@ -95,6 +96,59 @@ sys.exit(17)
                 self.assertEqual(stat.S_IMODE(outside.stat().st_mode),0o555)
                 self.assertFalse(list(results.glob('*/result.json')))
                 outside.chmod(0o700)
+
+    def process_file_scan_error(self, operation, error):
+        with tempfile.TemporaryDirectory(prefix='flatten-fd-test-') as directory:
+            scratch = pathlib.Path(directory)
+            fd = pathlib.Path('/proc')/str(os.getpid())/'fd/fixture'
+            with contextlib.ExitStack() as patches:
+                patches.enter_context(mock.patch.object(pathlib.Path, 'iterdir',
+                    side_effect=error if operation == 'enumerate' else None,
+                    return_value=iter([fd])))
+                patches.enter_context(mock.patch.object(os, 'readlink',
+                    side_effect=error if operation == 'readlink' else None,
+                    return_value=str(scratch/'unlinked')))
+                if operation == 'stat':
+                    original_stat = pathlib.Path.stat
+                    def stat_path(path, *args, **kwargs):
+                        if path == fd:
+                            raise error
+                        return original_stat(path, *args, **kwargs)
+                    patches.enter_context(mock.patch.object(pathlib.Path, 'stat', new=stat_path))
+                return bench_flatten.scratch_usage(scratch, [(os.getpid(), 0)])
+
+    def test_process_file_inspection_permission_errors_fail(self):
+        for operation in ['enumerate', 'readlink', 'stat']:
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(PermissionError, 'inspection denied'):
+                    self.process_file_scan_error(operation, PermissionError('inspection denied'))
+
+    def test_disappearing_process_files_are_tolerated(self):
+        for operation in ['enumerate', 'readlink', 'stat']:
+            for error in [FileNotFoundError, ProcessLookupError]:
+                with self.subTest(operation=operation, error=error):
+                    sample = self.process_file_scan_error(operation, error('process or FD vanished'))
+                    self.assertEqual(sample['deleted_open_files'], 0)
+                    self.assertEqual(sample['deleted_open_blocks'], 0)
+
+    def test_resource_pass_rejects_denied_process_file_inspection(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-fd-test-') as directory:
+            root=pathlib.Path(directory)
+            scratch=root/'scratch';scratch.mkdir()
+            results=root/'results';results.mkdir()
+            producer=root/'producer'
+            producer.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(0.1)\nprint("fixture")\n')
+            producer.chmod(0o755)
+            args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                                 timing_only=False,interval=0.01)
+            with mock.patch.object(bench_flatten,'scratch_usage',side_effect=PermissionError('process file inspection denied')) as sample, \
+                 mock.patch.object(bench_flatten,'verify_contents') as verify:
+                with self.assertRaisesRegex(RuntimeError,'measurement failed.*process file inspection denied'):
+                    bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                sample.assert_called_once()
+                verify.assert_not_called()
+            self.assertFalse(list(results.glob('*/result.json')))
+            self.assertEqual(list(scratch.iterdir()),[])
 
     def test_deleted_open_uses_link_count(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:

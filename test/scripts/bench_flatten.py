@@ -77,6 +77,8 @@ def scratch_usage(scratch, processes):
             except FileNotFoundError:
                 pass
     deleted = set()
+    # A disappearing process/FD is normal. Denied inspection cannot establish
+    # whether an unlinked scratch file still occupies space.
     for pid, _ in processes:
         try:
             for fd in (pathlib.Path('/proc') / str(pid) / 'fd').iterdir():
@@ -88,9 +90,9 @@ def scratch_usage(scratch, processes):
                         objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
                         if st.st_nlink == 0:
                             deleted.add(key)
-                except (FileNotFoundError, PermissionError):
+                except (FileNotFoundError, ProcessLookupError):
                     pass
-        except (FileNotFoundError, PermissionError):
+        except (FileNotFoundError, ProcessLookupError):
             pass
     return {'scratch_blocks': sum(v[0] for v in objects.values()),
             'scratch_inodes': len(objects), 'deleted_open_files': len(deleted),
