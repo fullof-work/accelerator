@@ -160,7 +160,7 @@ these checks or tool hashes remain incomplete evidence; do not infer them from
 the producer hash or artifact identity.
 
 Walking a wide tree for block/inode samples can perturb the pipe receiver and
-source I/O. Process enumeration follows procfs parent PIDs and includes owned-session
+source I/O. Procfs stat parsing preserves arbitrary process-name bytes, including names of unrelated processes. Process enumeration follows procfs parent PIDs and includes owned-session
 members after reparenting, checking the leader start time; it does not require
 the optional per-task `children` interface. A resource pass without samples, or whose samples never observe a live owned process, fails
 instead of publishing zero peaks. The receiver retries interrupted and positive short writes before recording artifact bytes; a write without progress or a storage error fails the run. Deleted-open accounting includes a retained, removed scratch root and uses inode link count,

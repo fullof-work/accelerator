@@ -297,3 +297,45 @@ class ProcessDirectoryReferences(unittest.TestCase):
                                     bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
                             else:
                                 self.assertEqual(bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])['scratch_inodes'], 1)
+
+
+class ProcessNameEncoding(unittest.TestCase):
+    @contextlib.contextmanager
+    def processes_with_byte_names(self):
+        code = ("import ctypes,sys\n"
+                "libc=ctypes.CDLL(None,use_errno=True)\n"
+                "libc.prctl.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong]\n"
+                "if libc.prctl(15,b'flat\\xff) \\nname',0,0,0):raise OSError(ctypes.get_errno(),'prctl')\n"
+                "print('ready',flush=True)\n"
+                "sys.stdin.buffer.read(1)\n")
+        children = []
+        try:
+            # Two independent sessions: the first belongs to the measurement;
+            # the second is visible in procfs but must survive its teardown.
+            for _ in range(2):
+                child = subprocess.Popen([sys.executable, '-c', code], start_new_session=True,
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                children.append(child)
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0], 'name fixture did not become ready')
+                self.assertEqual(child.stdout.readline(), b'ready\n')
+            record = (pathlib.Path('/proc')/str(children[0].pid)/'stat').read_bytes()
+            self.assertIn(b'flat\xff) \nname', record)
+            start = record.rsplit(b') ', 1)[1].split()[19].decode('ascii')
+            yield children[0], children[1], start
+        finally:
+            for child in children:
+                if child.poll() is None:child.terminate()
+                child.wait(timeout=5)
+                for stream in [child.stdin, child.stdout, child.stderr]:stream.close()
+
+    def test_sampling_accepts_non_utf8_owned_and_unrelated_names(self):
+        with self.processes_with_byte_names() as (owned, unrelated, started):
+            observed = dict(bench_flatten.process_tree(owned.pid, started))
+            self.assertGreater(observed[owned.pid], 0)
+            self.assertNotIn(unrelated.pid, observed)
+
+    def test_teardown_accepts_non_utf8_names_and_preserves_unrelated_session(self):
+        with self.processes_with_byte_names() as (owned, unrelated, started):
+            bench_flatten.stop_owned_group(owned, started)
+            self.assertIsNotNone(owned.poll())
+            self.assertIsNone(unrelated.poll(), 'unrelated session was terminated')

@@ -34,7 +34,7 @@ def process_tree(root, leader_start=None):
     page_size = os.sysconf('SC_PAGE_SIZE')
     for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
         try:
-            fields = path.read_text().rsplit(') ', 1)[1].split()
+            fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
             pid, parent = int(path.parent.name), int(fields[1])
             # Exited rows have no resident memory to measure. Keep their
             # edges below so an observed descendant is still traversed.
@@ -176,7 +176,7 @@ def stop_owned_group(producer, leader_start):
         groups = set()
         for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
             try:
-                fields = path.read_text().rsplit(') ', 1)[1].split()
+                fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
                 if int(path.parent.name) == producer.pid and fields[19] != leader_start:
                     raise RuntimeError('producer PID was reused; refusing group termination')
                 if int(fields[3]) == producer.pid:
@@ -374,7 +374,7 @@ def measure_one(args, variant, trial, result_root, verified):
                         failures.append('progress reader: '+str(error))
                 stderr_reader = threading.Thread(target=read_progress)
                 stderr_reader.start()
-            leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
+            leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()[19]
             if not stat.S_ISFIFO(os.fstat(producer.stdout.fileno()).st_mode):
                 raise RuntimeError('producer output is not a real pipe')
             def monitor():
@@ -498,7 +498,7 @@ def measure_one(args, variant, trial, result_root, verified):
         # Wait for owned writers before removing their scratch.
         if producer is not None and not stopped:
             if leader_start is None:
-                leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
+                leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()[19]
             try:
                 stop_owned_group(producer, leader_start)
                 stopped = True
