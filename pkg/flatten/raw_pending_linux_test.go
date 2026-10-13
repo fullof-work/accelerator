@@ -366,3 +366,89 @@ func TestRawPendingGroupAndEmptyRoot(t *testing.T) {
 		}
 	}
 }
+
+func TestRawPendingChownOnly(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_CHOWN_ONLY"
+	if kind := os.Getenv(helper); kind != "" {
+		dir := t.TempDir()
+		output := filepath.Join(dir, "output")
+		if err := os.WriteFile(output, []byte("old"), 0640); err != nil {
+			t.Fatal(err)
+		}
+		var acl []byte
+		if kind == "acl" {
+			acl = pendingACL(6)
+			setPendingACL(t, output, outputAccessACL, acl)
+		}
+		if err := os.Chown(output, 12344, 23456); err != nil {
+			t.Fatal(err)
+		}
+		// Capability changes are thread-local. Keep all filesystem calls below on
+		// this test child's reduced thread, leaving the parent test runner intact.
+		runtime.LockOSThread()
+		header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+		caps := [2]unix.CapUserData{{Effective: 1 << unix.CAP_CHOWN, Permitted: 1 << unix.CAP_CHOWN}, {}}
+		if err := unix.Capset(&header, &caps[0]); err != nil {
+			t.Fatal(err)
+		}
+		var actual [2]unix.CapUserData
+		if err := unix.Capget(&header, &actual[0]); err != nil {
+			t.Fatal(err)
+		}
+		if actual != caps {
+			t.Fatalf("capability reduction failed: %+v", actual)
+		}
+		pending, err := reserveRawOutput(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pending.Close()
+		if _, err := pending.file.Write([]byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 3)
+		if _, err := pending.file.ReadAt(got, 0); err != nil || string(got) != "new" {
+			t.Fatalf("reserved content: %q %v", got, err)
+		}
+		if err := pending.closeFile(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.Close(); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := info.Sys().(*syscall.Stat_t)
+		if owner.Uid != 12344 || owner.Gid != 23456 || info.Mode().Perm() != 0640 {
+			t.Fatalf("output metadata: %+v", owner)
+		}
+		gotACL, err := readOutputAccessACL(output)
+		if err != nil || !bytes.Equal(gotACL, acl) {
+			t.Fatalf("output ACL: %x %v", gotACL, err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 1 || entries[0].Name() != "output" {
+			t.Fatalf("staging cleanup: %v %v", entries, err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to prepare foreign ownership and reduce capabilities")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"mode", "acl"} {
+		cmd := exec.Command(executable, "-test.run=^TestRawPendingChownOnly$")
+		cmd.Env = append(os.Environ(), helper+"="+kind)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", kind, err, out)
+		}
+	}
+}

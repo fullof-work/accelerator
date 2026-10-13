@@ -121,6 +121,12 @@ artifact reader，默认交替顺序执行三轮。记录工具摘要、进程�
 stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 writer 才能输出 artifact 头。部分宿主不提供 child rusage I/O 计数；
 采样 RSS 与块峰值受记录的采样间隔限制。
 
+接收成功或缓存已核验 artifact 身份之前，当前 consumer 的 `info --json` 配置必须与
+`--expected-config` 提供的固定投影 JSON 相同。仅当夹具明确不含追加配置时使用 JSON
+`null`。记录包含预期配置摘要、保存的 consumer 输出，以及 consumer 和 fsck 的解析后
+路径和 SHA-256 摘要。旧记录若缺少这些核验或工具摘要，仍属不完整证据；不得从生产工具
+摘要或 artifact 身份推断补齐。
+
 进程枚举使用 procfs 的父 PID，并在核对会话首进程启动时间后纳入重新归属父进程的自有会话成员，不依赖可选的逐任务 `children` 接口。资源轮次没有样本时明确失败，不发布零峰值。已删除但仍打开的文件按 inode 链接数判定，不依赖 procfs 文件名后缀。清理失败时终止进度读取并保留 scratch，避免无限等待 stderr。
 
 宽目录的块数/inode 遍历可能干扰管道接收和源文件 I/O。资源采样轮次之外，再在相同
@@ -150,6 +156,7 @@ python3 test/scripts/bench_flatten.py \
   --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
   --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
   --input fixtures/image.tar --expected fixtures/expected.json \
+  --expected-config fixtures/runtime-config.json \
   --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
   --scratch-parent scratch --output-root results --trials 3 --fsync
 ```

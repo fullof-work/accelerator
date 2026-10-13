@@ -322,7 +322,13 @@ def one(args, variant, trial, result_root, verified):
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         validation_started = time.monotonic()
         with (run / 'consumer.json').open('wb') as output:
-            subprocess.run([args.consumer, 'info', str(artifact)], stdout=output, check=True)
+            subprocess.run([args.consumer, 'info', '--json', str(artifact)], stdout=output, check=True)
+        # Compare the appended config before either acceptance or caching a
+        # verified artifact identity. A valid EROFS tree alone is insufficient.
+        info = json.loads((run / 'consumer.json').read_text())
+        expected_config = json.loads(args.expected_config.read_text())
+        if 'config' not in info or info['config'] != expected_config:
+            raise RuntimeError('runtime config differs from fixed fixture')
         accepted = time.monotonic()
         fsync_seconds = 0
         if args.fsync:
@@ -339,6 +345,10 @@ def one(args, variant, trial, result_root, verified):
         result = {'variant': name, 'trial': trial, 'command': command,
                   'producer_sha256': file_digest(cli),
                   'mkfs_sha256': file_digest(mkfs),
+                  'consumer': str(pathlib.Path(args.consumer).resolve(strict=True)),
+                  'consumer_sha256': file_digest(args.consumer),
+                  'fsck': str(pathlib.Path(args.fsck).resolve(strict=True)),
+                  'fsck_sha256': file_digest(args.fsck),
                   'artifact_sha256': digest.hexdigest(), 'artifact_bytes': size,
                   'artifact_blocks': artifact.stat().st_blocks*512,
                   'producer_eof_seconds': eof-started, 'accepted_seconds': accepted-started,
@@ -357,6 +367,8 @@ def one(args, variant, trial, result_root, verified):
                   'timing_only': args.timing_only,
                   'content_verification': verified[identity],
                   'expected_content_sha256': file_digest(args.expected),
+                  'runtime_config_verification': str(run / 'consumer.json'),
+                  'expected_config_sha256': file_digest(args.expected_config),
                   'measurement_scope': ('timing only; no sampled scratch or process RSS; receiver P separate' if args.timing_only else 'host producer private scratch and sampled process RSS; receiver P separate; rusage I/O may be unavailable; not Guest ext4 or Host COW')}
         (run / 'samples.json').write_text(json.dumps(samples)+'\n')
         (run / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
@@ -392,6 +404,7 @@ def main():
     parser.add_argument('--consumer', required=True, help='current flatten-ctl')
     parser.add_argument('--config', type=pathlib.Path)
     parser.add_argument('--expected', type=pathlib.Path, required=True, help='fixed extracted content and metadata JSON')
+    parser.add_argument('--expected-config', type=pathlib.Path, required=True, help='fixed projected runtime config JSON; null only when no appended config is expected')
     parser.add_argument('--fsck', required=True, help='trusted native fsck.erofs with extraction support')
     parser.add_argument('--scratch-parent', required=True, type=pathlib.Path)
     parser.add_argument('--output-root', required=True, type=pathlib.Path)
@@ -415,6 +428,10 @@ def main():
     args.consumer = str(pathlib.Path(args.consumer).resolve(strict=True))
     args.fsck = str(pathlib.Path(args.fsck).resolve(strict=True))
     args.expected = args.expected.resolve(strict=True)
+    args.expected_config = args.expected_config.resolve(strict=True)
+    expected_config = json.loads(args.expected_config.read_text())
+    if expected_config is not None and not isinstance(expected_config, dict):
+        parser.error("expected runtime config must be an object or null")
     args.scratch_parent = args.scratch_parent.resolve(strict=True)
     args.output_root = args.output_root.resolve()
     local_input = pathlib.Path(args.input)

@@ -127,13 +127,10 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		if err := unix.Fstat(fileFD, &st); err != nil {
 			return nil, err
 		}
-		if st.Uid != uint32(uid) || st.Gid != uint32(gid) {
-			if err := p.file.Chown(uid, gid); err != nil {
-				return nil, err
-			}
-		}
 		// Drop an inherited ACL when the existing destination had none, then
-		// restore its rwx bits and access ACL after ownership changes.
+		// restore its rwx bits and access ACL while we still own the file.
+		// A caller with CAP_CHOWN need not also have CAP_FOWNER. Output
+		// files do not retain setuid/setgid execution bits.
 		if accessACL == nil {
 			if err := unix.Fremovexattr(fileFD, outputAccessACL); err != nil && !absentAccessACL(err) {
 				return nil, err
@@ -144,6 +141,11 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		}
 		if accessACL != nil {
 			if err := unix.Fsetxattr(fileFD, outputAccessACL, accessACL, 0); err != nil {
+				return nil, err
+			}
+		}
+		if st.Uid != uint32(uid) || st.Gid != uint32(gid) {
+			if err := p.file.Chown(uid, gid); err != nil {
 				return nil, err
 			}
 		}

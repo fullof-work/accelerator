@@ -305,7 +305,7 @@ print('fixture')
             expected.write_text('{}')
             args = SimpleNamespace(scratch_parent=scratch, progress_timing=False,
                                    config=None, input='fixture', timing_only=True,
-                                   consumer='/bin/true', fsync=False, expected=expected,
+                                   consumer='/bin/true', fsck='/bin/true', fsync=False, expected=expected, expected_config=expected,
                                    keep_artifacts=False)
             clock = time.monotonic
             stop = bench_flatten.stop_owned_group
@@ -321,6 +321,7 @@ print('fixture')
             def timed_consumer(*args, **kwargs):
                 nonlocal offset
                 result = run(*args, **kwargs)
+                kwargs['stdout'].write(b'{"config":{}}')
                 offset += 2
                 return result
 
@@ -335,6 +336,51 @@ print('fixture')
             self.assertAlmostEqual(result['accepted_seconds'], result['producer_eof_seconds'] +
                                    result['post_eof_teardown_seconds'] + result['receiver_validation_seconds'])
             self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_config_validation_and_consumer_provenance(self):
+        fixed = {'Architecture':'amd64', 'Os':'linux', 'User':'10001:10002',
+                 'Env':['LANG=C', 'FIXTURE=161'], 'Entrypoint':['/bin/fixture'],
+                 'Healthcheck':{'Test':['CMD','/bin/fixture','--health'], 'Interval':1000000000}}
+        variants = [('valid', fixed), ('missing', None)]
+        for key in fixed:
+            changed = dict(fixed)
+            changed.pop(key)
+            variants.append((key, changed))
+        for label, config in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='flatten-config-test-') as directory:
+                root=pathlib.Path(directory)
+                scratch=root/'scratch';scratch.mkdir()
+                results=root/'results';results.mkdir()
+                producer=root/'producer'
+                producer.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(0.02)\nprint("same tree")\n')
+                producer.chmod(0o755)
+                consumer=root/'consumer'
+                consumer.write_text('#!/usr/bin/env python3\nimport sys\nprint('+repr(json.dumps({'config':config}))+')\n')
+                consumer.chmod(0o755)
+                expected=root/'tree.json';expected.write_text('{}')
+                expected_config=root/'config.json';expected_config.write_text(json.dumps(fixed))
+                args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                    timing_only=True,consumer=str(consumer),fsck='/bin/true',fsync=False,expected=expected,
+                    expected_config=expected_config,keep_artifacts=False)
+                verified={}
+                with mock.patch.object(bench_flatten,'verify_contents') as tree_check:
+                    if label != 'valid':
+                        with self.assertRaisesRegex(RuntimeError,'runtime config differs'):
+                            bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,verified)
+                        self.assertFalse(verified)
+                        self.assertFalse(list(results.glob('*/result.json')))
+                        tree_check.assert_not_called()
+                    else:
+                        result=bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,verified)
+                        self.assertEqual(result['consumer'],str(consumer.resolve()))
+                        self.assertEqual(result['consumer_sha256'],bench_flatten.file_digest(consumer))
+                        self.assertEqual(result['fsck'],str(pathlib.Path('/bin/true').resolve()))
+                        self.assertEqual(result['fsck_sha256'],bench_flatten.file_digest('/bin/true'))
+                        self.assertEqual(result['expected_config_sha256'],bench_flatten.file_digest(expected_config))
+                        self.assertEqual(json.loads(pathlib.Path(result['runtime_config_verification']).read_text())['config'],fixed)
+                        self.assertTrue(verified)
+                        tree_check.assert_called_once()
+                self.assertEqual(list(scratch.iterdir()),[])
 
     def test_cancel_joins_writer_in_another_owned_process_group(self):
         self.cancel_measurement(True, timing_only=True, new_group=True)
@@ -380,7 +426,7 @@ with (scratch/'active').open('wb') as out:
                                          start_new_session=True)
             command = [sys.executable, '-B', str(pathlib.Path(__file__).with_name('bench_flatten.py')),
                        '--variant', f'fixture,{producer},/bin/true', '--input', str(input_file),
-                       '--consumer', '/bin/true', '--fsck', '/bin/true', '--expected', str(expected),
+                       '--consumer', '/bin/true', '--fsck', '/bin/true', '--expected', str(expected), '--expected-config', str(expected),
                        '--scratch-parent', str(scratch), '--output-root', str(root/'results'), '--trials', '1']
             if progress:
                 command.append('--progress-timing')

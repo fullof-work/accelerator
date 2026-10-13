@@ -141,6 +141,14 @@ lines and the first available stdout bytes for phase attribution; preparation
 ends before the artifact writer can emit its header. Child rusage I/O counters may be unavailable on some hosts;
 sampled RSS and block peaks have the recorded sampling resolution.
 
+The current consumer's `info --json` config must equal the fixed projected JSON
+provided by `--expected-config` before acceptance or caching a verified artifact
+identity. Use JSON `null` only when the fixture intentionally has no appended
+config. Records include the expected config hash, saved consumer output, and the
+resolved paths and SHA-256 hashes of both consumer and fsck. Older records without
+these checks or tool hashes remain incomplete evidence; do not infer them from
+the producer hash or artifact identity.
+
 Walking a wide tree for block/inode samples can perturb the pipe receiver and
 source I/O. Process enumeration follows procfs parent PIDs and includes owned-session
 members after reparenting, checking the leader start time; it does not require
@@ -180,6 +188,7 @@ python3 test/scripts/bench_flatten.py \
   --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
   --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
   --input fixtures/image.tar --expected fixtures/expected.json \
+  --expected-config fixtures/runtime-config.json \
   --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
   --scratch-parent scratch --output-root results --trials 3 --fsync
 ```
