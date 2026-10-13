@@ -630,3 +630,143 @@ func TestRawPendingForeignGroup(t *testing.T) {
 		t.Fatalf("ordinary child: %v\n%s", err, out)
 	}
 }
+
+func TestRawPendingStickyReplacement(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_STICKY"
+	if kind := os.Getenv(helper); kind != "" {
+		runtime.LockOSThread()
+		header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+		var caps [2]unix.CapUserData
+		if err := unix.Capget(&header, &caps[0]); err != nil {
+			t.Fatal(err)
+		}
+		want := uint32(1 << unix.CAP_CHOWN)
+		if kind == "fowner" {
+			want |= 1 << unix.CAP_FOWNER
+		}
+		if os.Geteuid() != 12345 || caps[0].Effective != want || caps[1].Effective != 0 {
+			t.Fatalf("unexpected test identity/capabilities: uid=%d caps=%+v", os.Geteuid(), caps)
+		}
+		output := os.Getenv("KUASAR_TEST_STICKY_OUTPUT")
+		if kind != "absent" {
+			// A writable inode does not imply permission to replace its name.
+			f, err := os.OpenFile(output, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt([]byte("old"), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pending, err := reserveRawOutput(output)
+		if kind == "foreign" {
+			if err == nil {
+				if _, writeErr := pending.file.Write([]byte("new")); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				if closeErr := pending.closeFile(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				commitErr := pending.commit()
+				pending.Close()
+				t.Fatalf("sticky replacement was not rejected before preparation; commit error: %v", commitErr)
+			}
+			if !errors.Is(err, unix.EPERM) {
+				t.Fatalf("expected sticky permission error, got %v", err)
+			}
+			if got, readErr := os.ReadFile(output); readErr != nil || string(got) != "old" {
+				t.Fatalf("old output: %q %v", got, readErr)
+			}
+		} else {
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pending.Close()
+			if _, err := pending.file.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.closeFile(); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.ReadFile(output); err != nil || string(got) != "new" {
+				t.Fatalf("committed output: %q %v", got, err)
+			}
+		}
+		entries, err := os.ReadDir(filepath.Dir(output))
+		if err != nil || len(entries) != 1 || entries[0].Name() != "output" {
+			t.Fatalf("staging entries: %v %v", entries, err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to run an ordinary UID with selected ambient capabilities")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.MkdirTemp("", "sticky-output-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(base)
+	if err := os.Chmod(base, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"foreign", "parent-owner", "file-owner", "fowner", "absent", "non-sticky"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := filepath.Join(base, kind)
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			uid := 12346
+			if kind == "parent-owner" {
+				uid = 12345
+			}
+			if err := os.Chown(dir, uid, 23456); err != nil {
+				t.Fatal(err)
+			}
+			mode := os.FileMode(0777) | os.ModeSticky
+			if kind == "non-sticky" {
+				mode = 0777
+			}
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(dir, "output")
+			if kind != "absent" {
+				if err := os.WriteFile(output, []byte("old"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				uid = 12344
+				if kind == "file-owner" {
+					uid = 12345
+				}
+				if err := os.Chown(output, uid, 23456); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(output, 0666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(executable, "-test.run=^TestRawPendingStickyReplacement$", "-test.v")
+			cmd.Env = append(os.Environ(), helper+"="+kind, "KUASAR_TEST_STICKY_OUTPUT="+output)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 12345, Gid: 23456}, AmbientCaps: []uintptr{unix.CAP_CHOWN}}
+			if kind == "fowner" {
+				cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps, unix.CAP_FOWNER)
+			}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+		})
+	}
+}

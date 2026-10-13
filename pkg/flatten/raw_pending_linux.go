@@ -46,6 +46,11 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 			retErr = errors.Join(retErr, p.Close())
 		}
 	}()
+	if previous != nil {
+		if err := checkStickyReplacement(fd, previous.Uid); err != nil {
+			return nil, err
+		}
+	}
 	for range 10 {
 		name := ".flatten-output-" + rand.Text()
 		err = unix.Mkdirat(fd, name, 0700)
@@ -138,7 +143,7 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		}
 		// Drop an inherited ACL when the existing destination had none, then
 		// restore its rwx bits and access ACL while we still own the file.
-		// A caller with CAP_CHOWN need not also have CAP_FOWNER. Output
+		// This attribute transfer does not require CAP_FOWNER. Output
 		// files do not retain setuid/setgid execution bits.
 		if accessACL == nil {
 			if err := unix.Fremovexattr(fileFD, outputAccessACL); err != nil && !absentAccessACL(err) {
@@ -349,4 +354,27 @@ func readOutputAccessACL(path string) ([]byte, error) {
 		return nil, fmt.Errorf("read destination access ACL: %w", err)
 	}
 	return value[:n], nil
+}
+
+// Writable file contents do not imply permission to replace a directory entry.
+// Check this stable permission denial before preparing an image; rename remains
+// authoritative if ownership, permissions or the destination later change.
+func checkStickyReplacement(parentFD int, owner uint32) error {
+	var parent unix.Stat_t
+	if err := unix.Fstat(parentFD, &parent); err != nil {
+		return err
+	}
+	caller := uint32(os.Geteuid())
+	if parent.Mode&unix.S_ISVTX == 0 || parent.Uid == caller || owner == caller {
+		return nil
+	}
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var caps [2]unix.CapUserData
+	if err := unix.Capget(&header, &caps[0]); err != nil {
+		return fmt.Errorf("check atomic output replacement permission: %w", err)
+	}
+	if caps[0].Effective&(1<<unix.CAP_FOWNER) == 0 {
+		return fmt.Errorf("atomic output replacement in a sticky directory requires ownership of the directory or destination, or CAP_FOWNER: %w", unix.EPERM)
+	}
+	return nil
 }

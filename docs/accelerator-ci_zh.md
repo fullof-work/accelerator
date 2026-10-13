@@ -87,7 +87,7 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 | 原生布局与顺序输出 | Guest native patch series；`pkg/flatten/plan_linux.go` | Raw/Plan 身份及提取内容；损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾前失败。Native exact-read 注入沿用 guest-runtime 的 `test-erofs`。 |
 | 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
 | 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
-| 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
+| 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、粘滞目录替换权限的提前检查、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
 
 最后一行包含显式启用的真实挂载测试。普通用户编译测试程序，再在新的私有 mount
 namespace 中以挂载权限仅运行这些用例。将 `TMPDIR` 设为私有测试目录，
