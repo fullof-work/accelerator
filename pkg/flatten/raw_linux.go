@@ -17,9 +17,10 @@ import (
 // retains Source's reopenable, uncompressed LayerOpener contract; compressed
 // descriptor verification remains the responsibility of that Source. Every
 // complete uncompressed stream is verified against the fixed config's DiffID.
-// The destination is replaced only after preparation, output and cleanup succeed.
+// The destination is replaced only after preparation, output and source cleanup
+// succeed. Post-commit staging cleanup is reported through Options.CleanupWarning.
 func Build(src Source, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		return prepareSource(context.Background(), src, opts)
 	})
 }
@@ -93,7 +94,7 @@ func Flatten(input io.Reader, outputPath string) error {
 }
 
 func FlattenWith(input io.Reader, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		return prepareArchive(context.Background(), input, opts, nil)
 	})
 }
@@ -103,7 +104,7 @@ func FlattenFile(inputPath, outputPath string) error {
 }
 
 func FlattenFileWith(inputPath, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		f, err := os.Open(inputPath)
 		if err != nil {
 			return nil, err
@@ -116,31 +117,45 @@ func FlattenFileWith(inputPath, outputPath string, opts Options) error {
 // It excludes its scratch, pending output and destination before planning. The
 // source remains owned by the caller and must stay stable until this returns.
 func BuildFromDir(root, outputPath string, opts Options, dopts DirOptions) error {
-	return writeRawFile(context.Background(), outputPath, func(pending string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(pending string) (*PreparedImage, error) {
 		dopts.OutputPaths = append(append([]string(nil), dopts.OutputPaths...), outputPath, pending)
 		return PrepareDir(context.Background(), root, opts, dopts)
 	})
 }
 
-func writeRawFile(ctx context.Context, output string, prepare func(string) (*PreparedImage, error)) (retErr error) {
+func writeRawFile(ctx context.Context, output string, warn func(error), prepare func(string) (*PreparedImage, error)) (retErr error) {
 	pending, err := reserveRawOutput(output)
 	if err != nil {
 		return err
 	}
-	defer func() { retErr = errors.Join(retErr, pending.Close()) }()
+	committed := false
+	defer func() { retErr = errors.Join(retErr, finishRawOutput(pending, committed, warn)) }()
 	// Exclude the complete private staging directory before planning.
 	p, err := prepare(pending.path)
 	if err != nil {
 		return err
 	}
 	err = p.WriteRaw(ctx, pending.file)
-	// Close input resources and the output before commit. Every late failure
+	// Close input resources and the output before commit. Every pre-commit failure
 	// preserves the previous destination; no additional fsync is introduced.
 	err = errors.Join(err, pending.closeFile(), p.Close())
 	if err != nil {
 		return err
 	}
-	return pending.commit()
+	err = pending.commit()
+	committed = err == nil
+	return err
+}
+
+func finishRawOutput(pending *pendingRawOutput, committed bool, warn func(error)) error {
+	err := pending.Close()
+	if err != nil && committed {
+		if warn != nil {
+			warn(fmt.Errorf("raw output committed; staging cleanup: %w", err))
+		}
+		return nil
+	}
+	return err
 }
 
 // outputPermissions accepts only ordinary destination files. Atomic replacement

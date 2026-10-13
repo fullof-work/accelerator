@@ -452,3 +452,70 @@ func TestRawPendingChownOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestRawPostCommitCleanup(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary UID required for actual permission failure")
+	}
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprint(committed), func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, "output")
+			if err := os.WriteFile(output, []byte("old"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			p, err := reserveRawOutput(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = p.file.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err = p.closeFile(); err != nil {
+				t.Fatal(err)
+			}
+			if committed {
+				if err = p.commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = os.Chmod(dir, 0555); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(dir, 0700)
+
+			warned := false
+			err = finishRawOutput(p, committed, func(diagnostic error) {
+				warned = true
+				if !errors.Is(diagnostic, unix.EACCES) {
+					t.Errorf("diagnostic: %v", diagnostic)
+				}
+			})
+			if committed {
+				if err != nil || !warned {
+					t.Fatalf("committed: error=%v warning=%v", err, warned)
+				}
+			} else if !errors.Is(err, unix.EACCES) || warned {
+				t.Fatalf("uncommitted: error=%v warning=%v", err, warned)
+			}
+			want := "old"
+			if committed {
+				want = "new"
+			}
+			data, readErr := os.ReadFile(output)
+			if readErr != nil || string(data) != want {
+				t.Fatalf("output=%q err=%v want=%s", data, readErr, want)
+			}
+			// The nonfatal diagnostic still leaves observable, owned cleanup work.
+			if _, err := os.Stat(p.path); err != nil {
+				t.Fatalf("expected retained empty staging directory: %v", err)
+			}
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(p.path); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

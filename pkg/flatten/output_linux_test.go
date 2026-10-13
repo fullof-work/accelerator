@@ -59,7 +59,7 @@ func TestRawOutputRejectsSpecialDestinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = writeRawFile(context.Background(), output, func(string) (*PreparedImage, error) { t.Fatal("special output reached preparation"); return nil, nil })
+		err = writeRawFile(context.Background(), output, nil, func(string) (*PreparedImage, error) { t.Fatal("special output reached preparation"); return nil, nil })
 		if err == nil {
 			t.Fatal("accepted special output", output)
 		}
@@ -129,7 +129,7 @@ func TestRawOutputOwnershipFailure(t *testing.T) {
 		if os.Geteuid() != 65534 {
 			t.Fatal("helper credentials not applied")
 		}
-		err := writeRawFile(context.Background(), output, func(string) (*PreparedImage, error) {
+		err := writeRawFile(context.Background(), output, nil, func(string) (*PreparedImage, error) {
 			t.Fatal("ownership failure reached preparation")
 			return nil, nil
 		})
@@ -216,7 +216,7 @@ func TestRawOutputRejectsReplacedTemporary(t *testing.T) {
 				t.Fatal(err)
 			}
 			var moved, replacement string
-			err := writeRawFile(context.Background(), output, func(pending string) (*PreparedImage, error) {
+			err := writeRawFile(context.Background(), output, nil, func(pending string) (*PreparedImage, error) {
 				if kind == "directory" {
 					moved = pending + "-moved"
 					if err := os.Rename(pending, moved); err != nil {

@@ -7,6 +7,8 @@ files are sampled; receiver P and its optional fsync are reported separately.
 This host harness does not measure Guest ext4 or Host COW and is not VM evidence.
 """
 import argparse
+import contextlib
+import ctypes
 import hashlib
 import itertools
 import json
@@ -18,6 +20,7 @@ import signal
 import stat
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -96,6 +99,24 @@ def file_digest(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+@contextlib.contextmanager
+def child_subreaper():
+    # This private Linux harness adopts orphaned helpers so wait accounts their
+    # CPU/I/O. Never waitpid(-1): unrelated children remain caller-owned.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    def prctl(option, argument):
+        if libc.prctl(option, argument, 0, 0, 0) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+    prctl(37, ctypes.byref(previous))  # PR_GET_CHILD_SUBREAPER
+    prctl(36, 1)  # PR_SET_CHILD_SUBREAPER, before producer launch
+    try:
+        yield
+    finally:
+        prctl(36, previous.value)
+
+
 def stop_owned_group(producer, leader_start):
     def active_groups():
         groups = set()
@@ -104,11 +125,22 @@ def stop_owned_group(producer, leader_start):
                 fields = path.read_text().rsplit(') ', 1)[1].split()
                 if int(path.parent.name) == producer.pid and fields[19] != leader_start:
                     raise RuntimeError('producer PID was reused; refusing group termination')
-                if int(fields[3]) == producer.pid and fields[0] != 'Z':
+                if int(fields[3]) == producer.pid:
                     group = int(fields[2])
                     if group <= 1 or int(fields[19]) < int(leader_start):
                         raise RuntimeError('unexpected member of owned producer session')
-                    groups.add(group)
+                    pid = int(path.parent.name)
+                    if pid != producer.pid and int(fields[1]) == os.getpid():
+                        # Only adopted members of this exact session are ours
+                        # to reap. The leader remains managed by Popen.
+                        try:
+                            waited, _ = os.waitpid(pid, os.WNOHANG)
+                            if waited:
+                                continue
+                        except ChildProcessError:
+                            pass
+                    if fields[0] != 'Z':
+                        groups.add(group)
             except (FileNotFoundError, ProcessLookupError):
                 pass
         return groups
@@ -119,7 +151,9 @@ def stop_owned_group(producer, leader_start):
             groups = active_groups()
             if not groups:
                 producer.wait()
-                return
+                if not active_groups():
+                    return
+                continue
             for group in groups:
                 try:
                     os.killpg(group, sig)
@@ -157,8 +191,8 @@ def tree_contents(tree):
 
 
 def remove_verification_tree(tree):
-    # fsck and metadata verification have finished. Recover directory access
-    # only in this private extraction; symlink targets are never visited.
+    # All writers and metadata checks have finished. Recover directory access
+    # only in this owned tree; symlink targets are never visited.
     if not stat.S_ISDIR(tree.lstat().st_mode):
         raise RuntimeError('verification root is not a directory')
     tree.chmod(0o700)
@@ -228,6 +262,11 @@ def verify_contents(args, artifact, run):
 
 
 def one(args, variant, trial, result_root, verified):
+    with child_subreaper():
+        return measure_one(args, variant, trial, result_root, verified)
+
+
+def measure_one(args, variant, trial, result_root, verified):
     name, cli, mkfs = variant
     run = result_root / f'{trial}-{name}'
     run.mkdir()
@@ -394,7 +433,13 @@ def one(args, variant, trial, result_root, verified):
                         progress_abort.set()
                     stderr_reader.join()
         if stopped or producer is None:
-            shutil.rmtree(scratch)
+            primary = sys.exc_info()[1]
+            try:
+                remove_verification_tree(scratch)
+            except Exception as cleanup_error:
+                if primary is None:
+                    raise
+                primary.add_note(f'owned scratch cleanup also failed: {cleanup_error}')
 
 
 def main():

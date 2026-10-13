@@ -22,6 +22,80 @@ import bench_flatten
 
 class BenchmarkLifecycle(unittest.TestCase):
 
+
+    def test_orphan_helpers_are_waited_and_accounted_without_reaping_unrelated_children(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-orphan-test-') as directory:
+            root=pathlib.Path(directory)
+            scratch=root/'scratch';scratch.mkdir()
+            results=root/'results';results.mkdir()
+            producer=root/'producer'
+            helper=root/'helper.py'
+            helper.write_text("""import json,os,pathlib,resource,sys,time
+root=pathlib.Path(__file__).parent
+begin=time.process_time()
+while time.process_time()-begin < 0.25: pass
+with (root/'io').open('wb',buffering=0) as output:
+    output.write(b'x'*(4<<20));os.fsync(output.fileno())
+usage=resource.getrusage(resource.RUSAGE_SELF)
+(root/'helper.json').write_text(json.dumps({'pid':os.getpid(),'cpu':usage.ru_utime+usage.ru_stime,
+                                         'io':usage.ru_oublock}))
+print('fixture')
+""")
+            producer.write_text('#!/usr/bin/env python3\nimport pathlib,subprocess,sys\n'
+                                'subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name("helper.py"))])\n')
+            producer.chmod(0o755)
+            consumer=root/'consumer'
+            consumer.write_text('#!/usr/bin/env python3\nprint(\'{"config":{}}\')\n')
+            consumer.chmod(0o755)
+            expected=root/'expected.json';expected.write_text('{}')
+            args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                timing_only=True,consumer=str(consumer),fsck='/bin/true',fsync=False,expected=expected,
+                expected_config=expected,keep_artifacts=False)
+            unrelated=subprocess.Popen([sys.executable,'-c','import sys;sys.exit(19)'])
+            try:
+                with mock.patch.object(bench_flatten,'verify_contents'):
+                    result=bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                helper_usage=json.loads((root/'helper.json').read_text())
+                self.assertGreaterEqual(result['child_cpu_user_seconds']+result['child_cpu_system_seconds'],helper_usage['cpu']-0.01)
+                self.assertGreaterEqual(result['child_io_output_512blocks'],helper_usage['io'])
+                self.assertFalse((pathlib.Path('/proc')/str(helper_usage['pid'])).exists(),'owned zombie was not reaped')
+                with self.assertRaises(ChildProcessError):os.waitpid(helper_usage['pid'],os.WNOHANG)
+                self.assertEqual(unrelated.wait(timeout=5),19,'unrelated child was reaped by measurement')
+            finally:
+                unrelated.wait(timeout=5)
+
+    def test_failed_producer_readonly_scratch_cleanup_preserves_primary_error(self):
+        for cleanup_failure in [False,True]:
+            with self.subTest(cleanup_failure=cleanup_failure), tempfile.TemporaryDirectory(prefix='flatten-readonly-test-') as directory:
+                root=pathlib.Path(directory)
+                scratch=root/'scratch';scratch.mkdir()
+                results=root/'results';results.mkdir()
+                outside=root/'outside';outside.mkdir();outside.chmod(0o555)
+                producer=root/'producer'
+                producer.write_text("""#!/usr/bin/env python3
+import pathlib,sys
+root=pathlib.Path(sys.argv[sys.argv.index('--tmpdir')+1])
+child=root/'readonly';child.mkdir()
+(child/'payload').write_bytes(b'preserve primary failure')
+(child/'external').symlink_to(pathlib.Path(__file__).parent/'outside',target_is_directory=True)
+child.chmod(0o000)
+sys.exit(17)
+""")
+                producer.chmod(0o755)
+                args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',timing_only=True)
+                remove=bench_flatten.remove_verification_tree
+                with mock.patch.object(bench_flatten,'remove_verification_tree',
+                        side_effect=PermissionError('injected final removal failure') if cleanup_failure else remove):
+                    with self.assertRaisesRegex(RuntimeError,'producer exit 17') as caught:
+                        bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                if cleanup_failure:
+                    self.assertIn('owned scratch cleanup also failed',caught.exception.__notes__[0])
+                    for path in scratch.iterdir():remove(path)
+                self.assertEqual(list(scratch.iterdir()),[])
+                self.assertEqual(stat.S_IMODE(outside.stat().st_mode),0o555)
+                self.assertFalse(list(results.glob('*/result.json')))
+                outside.chmod(0o700)
+
     def test_deleted_open_uses_link_count(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root=pathlib.Path(directory)
@@ -408,6 +482,9 @@ print('fixture')
 import os, pathlib, subprocess, sys, time
 root = pathlib.Path(__file__).parent
 scratch = pathlib.Path(sys.argv[sys.argv.index('--tmpdir')+1])
+readonly=scratch/'readonly';readonly.mkdir()
+(readonly/'payload').write_bytes(b'cancelled')
+readonly.chmod(0o555)
 child_code = ("import pathlib,sys,time\\n"
               "out=(pathlib.Path(sys.argv[1])/'background').open('wb')\\n"
               "while True:\\n out.write(b'x'); out.flush(); time.sleep(0.02)\\n")

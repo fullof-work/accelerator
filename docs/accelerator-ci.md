@@ -130,7 +130,13 @@ tests or these mount fixtures do not replace real VM evidence.
 pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated
 scratch blocks/inodes and deleted-open files, and waits for the owned producer
-session, including children in different process groups, before cleaning scratch. Receiving artifact P and its optional fsync are
+session, including children in different process groups, before cleaning scratch.
+The Linux harness temporarily acts as a child subreaper and waits only adopted
+members of that owned session, so their CPU/I/O is included in child rusage;
+unrelated children are not reaped. Records from older harnesses may omit orphan
+helpers' CPU/I/O. After all writers stop, cleanup restores deletion access only
+within owned scratch, including failure/cancellation paths. A cleanup error is
+attached to the original failure instead of replacing it. Receiving artifact P and its optional fsync are
 reported separately. `post_eof_teardown_seconds` measures the interval from producer
 completion through owned process/thread cleanup to the start of consumer validation;
 `receiver_validation_seconds` measures the consumer validation interval.
