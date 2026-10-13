@@ -85,8 +85,13 @@ def scratch_usage(scratch, processes):
             for fd in (pathlib.Path('/proc') / str(pid) / 'fd').iterdir():
                 try:
                     target = os.readlink(fd)
-                    if target.startswith(str(scratch) + '/'):
+                    root_name = str(scratch)
+                    if target.startswith(root_name + '/') or target in (root_name, root_name + ' (deleted)'):
                         st = fd.stat()
+                        # A retained, removed root has no trailing slash. Do
+                        # not confuse a live sibling with a literal suffix.
+                        if target == root_name + ' (deleted)' and st.st_nlink != 0:
+                            continue
                         key = st.st_dev, st.st_ino
                         objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
                         if st.st_nlink == 0:
@@ -309,6 +314,19 @@ def one(args, variant, trial, result_root, verified):
         return measure_one(args, variant, trial, result_root, verified)
 
 
+
+def write_all(output, block):
+    pending = memoryview(block)
+    while pending:
+        try:
+            written = output.write(pending)
+        except InterruptedError:
+            continue
+        if written is None or written <= 0 or written > len(pending):
+            raise OSError('artifact receiver made no valid write progress')
+        pending = pending[written:]
+
+
 def measure_one(args, variant, trial, result_root, verified):
     name, cli, mkfs = variant
     run = result_root / f'{trial}-{name}'
@@ -378,7 +396,7 @@ def measure_one(args, variant, trial, result_root, verified):
                     while block := output_read(1 << 20):
                         if first_output_seconds is None:
                             first_output_seconds = time.monotonic()-started
-                        output.write(block)
+                        write_all(output, block)
                         digest.update(block)
                         size += len(block)
                 code = producer.wait()

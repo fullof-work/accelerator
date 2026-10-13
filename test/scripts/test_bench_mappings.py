@@ -1,11 +1,14 @@
 """Actual mapping and non-regular hard-link measurement regressions."""
 import contextlib
 import ctypes
+import hashlib
+import json
 import os
 import pathlib
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import bench_flatten
 
@@ -108,3 +111,72 @@ class MappingAndLinkMeasurements(unittest.TestCase):
             for kind in ['fifo', 'symlink']:
                 self.assertEqual(fingerprints[0][kind+'-b']['hardlink_to'], kind+'-a')
                 self.assertNotIn('hardlink_to', fingerprints[1][kind+'-b'])
+
+
+class ReceiverAndRootMeasurements(unittest.TestCase):
+    def test_retained_deleted_root_is_counted(self):
+        with tempfile.TemporaryDirectory(prefix='retained-root-') as directory:
+            parent = pathlib.Path(directory)
+            root = parent/'scratch'; root.mkdir()
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            # This live sibling must not be classified as the deleted root.
+            sibling = parent/'scratch (deleted)'; sibling.mkdir()
+            other = os.open(sibling, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                root.rmdir(); root.mkdir()
+                retained = os.fstat(fd)
+                self.assertEqual(retained.st_nlink, 0)
+                sample = bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                self.assertEqual(sample['scratch_inodes'], 2)
+                self.assertEqual(sample['deleted_open_files'], 1)
+                self.assertEqual(sample['scratch_blocks'], (root.stat().st_blocks + retained.st_blocks) * 512)
+                self.assertEqual(sample['deleted_open_blocks'], retained.st_blocks * 512)
+            finally:
+                os.close(fd); os.close(other)
+
+    def test_receiver_short_writes_match_captured_bytes(self):
+        for fault in ['short', 'interrupt', 'zero', 'none', 'enospc']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='receiver-write-') as directory:
+                root=pathlib.Path(directory)
+                scratch=root/'scratch';scratch.mkdir()
+                results=root/'results';results.mkdir()
+                payload=b'complete pipe output' * 8192
+                producer=root/'producer'
+                producer.write_text('#!/usr/bin/env python3\nimport os\nos.write(1, '+repr(payload)+')\n')
+                producer.chmod(0o755)
+                consumer=root/'consumer'
+                consumer.write_text('#!/usr/bin/env python3\nprint(\'{"config":{}}\')\n')
+                consumer.chmod(0o755)
+                expected=root/'expected.json';expected.write_text('{}')
+                args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                    timing_only=True,consumer=str(consumer),fsck='/bin/true',fsync=False,expected=expected,
+                    expected_config=expected,keep_artifacts=True)
+                original_open=pathlib.Path.open
+                class PartialOutput:
+                    def __init__(self, stream):self.stream=stream;self.calls=0
+                    def __enter__(self):return self
+                    def __exit__(self,*exc):self.stream.close()
+                    def write(self, block):
+                        self.calls+=1
+                        if self.calls==1:
+                            if fault=='interrupt':raise InterruptedError('injected interruption')
+                            if fault=='zero':return 0
+                            if fault=='none':return None
+                        if fault=='enospc' and self.calls==2:raise OSError(28,'injected storage exhaustion')
+                        return self.stream.write(block[:137])
+                def open_path(path,*a,**kw):
+                    stream=original_open(path,*a,**kw)
+                    return PartialOutput(stream) if path.name=='image.artifact' and a and a[0]=='xb' else stream
+                with mock.patch.object(pathlib.Path,'open',new=open_path),mock.patch.object(bench_flatten,'verify_contents') as verify:
+                    if fault in ['short','interrupt']:
+                        result=bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                        captured=(results/'1-fixture/image.artifact').read_bytes()
+                        self.assertEqual(captured,payload)
+                        self.assertEqual(result['artifact_bytes'],len(captured))
+                        self.assertEqual(result['artifact_sha256'],hashlib.sha256(captured).hexdigest())
+                        verify.assert_called_once()
+                    else:
+                        with self.assertRaises(OSError):bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                        verify.assert_not_called()
+                        self.assertFalse((results/'1-fixture/result.json').exists())
+                self.assertEqual(list(scratch.iterdir()),[])
