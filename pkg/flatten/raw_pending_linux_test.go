@@ -770,3 +770,57 @@ func TestRawPendingStickyReplacement(t *testing.T) {
 		})
 	}
 }
+
+func TestRawPendingInheritedIdentityCleanup(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_INHERITED_STAT"
+	if dir := os.Getenv(helper); dir != "" {
+		runtime.LockOSThread()
+		output := filepath.Join(dir, "output")
+		pending, err := reserveRawOutput(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pending.Close()
+		// Fail only the post-move identity stat through this private directory FD.
+		// Rename/unlink and the parent identity check remain real kernel operations.
+		filter := []unix.SockFilter{
+			{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: unix.SYS_NEWFSTATAT, Jf: 3},
+			{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(pending.dir.Fd()), Jf: 1},
+			{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EIO)},
+			{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+		}
+		program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)), 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.inheritFileGroup(); err == nil {
+			t.Fatal("identity failure was accepted")
+		}
+		entries, err := os.ReadDir(pending.path)
+		if err != nil || len(entries) != 1 || entries[0].Name() != "image" {
+			t.Fatalf("moved reservation was not cleaned: %v %v", entries, err)
+		}
+		if err := pending.Close(); err != nil {
+			t.Fatal(err)
+		}
+		entries, err = os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("private staging was not cleaned: %v %v", entries, err)
+		}
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestRawPendingInheritedIdentityCleanup$")
+	cmd.Env = append(os.Environ(), helper+"="+t.TempDir())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+}

@@ -464,3 +464,27 @@ while True:time.sleep(1)
             with mock.patch.object(pathlib.Path, 'iterdir', new=tasks):
                 with self.assertRaisesRegex(PermissionError, 'owned tasks denied'):
                     bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+
+    def test_reused_zombie_group_is_not_observed(self):
+        for reuse in ['before-tasks', 'during-tasks']:
+            with self.subTest(reuse=reuse), tempfile.TemporaryDirectory(prefix='reused-task-') as directory:
+                process = pathlib.Path(directory)/'100';process.mkdir()
+                task = process/'task/100';task.mkdir(parents=True)
+                def row(state, start, session, rss):
+                    fields = [state, '1', '100', str(session)]+['0']*18
+                    fields[19], fields[21] = str(start), str(rss)
+                    return '100 (fixture) '+' '.join(fields)
+                group_stat = process/'stat';group_stat.write_text(row('Z', 10, 100, 0))
+                (task/'stat').write_text(row('S', 20, 200, 100))
+                original = pathlib.Path.read_text
+                reads = 0
+                def read(path, *args, **kwargs):
+                    nonlocal reads
+                    if path == group_stat:
+                        reads += 1
+                        if reads > (1 if reuse == 'before-tasks' else 2):
+                            return row('S', 20, 200, 100)
+                    return original(path, *args, **kwargs)
+                with mock.patch.object(pathlib.Path, 'glob', return_value=[group_stat]), \
+                     mock.patch.object(pathlib.Path, 'read_text', new=read):
+                    self.assertEqual(bench_flatten.process_tree(100, '10'), [])

@@ -27,11 +27,17 @@ import threading
 import time
 
 
-def live_task_stats(process):
+def live_task_stats(process, expected=None):
     # Threads can unshare FD/FS tables, and a zombie leader may still have
     # live siblings. A denied task inspection is an incomplete observation.
+    def identity():
+        fields = (process / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+        return fields[19], fields[3]  # start time and session
     tasks = []
     try:
+        before = identity()
+        if expected is not None and before != expected:
+            return []
         for task in (process / 'task').iterdir():
             try:
                 fields = (task / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
@@ -39,8 +45,10 @@ def live_task_stats(process):
                     tasks.append((task, fields))
             except (FileNotFoundError, ProcessLookupError):
                 pass
+        if identity() != before:
+            return []
     except (FileNotFoundError, ProcessLookupError):
-        pass
+        return []
     return tasks
 
 
@@ -58,7 +66,7 @@ def process_tree(root, leader_start=None):
             else:
                 # Inspect siblings only for owned groups during traversal.
                 # Keep parent edges even when the entire group has exited.
-                exited[pid] = path.parent
+                exited[pid] = path.parent, fields[19], fields[3]
             children.setdefault(parent, []).append(pid)
             if leader_start is not None:
                 if pid == root and fields[19] != leader_start:
@@ -76,7 +84,8 @@ def process_tree(root, leader_start=None):
         if pid in rows:
             result.append((pid, rows[pid]))
         elif pid in exited:
-            tasks = live_task_stats(exited[pid])
+            process, start, session = exited[pid]
+            tasks = live_task_stats(process, (start, session))
             if tasks:
                 # Threads share an address space; count one live task's RSS.
                 result.append((pid, int(tasks[0][1][21]) * page_size))
@@ -246,7 +255,7 @@ def stop_owned_group(producer, leader_start):
                                 continue
                         except ChildProcessError:
                             pass
-                    if fields[0] not in ('Z', 'X', 'x') or live_task_stats(path.parent):
+                    if fields[0] not in ('Z', 'X', 'x') or live_task_stats(path.parent, (fields[19], fields[3])):
                         groups.add(group)
             except (FileNotFoundError, ProcessLookupError):
                 pass

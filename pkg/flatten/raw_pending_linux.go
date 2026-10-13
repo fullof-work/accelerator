@@ -226,11 +226,12 @@ func (p *pendingRawOutput) inheritFileGroup() (retErr error) {
 	if err = unix.Renameat(int(p.parent.Fd()), name, int(p.dir.Fd()), "inherited"); err != nil {
 		return err
 	}
-	moved = true
+	moved, owned = true, true
+	// Rename has placed this entry inside our private directory. Unlink that
+	// entry on any subsequent failure, even when its identity cannot be read.
 	if !sameRawObjectAt(p.dir, "inherited", info) {
 		return errors.New("inherited output temporary object was replaced")
 	}
-	owned = true
 	var current unix.Stat_t
 	if err = unix.Fstat(int(file.Fd()), &current); err != nil {
 		return err
