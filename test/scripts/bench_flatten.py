@@ -567,9 +567,9 @@ def main():
             result = one(args, variant, trial, args.output_root, verified)
             results.append(result)
             print(json.dumps(result), flush=True)
-    (args.output_root / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
     if len({r['artifact_sha256'] for r in results}) != 1:
         raise RuntimeError('normal-corpus artifact identities differ')
+    (args.output_root / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
 
 
 if __name__ == '__main__':

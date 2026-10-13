@@ -2,9 +2,11 @@
 import contextlib
 import ctypes
 import hashlib
+import io
 import json
 import os
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -185,3 +187,45 @@ class ReceiverAndRootMeasurements(unittest.TestCase):
                         verify.assert_not_called()
                         self.assertFalse((results/'1-fixture/result.json').exists())
                 self.assertEqual(list(scratch.iterdir()),[])
+
+
+class AggregatePublication(unittest.TestCase):
+    def test_only_matching_accepted_artifacts_publish_aggregate(self):
+        for matching in [False, True]:
+            with self.subTest(matching=matching), tempfile.TemporaryDirectory(prefix='aggregate-identity-') as directory:
+                root = pathlib.Path(directory)
+                scratch = root/'scratch'; scratch.mkdir()
+                output = root/'results'
+                expected = root/'expected.json'; expected.write_text('{}')
+                consumer = root/'consumer'
+                consumer.write_text('#!/usr/bin/env python3\nprint(\'{"config":{}}\')\n')
+                consumer.chmod(0o755)
+                argv = ['bench_flatten.py', '--input', 'registry.invalid/image@sha256:'+'0'*64,
+                        '--consumer', str(consumer), '--fsck', '/bin/true', '--expected', str(expected),
+                        '--expected-config', str(expected), '--scratch-parent', str(scratch),
+                        '--output-root', str(output), '--trials', '2', '--timing-only']
+                for variant in ['first', 'second']:
+                    producer = root/variant
+                    payload = 'identical' if matching else variant
+                    producer.write_text('#!/usr/bin/env python3\nprint('+repr(payload)+')\n')
+                    producer.chmod(0o755)
+                    argv.extend(['--variant', variant+','+str(producer)+',/bin/true'])
+                # Model byte-different carriers whose decoded contents are both
+                # accepted. The actual receiver, config check and aggregate run.
+                with mock.patch.object(sys, 'argv', argv), mock.patch.object(bench_flatten, 'verify_contents'), contextlib.redirect_stdout(io.StringIO()):
+                    if matching:
+                        bench_flatten.main()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'artifact identities differ'):
+                            bench_flatten.main()
+                rounds = sorted(output.glob('*/result.json'))
+                self.assertEqual(len(rounds), 4)
+                self.assertTrue(all(json.loads(p.read_text())['scratch_clean'] for p in rounds))
+                self.assertEqual(list(scratch.iterdir()), [])
+                aggregate = output/'results.json'
+                if matching:
+                    results = json.loads(aggregate.read_text())
+                    self.assertEqual(len(results), 4)
+                    self.assertEqual(len({r['artifact_sha256'] for r in results}), 1)
+                else:
+                    self.assertFalse(aggregate.exists(), 'rejected comparison published a success aggregate')

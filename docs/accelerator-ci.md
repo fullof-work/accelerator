@@ -149,6 +149,8 @@ sampled RSS and block peaks have the recorded sampling resolution.
 
 Allocated storage values in the historical `scratch_blocks`, `deleted_open_blocks` and `artifact_blocks` fields are **bytes** (`st_blocks * 512`), not block counts. Their names and numeric meaning are retained for compatibility. `metric_units` now labels these fields and process RSS as bytes; it labels `child_io_input_512blocks` and `child_io_output_512blocks` as counts of 512-byte blocks. The same allocation units apply to individual samples and reported peaks.
 
+The aggregate `results.json` is published only after all rounds succeed and their artifact identities match. Rejected comparisons retain per-round diagnostics without a success aggregate.
+
 The current consumer's `info --json` config must equal the fixed projected JSON
 provided by `--expected-config` before acceptance or caching a verified artifact
 identity. Use JSON `null` only when the fixture intentionally has no appended
