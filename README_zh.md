@@ -95,6 +95,12 @@ make test-e2e-scripts           # 离线 E2E fixture/helper 回归，不是产�
 
 所选 owner 源码在 `release/helper-inputs.json` 显式声明编译型 E2E helper 清单。当前清单为空。后续 helper 及其构建配方由此 owner 声明维护，聚合打包自动发现，无需平台文件名清单。
 
+发行测试需要匹配的原生 EROFS Plan 能力。预检仅一次准入同一发行线上的
+`guest-runtime` 源码分支，并记录精确提交。现有固定输入传输将该源码树交给
+两个架构的构建任务；它们使用原生 EROFS 配方和缓存，在测试前检查 Plan 能力。
+这是测试工具的源码依赖；组件构建无需已发布的 Runtime 二进制，Runtime
+发布仍消费所选 accelerator 发行版。
+
 使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
 `bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
 不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
