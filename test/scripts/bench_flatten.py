@@ -447,6 +447,12 @@ def measure_one(args, variant, trial, result_root, verified):
             verify_contents(args, artifact, run)
             verified[identity] = str(run / 'content-check.log')
         result = {'variant': name, 'trial': trial, 'command': command,
+                  # Keep historical field names/values; make the units explicit
+                  # for both sampled rows and their reported peak fields.
+                  'metric_units': {'artifact_blocks': 'bytes', 'scratch_blocks': 'bytes',
+                                   'deleted_open_blocks': 'bytes', 'process_rss': 'bytes',
+                                   'child_io_input_512blocks': '512-byte blocks',
+                                   'child_io_output_512blocks': '512-byte blocks'},
                   'producer_sha256': file_digest(cli),
                   'mkfs_sha256': file_digest(mkfs),
                   'consumer': str(pathlib.Path(args.consumer).resolve(strict=True)),

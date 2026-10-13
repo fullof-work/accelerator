@@ -19,6 +19,7 @@ type DirOptions struct {
 	// OutputFiles excludes regular output files and their aliases by identity,
 	// including redirected standard streams without requiring procfs paths.
 	// Files are borrowed during preparation, never retained or closed here.
+	// Their blocking mode and deadline behavior are preserved.
 	OutputFiles []*os.File
 	// Skip lists paths relative to the rootfs to leave out of the
 	// image, subtree and node included (mkfs.erofs --exclude-path

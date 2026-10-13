@@ -121,6 +121,8 @@ artifact reader，默认交替顺序执行三轮。记录工具摘要、进程�
 stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 writer 才能输出 artifact 头。部分宿主不提供 child rusage I/O 计数；
 采样 RSS 与块峰值受记录的采样间隔限制。
 
+历史字段 `scratch_blocks`、`deleted_open_blocks` 和 `artifact_blocks` 的数值是已分配的**字节数**（`st_blocks * 512`），不是块个数。为保持兼容，保留字段名和数值含义；新增 `metric_units` 将这些字段及进程 RSS 标为字节，将 `child_io_input_512blocks` 和 `child_io_output_512blocks` 标为 512 字节块的个数。单次采样和对应峰值采用相同单位。
+
 接收成功或缓存已核验 artifact 身份之前，当前 consumer 的 `info --json` 配置必须与
 `--expected-config` 提供的固定投影 JSON 相同。仅当夹具明确不含追加配置时使用 JSON
 `null`。记录包含预期配置摘要、保存的 consumer 输出，以及 consumer 和 fsck 的解析后

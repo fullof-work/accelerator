@@ -5,6 +5,7 @@ package flatten
 import (
 	"bytes"
 	"context"
+	"errors"
 	"golang.org/x/sys/unix"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestRawOutputPermissions(t *testing.T) {
@@ -334,5 +336,46 @@ func TestSourceSelectionOutputFiles(t *testing.T) {
 	}
 	if _, err := selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{nil}, 1<<20); err == nil {
 		t.Fatal("nil output FD accepted")
+	}
+}
+
+func TestSourceSelectionBorrowedPipe(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	flags := func() int {
+		t.Helper()
+		raw, err := write.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var value int
+		var statErr error
+		if err := raw.Control(func(fd uintptr) { value, statErr = unix.FcntlInt(fd, unix.F_GETFL, 0) }); err != nil {
+			t.Fatal(err)
+		}
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		return value
+	}
+	before := flags()
+	if before&unix.O_NONBLOCK == 0 {
+		t.Fatal("fixture pipe is not pollable")
+	}
+	if _, err := selectSourceWithOwned(context.Background(), t.TempDir(), nil, nil, []*os.File{write}, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if after := flags(); after != before {
+		t.Fatalf("borrow changed pipe flags: %x -> %x", before, after)
+	}
+	if err := write.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := write.Write(make([]byte, 1<<20)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("borrowed write deadline: %v", err)
 	}
 }

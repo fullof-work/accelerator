@@ -173,6 +173,11 @@ class ReceiverAndRootMeasurements(unittest.TestCase):
                         captured=(results/'1-fixture/image.artifact').read_bytes()
                         self.assertEqual(captured,payload)
                         self.assertEqual(result['artifact_bytes'],len(captured))
+                        self.assertEqual(result['artifact_blocks'],(results/'1-fixture/image.artifact').stat().st_blocks*512)
+                        for field in ['artifact_blocks','scratch_blocks','deleted_open_blocks','process_rss']:
+                            self.assertEqual(result['metric_units'][field],'bytes')
+                        for field in ['child_io_input_512blocks','child_io_output_512blocks']:
+                            self.assertEqual(result['metric_units'][field],'512-byte blocks')
                         self.assertEqual(result['artifact_sha256'],hashlib.sha256(captured).hexdigest())
                         verify.assert_called_once()
                     else:

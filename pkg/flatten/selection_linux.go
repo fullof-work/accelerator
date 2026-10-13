@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -234,11 +235,16 @@ func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPath
 		if file == nil {
 			return nil, fmt.Errorf("flatten: nil output file")
 		}
-		var st unix.Stat_t
-		if err := unix.Fstat(int(file.Fd()), &st); err != nil {
+		// File.Stat retains the borrowed file's poller and deadline behavior.
+		info, err := file.Stat()
+		if err != nil {
 			return nil, fmt.Errorf("flatten: stat output file: %w", err)
 		}
-		if st.Mode&unix.S_IFMT == unix.S_IFREG {
+		if info.Mode().IsRegular() {
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return nil, fmt.Errorf("flatten: output file has no filesystem identity")
+			}
 			s.owned = append(s.owned, ownedPath{dev: uint64(st.Dev), ino: st.Ino})
 		}
 	}
