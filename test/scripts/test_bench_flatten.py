@@ -186,6 +186,25 @@ while not (root/'exit').exists():time.sleep(0.01)
                 except ProcessLookupError:pass
                 parent.wait(timeout=5)
 
+    def test_resource_pass_without_observed_process_is_invalid(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root=pathlib.Path(directory)
+            scratch=root/'scratch';scratch.mkdir()
+            results=root/'results';results.mkdir()
+            producer=root/'producer'
+            producer.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(0.1)\nprint("fixture")\n')
+            producer.chmod(0o755)
+            args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                                 timing_only=False,interval=0.01)
+            with mock.patch.object(bench_flatten,'process_tree',return_value=[]) as snapshots, \
+                 mock.patch.object(bench_flatten,'verify_contents') as verify:
+                with self.assertRaisesRegex(RuntimeError,'never observed an owned process; memory measurement is invalid'):
+                    bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                self.assertGreater(snapshots.call_count,0,'fixture must take actual monitor samples')
+                verify.assert_not_called()
+            self.assertFalse(list(results.glob('*/result.json')))
+            self.assertEqual(list(scratch.iterdir()),[])
+
     def test_resource_pass_without_samples_is_rejected(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root=pathlib.Path(directory)

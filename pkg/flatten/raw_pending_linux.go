@@ -88,8 +88,10 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 	if st.Dev != p.createdDir.Dev || st.Ino != p.createdDir.Ino {
 		return nil, errors.New("output staging directory was replaced")
 	}
-	// Keep inherited setgid while restoring owner access. A usable directory
-	// descriptor works on Linux 6.1 even in a privileged empty root without /proc.
+	// An unprivileged chmod can clear an inherited foreign setgid bit. Keep
+	// the private directory usable and preserve file GID through its parent
+	// in that case. A usable directory FD also works in a privileged empty root.
+	inheritFromParent := false
 	if st.Mode&0700 != 0700 {
 		mode := uint32(0700) | st.Mode&unix.S_ISGID
 		accessFD, openErr := unix.Openat(dirFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -112,9 +114,10 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		if err := unix.Fstat(dirFD, &restored); err != nil {
 			return nil, err
 		}
-		if restored.Gid != st.Gid || restored.Mode&02777 != mode {
+		if restored.Gid != st.Gid || restored.Mode&0777 != 0700 {
 			return nil, errors.New("staging directory lost its private permissions or inherited group")
 		}
+		inheritFromParent = st.Mode&unix.S_ISGID != 0 && restored.Mode&unix.S_ISGID == 0
 	}
 	fileFD, err := unix.Openat(dirFD, "image", unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode))
 	if err != nil {
@@ -122,6 +125,12 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 	}
 	p.ownedFile = true
 	p.file = os.NewFile(uintptr(fileFD), filepath.Join(p.path, "image"))
+	if inheritFromParent {
+		if err := p.inheritFileGroup(); err != nil {
+			return nil, err
+		}
+		fileFD = int(p.file.Fd())
+	}
 	if previous != nil {
 		uid, gid := int(previous.Uid), int(previous.Gid)
 		if err := unix.Fstat(fileFD, &st); err != nil {
@@ -156,6 +165,97 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 	}
 	p.output = filepath.Base(output)
 	return p, nil
+}
+
+// Replace the empty permission template with a file created in the destination
+// parent, where the kernel supplies the inherited GID. The public name has mode
+// 000 until it is moved into private staging and verified. The template preserves
+// the caller's umask/default-ACL result without changing process-global umask.
+func (p *pendingRawOutput) inheritFileGroup() (retErr error) {
+	template, err := p.file.Stat()
+	if err != nil {
+		return err
+	}
+	acl := make([]byte, 64<<10)
+	n, err := unix.Fgetxattr(int(p.file.Fd()), outputAccessACL, acl)
+	if absentAccessACL(err) {
+		acl = nil
+	} else if err != nil {
+		return err
+	} else {
+		acl = acl[:n]
+	}
+	var file *os.File
+	var name string
+	for range 10 {
+		name = ".flatten-reserve-" + rand.Text()
+		fd, openErr := unix.Openat(int(p.parent.Fd()), name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(openErr, unix.EEXIST) {
+			continue
+		}
+		if openErr != nil {
+			return openErr
+		}
+		file = os.NewFile(uintptr(fd), filepath.Join(p.path, "image"))
+		break
+	}
+	if file == nil {
+		return fmt.Errorf("reserve inherited output: %w", os.ErrExist)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return errors.Join(err, file.Close())
+	}
+	moved, owned, complete := false, false, false
+	defer func() {
+		if complete {
+			return
+		}
+		if !moved && sameRawObjectAt(p.parent, name, info) {
+			retErr = errors.Join(retErr, unix.Unlinkat(int(p.parent.Fd()), name, 0))
+		} else if owned {
+			retErr = errors.Join(retErr, unix.Unlinkat(int(p.dir.Fd()), "inherited", 0))
+		}
+		retErr = errors.Join(retErr, file.Close())
+	}()
+	if err = unix.Renameat(int(p.parent.Fd()), name, int(p.dir.Fd()), "inherited"); err != nil {
+		return err
+	}
+	moved = true
+	if !sameRawObjectAt(p.dir, "inherited", info) {
+		return errors.New("inherited output temporary object was replaced")
+	}
+	owned = true
+	var current unix.Stat_t
+	if err = unix.Fstat(int(file.Fd()), &current); err != nil {
+		return err
+	}
+	if current.Nlink != 1 || current.Mode&0777 != 0 {
+		return errors.New("inherited output is not exclusively reserved")
+	}
+	if err = file.Chmod(template.Mode().Perm()); err != nil {
+		return err
+	}
+	if acl != nil {
+		err = unix.Fsetxattr(int(file.Fd()), outputAccessACL, acl, 0)
+	} else {
+		err = unix.Fremovexattr(int(file.Fd()), outputAccessACL)
+		if absentAccessACL(err) {
+			err = nil
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err = p.closeFile(); err != nil {
+		return err
+	}
+	if err = unix.Renameat(int(p.dir.Fd()), "inherited", int(p.dir.Fd()), "image"); err != nil {
+		return err
+	}
+	p.file = file
+	complete = true
+	return nil
 }
 
 func sameRawObjectAt(dir *os.File, name string, info os.FileInfo) bool {

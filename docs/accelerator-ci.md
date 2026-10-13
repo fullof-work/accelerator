@@ -158,7 +158,7 @@ the producer hash or artifact identity.
 Walking a wide tree for block/inode samples can perturb the pipe receiver and
 source I/O. Process enumeration follows procfs parent PIDs and includes owned-session
 members after reparenting, checking the leader start time; it does not require
-the optional per-task `children` interface. A resource pass without samples fails
+the optional per-task `children` interface. A resource pass without samples, or whose samples never observe an owned process, fails
 instead of publishing zero peaks. Deleted-open accounting uses inode link count,
 not the procfs filename suffix. Failed teardown aborts the progress reader and
 retains scratch instead of waiting indefinitely for stderr. Pair the resource pass with `--timing-only` under the same resource,

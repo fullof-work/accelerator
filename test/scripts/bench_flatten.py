@@ -313,6 +313,7 @@ def measure_one(args, variant, trial, result_root, verified):
                     try:
                         processes = process_tree(producer.pid, leader_start)
                         samples.append(dict(seconds=time.monotonic()-started,
+                                            processes=len(processes),
                                             process_rss=sum(rss for _, rss in processes),
                                             **scratch_usage(scratch, processes)))
                     except Exception as error:
@@ -356,8 +357,11 @@ def measure_one(args, variant, trial, result_root, verified):
             raise RuntimeError(f'{name}: producer exit {code}; see {run / "producer.stderr"}')
         if failures:
             raise RuntimeError(f'measurement failed: {failures}')
-        if not args.timing_only and not samples:
-            raise RuntimeError('resource pass produced no samples')
+        if not args.timing_only:
+            if not samples:
+                raise RuntimeError('resource pass produced no samples')
+            if not any(sample['processes'] for sample in samples):
+                raise RuntimeError('resource pass never observed an owned process; memory measurement is invalid')
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         validation_started = time.monotonic()
         with (run / 'consumer.json').open('wb') as output:

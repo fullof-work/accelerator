@@ -519,3 +519,114 @@ func TestRawPostCommitCleanup(t *testing.T) {
 		})
 	}
 }
+
+// The directory group deliberately differs from all groups of the child. A
+// restrictive umask forces private-directory permission repair by that child.
+func TestRawPendingForeignGroup(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_FOREIGN_GROUP"
+	if parent := os.Getenv(helper); parent != "" {
+		if os.Geteuid() == 0 {
+			t.Fatal("fixture must have no root privileges")
+		}
+		groups, err := os.Getgroups()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, gid := range groups {
+			if gid == 12345 {
+				t.Fatal("fixture belongs to destination group")
+			}
+		}
+		for _, mask := range []int{0707, 0777} {
+			syscall.Umask(mask)
+			direct, err := os.OpenFile(filepath.Join(parent, fmt.Sprintf("direct-%o", mask)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected, err := direct.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			direct.Close()
+			output := filepath.Join(parent, fmt.Sprintf("output-%o", mask))
+			pending, err := reserveRawOutput(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage, err := pending.dir.Stat()
+			if err != nil || stage.Mode().Perm() != 0700 {
+				t.Fatalf("private stage: %v %v", stage, err)
+			}
+			payload := []byte("inherited group, bound writable descriptor")
+			if _, err := pending.file.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(payload))
+			if _, err := pending.file.ReadAt(got, 0); err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("content: %q %v", got, err)
+			}
+			if err := pending.closeFile(); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.Close(); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if expected.Sys().(*syscall.Stat_t).Gid != 12345 || info.Sys().(*syscall.Stat_t).Gid != 12345 || info.Mode().Perm() != expected.Mode().Perm() {
+				t.Fatalf("output metadata differs from direct creation: got=%+v expected=%+v", info.Sys(), expected.Sys())
+			}
+		}
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) != 4 {
+			t.Fatalf("reservation leaked: %v %v", entries, err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to create a foreign-group fixture and ordinary child")
+	}
+	// Use a directly traversable parent rather than the root-only go test build
+	// directory. All fixture objects are removed by this parent after the child.
+	root, err := os.MkdirTemp("", "flatten-foreign-group-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	if err := os.Chmod(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "destination")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, 0, 12345); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, os.ModeSetgid|0777); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := filepath.Join(root, "fixture.test")
+	if err := os.WriteFile(copy, binary, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(copy, "-test.run=^TestRawPendingForeignGroup$")
+	cmd.Env = append(os.Environ(), helper+"="+parent)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534, Groups: []uint32{}}}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ordinary child: %v\n%s", err, out)
+	}
+}
