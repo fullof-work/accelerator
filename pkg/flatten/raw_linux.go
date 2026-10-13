@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // Build writes an explicit raw EROFS image with the runtime-config ZIP. It
@@ -157,22 +158,22 @@ func writeRawFile(ctx context.Context, output string, prepare func(string) (*Pre
 
 // outputPermissions accepts only ordinary destination files. Atomic replacement
 // must not unlink a device, directory or symlink. Check again at commit time.
-func outputPermissions(output string) (os.FileMode, bool, error) {
+func outputPermissions(output string) (os.FileMode, *syscall.Stat_t, error) {
 	st, err := os.Lstat(output)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0666, false, nil
+		return 0666, nil, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, nil, err
 	}
 	if !st.Mode().IsRegular() {
-		return 0, false, fmt.Errorf("destination is not a regular file: %s", output)
+		return 0, nil, fmt.Errorf("destination is not a regular file: %s", output)
 	}
-	return st.Mode().Perm(), true, nil
+	return st.Mode().Perm(), st.Sys().(*syscall.Stat_t), nil
 }
 
 func createPendingOutput(output, prefix string) (*os.File, error) {
-	mode, exists, err := outputPermissions(output)
+	mode, previous, err := outputPermissions(output)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +188,18 @@ func createPendingOutput(output, prefix string) (*os.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		if exists {
+		if previous != nil {
+			info, statErr := f.Stat()
+			if statErr != nil {
+				return nil, errors.Join(statErr, f.Close(), os.Remove(name))
+			}
+			current := info.Sys().(*syscall.Stat_t)
+			if current.Uid != previous.Uid || current.Gid != previous.Gid {
+				if err = f.Chown(int(previous.Uid), int(previous.Gid)); err != nil {
+					return nil, errors.Join(err, f.Close(), os.Remove(name))
+				}
+			}
+			// Restore the mode after chown, which can clear permission bits.
 			if err = f.Chmod(mode); err != nil {
 				return nil, errors.Join(err, f.Close(), os.Remove(name))
 			}

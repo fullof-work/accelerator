@@ -3,10 +3,13 @@
 package flatten
 
 import (
+	"bytes"
 	"context"
 	"golang.org/x/sys/unix"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -66,5 +69,131 @@ func TestRawOutputRejectsSpecialDestinations(t *testing.T) {
 	}
 	if _, _, err := outputPermissions(os.DevNull); err == nil {
 		t.Fatal("device accepted")
+	}
+}
+
+func TestRawOutputPreservesExistingOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to replace a foreign-owned output")
+	}
+	requirePlan(t)
+	root, dir, scratch := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "payload"), []byte("raw owner regression"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	control, output := filepath.Join(dir, "control"), filepath.Join(dir, "output")
+	if err := BuildFromDir(root, control, Options{TmpDir: scratch}, DirOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(output, []byte("previous output"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(output, 12345, 23456); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(output, 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := BuildFromDir(root, output, Options{TmpDir: scratch}, DirOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := info.Sys().(*syscall.Stat_t)
+	if owner.Uid != 12345 || owner.Gid != 23456 || info.Mode().Perm() != 0640 {
+		t.Fatalf("uid/gid/mode: %d/%d/%o", owner.Uid, owner.Gid, info.Mode().Perm())
+	}
+	want, err := os.ReadFile(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("raw contents differ: %v", err)
+	}
+	entries, err := os.ReadDir(scratch)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("scratch remains: %v %v", entries, err)
+	}
+	entries, err = os.ReadDir(dir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("pending output remains: %v %v", entries, err)
+	}
+}
+
+func TestRawOutputOwnershipFailure(t *testing.T) {
+	if output := os.Getenv("FLATTEN_TEST_FOREIGN_OUTPUT"); output != "" {
+		if os.Geteuid() != 65534 {
+			t.Fatal("helper credentials not applied")
+		}
+		err := writeRawFile(context.Background(), output, func(string) (*PreparedImage, error) {
+			t.Fatal("ownership failure reached preparation")
+			return nil, nil
+		})
+		if err == nil {
+			t.Fatal("ownership change unexpectedly succeeded")
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to set up a foreign-owned output")
+	}
+	root, err := os.MkdirTemp("", "flatten-owner-failure-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	if err := os.Chmod(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "output")
+	before := []byte("preserve previous artifact")
+	if err := os.WriteFile(output, before, 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(output, 12345, 23456); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(output, 0666); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The original test binary may be under a private checkout directory.
+	// Copy it into this fixture so the unprivileged helper can execute it.
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(root, "helper")
+	if err := os.WriteFile(helper, data, 0755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(helper)
+	cmd := exec.Command(helper, "-test.run=^TestRawOutputOwnershipFailure$", "-test.v")
+	cmd.Env = append(os.Environ(), "FLATTEN_TEST_FOREIGN_OUTPUT="+output)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
+	if log, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper: %v\n%s", err, log)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(got, before) {
+		t.Fatalf("previous artifact changed: %v", err)
+	}
+	info, err := os.Stat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if stat.Uid != 12345 || stat.Gid != 23456 || info.Mode().Perm() != 0666 {
+		t.Fatal("previous metadata changed")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("pending file remains: %v %v", entries, err)
 	}
 }
