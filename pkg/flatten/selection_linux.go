@@ -172,10 +172,10 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 }
 
 func selectSource(ctx context.Context, root string, excludes []string, budget uint64) (*sourceSelection, error) {
-	return selectSourceWithOwned(ctx, root, excludes, nil, budget)
+	return selectSourceWithOwned(ctx, root, excludes, nil, nil, budget)
 }
 
-func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPaths []string, budget uint64) (*sourceSelection, error) {
+func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPaths []string, outputFiles []*os.File, budget uint64) (*sourceSelection, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -229,6 +229,18 @@ func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPath
 			s.excludes = dedupeSorted(append(s.excludes, rel))
 		}
 		s.owned = append(s.owned, owned)
+	}
+	for _, file := range outputFiles {
+		if file == nil {
+			return nil, fmt.Errorf("flatten: nil output file")
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &st); err != nil {
+			return nil, fmt.Errorf("flatten: stat output file: %w", err)
+		}
+		if st.Mode&unix.S_IFMT == unix.S_IFREG {
+			s.owned = append(s.owned, ownedPath{dev: uint64(st.Dev), ino: st.Ino})
+		}
 	}
 	s.stamp, err = s.snapshot(ctx)
 	// The discovered aliases become part of the fixed native/read/validate

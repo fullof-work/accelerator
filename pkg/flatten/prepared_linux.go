@@ -106,7 +106,7 @@ func PrepareDir(ctx context.Context, root string, opts Options, dopts DirOptions
 		}
 	}()
 	owned := append(append([]string(nil), dopts.OutputPaths...), work)
-	selection, err := selectSourceWithOwned(ctx, abs, excludes, owned, limits.IndexMemoryBytes/4)
+	selection, err := selectSourceWithOwned(ctx, abs, excludes, owned, dopts.OutputFiles, limits.IndexMemoryBytes/4)
 	if err != nil {
 		return nil, err
 	}

@@ -520,9 +520,14 @@ print('fixture')
             # Device creation needs privileges; inject only lstat's type bits
             # to cover identical major/minor values through the real fingerprint.
             for kind in [stat.S_IFCHR, stat.S_IFBLK]:
+                identity = (tree/'node').lstat()
                 info = SimpleNamespace(st_mode=kind | 0o600, st_uid=1000,
-                                       st_gid=1000, st_mtime_ns=0, st_rdev=os.makedev(1, 3))
-                with mock.patch.object(pathlib.Path, 'lstat', return_value=info):
+                                       st_gid=1000, st_mtime_ns=0, st_rdev=os.makedev(1, 3),
+                                       st_dev=identity.st_dev, st_ino=identity.st_ino)
+                original = pathlib.Path.lstat
+                def lstat_node(path):
+                    return info if path == tree/'node' else original(path)
+                with mock.patch.object(pathlib.Path, 'lstat', new=lstat_node):
                     row = bench_flatten.tree_contents(tree)['node']
                 self.assertEqual(row['kind'], kind)
                 rows.append(row)

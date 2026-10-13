@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import resource
+import re
 import select
 import signal
 import stat
@@ -92,6 +93,41 @@ def scratch_usage(scratch, processes):
                             deleted.add(key)
                 except (FileNotFoundError, ProcessLookupError):
                     pass
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    # An mmap can pin an unlinked inode after its last FD closes. Do not
+    # silently accept an incomplete resource sample when that inode is absent.
+    for pid, _ in processes:
+        try:
+            with (pathlib.Path('/proc') / str(pid) / 'maps').open(errors='surrogateescape') as mappings:
+                for line in mappings:
+                    fields = line.rstrip('\n').split(None, 5)
+                    if len(fields) < 6 or fields[4] == '0':
+                        continue
+                    major, minor = (int(part, 16) for part in fields[3].split(':'))
+                    key = os.makedev(major, minor), int(fields[4])
+                    if key in objects:
+                        continue
+                    # maps quotes newlines as octal; map_files gives the exact
+                    # pathname for the uncommon, not-yet-accounted candidate.
+                    shown = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[5])
+                    if not any(name.startswith(str(scratch) + '/') for name in (fields[5], shown)):
+                        continue
+                    reference = pathlib.Path('/proc') / str(pid) / 'map_files' / fields[0]
+                    try:
+                        target = os.readlink(reference)
+                        # A newly created linked file may have missed the tree
+                        # walk. Only accept a stat of that same mapped inode.
+                        try:
+                            st = os.stat(target)
+                        except FileNotFoundError:
+                            st = None
+                        if st is not None and (st.st_dev, st.st_ino) == key:
+                            objects[key] = (st.st_blocks * 512, False)
+                        else:
+                            raise RuntimeError('unmeasured scratch mapping retained by owned process')
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass  # The mapping/process disappeared during sampling.
         except (FileNotFoundError, ProcessLookupError):
             pass
     return {'scratch_blocks': sum(v[0] for v in objects.values()),
@@ -180,13 +216,14 @@ def tree_contents(tree):
                'mtime_ns': info.st_mtime_ns}
         if stat.S_ISREG(info.st_mode):
             row.update(type='file', size=info.st_size, sha256=file_digest(path))
-            links.setdefault((info.st_dev, info.st_ino), []).append(name)
         elif stat.S_ISDIR(info.st_mode):
             row.update(type='directory')
         elif stat.S_ISLNK(info.st_mode):
             row.update(type='symlink', target=os.readlink(path))
         else:
             row.update(type='special', kind=stat.S_IFMT(info.st_mode), device=info.st_rdev)
+        if not stat.S_ISDIR(info.st_mode):
+            links.setdefault((info.st_dev, info.st_ino), []).append(name)
         actual[name] = row
     for names in links.values():
         canonical = min(names)

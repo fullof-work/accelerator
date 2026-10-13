@@ -279,3 +279,60 @@ func TestRawOutputRejectsReplacedTemporary(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceSelectionOutputFiles(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "input"), []byte("input"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(filepath.Join(outside, "stream"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	for _, name := range []string{"stdout", "alias"} {
+		if err := os.Link(file.Name(), filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	borrowed := os.NewFile(uintptr(fd), "no-usable-output-path")
+	defer borrowed.Close()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	selection, err := selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{borrowed, write}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selection.excluded("stdout") || !selection.excluded("alias") || selection.excluded("input") {
+		t.Fatalf("selection: %v", selection.excludes)
+	}
+	if _, err := borrowed.Write([]byte("output grows")); err != nil {
+		t.Fatal(err)
+	}
+	if err := selection.validate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "input"), []byte("changed input"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := selection.validate(context.Background()); err == nil {
+		t.Fatal("included source mutation was not rejected")
+	}
+	if err := borrowed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{borrowed}, 1<<20); err == nil {
+		t.Fatal("closed output FD accepted")
+	}
+	if _, err := selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{nil}, 1<<20); err == nil {
+		t.Fatal("nil output FD accepted")
+	}
+}

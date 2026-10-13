@@ -160,7 +160,7 @@ source I/O. Process enumeration follows procfs parent PIDs and includes owned-se
 members after reparenting, checking the leader start time; it does not require
 the optional per-task `children` interface. A resource pass without samples, or whose samples never observe a live owned process, fails
 instead of publishing zero peaks. Deleted-open accounting uses inode link count,
-not the procfs filename suffix. Failed teardown aborts the progress reader and
+not the procfs filename suffix. A scratch inode retained only by a memory mapping must also be accounted for; an unmeasured mapping invalidates the resource sample. Failed teardown aborts the progress reader and
 retains scratch instead of waiting indefinitely for stderr. Pair the resource pass with `--timing-only` under the same resource,
 storage and cache conditions to measure that effect. Timing-only results keep
 identity/content checks, child CPU/I/O accounting and owned teardown, but record
@@ -180,8 +180,8 @@ output root must be disjoint; the output root must not exist. A Registry input
 must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
 by relative path, including `.` for the root directory: each entry includes `type`, `mode`, `uid`, `gid`, and `mtime_ns` (0 under the fixed output timestamp policy), plus file
 `size`/`sha256`, symlink `target` or special-file `device` and numeric `kind` (`stat.S_IFMT(st_mode)`, distinguishing
-FIFO, socket, character and block device). For each regular-file
-hard-link group in the selected tree, the lexicographically first relative path
+FIFO, socket, character and block device). For each non-directory
+hard-link group (including symlinks and special files) in the selected tree, the lexicographically first relative path
 is canonical; other members include `hardlink_to` naming that path. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
 contents and metadata must match. This extra extraction is outside measurement. After verification, only the owned
