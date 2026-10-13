@@ -164,7 +164,7 @@ source I/O. Process enumeration follows procfs parent PIDs and includes owned-se
 members after reparenting, checking the leader start time; it does not require
 the optional per-task `children` interface. A resource pass without samples, or whose samples never observe a live owned process, fails
 instead of publishing zero peaks. The receiver retries interrupted and positive short writes before recording artifact bytes; a write without progress or a storage error fails the run. Deleted-open accounting includes a retained, removed scratch root and uses inode link count,
-not the procfs filename suffix. A scratch inode retained only by a memory mapping must also be accounted for; an unmeasured mapping invalidates the resource sample. Failed teardown aborts the progress reader and
+not the procfs filename suffix. Process `cwd` and `root` references are also inspected: a removed directory they retain contributes its inode and allocated bytes once, including in the historical `deleted_open_*` fields. A scratch inode retained only by a memory mapping must also be accounted for; an unmeasured mapping invalidates the resource sample. Failed teardown aborts the progress reader and
 retains scratch instead of waiting indefinitely for stderr. Pair the resource pass with `--timing-only` under the same resource,
 storage and cache conditions to measure that effect. Timing-only results keep
 identity/content checks, child CPU/I/O accounting and owned teardown, but record

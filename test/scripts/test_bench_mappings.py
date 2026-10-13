@@ -6,6 +6,8 @@ import io
 import json
 import os
 import pathlib
+import select
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -229,3 +231,69 @@ class AggregatePublication(unittest.TestCase):
                     self.assertEqual(len({r['artifact_sha256'] for r in results}), 1)
                 else:
                     self.assertFalse(aggregate.exists(), 'rejected comparison published a success aggregate')
+
+
+class ProcessDirectoryReferences(unittest.TestCase):
+    def retained_directory(self, kind):
+        with tempfile.TemporaryDirectory(prefix='retained-process-directory-') as directory:
+            scratch = pathlib.Path(directory)
+            held = scratch/'held'; held.mkdir()
+            code = ("import os,sys\n"
+                    "path,kind=sys.argv[1:]\n"
+                    "if kind in ('root','both'):os.chroot(path)\n"
+                    "if kind=='cwd':os.chdir(path)\n"
+                    "elif kind=='both':os.chdir('/')\n"
+                    "print('ready',flush=True)\n"
+                    "sys.stdin.buffer.read(1)\n")
+            child = subprocess.Popen([sys.executable, '-c', code, str(held), kind],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0], 'child did not become ready')
+                self.assertEqual(child.stdout.readline(), b'ready\n')
+                processes = [(child.pid, 0)]
+                self.assertEqual(bench_flatten.scratch_usage(scratch, processes)['scratch_inodes'], 2)
+                held.rmdir()
+                reference = pathlib.Path('/proc')/str(child.pid)/('cwd' if kind=='cwd' else 'root')
+                retained = reference.stat()
+                self.assertEqual(retained.st_nlink, 0)
+                sample = bench_flatten.scratch_usage(scratch, processes)
+                self.assertEqual(sample['scratch_inodes'], 2)
+                self.assertEqual(sample['scratch_blocks'], (scratch.stat().st_blocks+retained.st_blocks)*512)
+                self.assertEqual(sample['deleted_open_files'], 1)
+                self.assertEqual(sample['deleted_open_blocks'], retained.st_blocks*512)
+            finally:
+                child.communicate(b'x', timeout=5)
+                self.assertEqual(child.returncode, 0)
+
+    def test_deleted_cwd_without_fd_is_counted(self):
+        self.retained_directory('cwd')
+
+    @unittest.skipUnless(os.geteuid()==0, 'actual process root reference requires chroot privilege')
+    def test_deleted_process_root_is_counted_and_deduplicated(self):
+        for kind in ['root', 'both']:
+            with self.subTest(kind=kind):
+                self.retained_directory(kind)
+
+    def test_directory_reference_errors(self):
+        with tempfile.TemporaryDirectory(prefix='directory-reference-errors-') as directory:
+            scratch = pathlib.Path(directory)
+            readlink = os.readlink
+            path_stat = pathlib.Path.stat
+            for name in ['cwd', 'root']:
+                target = pathlib.Path('/proc')/str(os.getpid())/name
+                for operation in ['readlink', 'stat']:
+                    for error in [PermissionError, FileNotFoundError, ProcessLookupError]:
+                        def read_reference(path, *args, **kwargs):
+                            if path==target:
+                                if operation=='readlink':raise error('directory reference inspection')
+                                return str(scratch/'held')
+                            return readlink(path, *args, **kwargs)
+                        def stat_reference(path, *args, **kwargs):
+                            if path==target:raise error('directory reference inspection')
+                            return path_stat(path, *args, **kwargs)
+                        with self.subTest(name=name,operation=operation,error=error), mock.patch.object(os,'readlink',new=read_reference), mock.patch.object(pathlib.Path,'stat',new=stat_reference):
+                            if error is PermissionError:
+                                with self.assertRaisesRegex(PermissionError,'directory reference inspection'):
+                                    bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
+                            else:
+                                self.assertEqual(bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])['scratch_inodes'], 1)

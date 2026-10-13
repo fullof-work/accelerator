@@ -78,26 +78,34 @@ def scratch_usage(scratch, processes):
             except FileNotFoundError:
                 pass
     deleted = set()
-    # A disappearing process/FD is normal. Denied inspection cannot establish
-    # whether an unlinked scratch file still occupies space.
-    for pid, _ in processes:
+    def account_reference(reference):
         try:
-            for fd in (pathlib.Path('/proc') / str(pid) / 'fd').iterdir():
-                try:
-                    target = os.readlink(fd)
-                    root_name = str(scratch)
-                    if target.startswith(root_name + '/') or target in (root_name, root_name + ' (deleted)'):
-                        st = fd.stat()
-                        # A retained, removed root has no trailing slash. Do
-                        # not confuse a live sibling with a literal suffix.
-                        if target == root_name + ' (deleted)' and st.st_nlink != 0:
-                            continue
-                        key = st.st_dev, st.st_ino
-                        objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
-                        if st.st_nlink == 0:
-                            deleted.add(key)
-                except (FileNotFoundError, ProcessLookupError):
-                    pass
+            target = os.readlink(reference)
+            root_name = str(scratch)
+            if target.startswith(root_name + '/') or target in (root_name, root_name + ' (deleted)'):
+                st = reference.stat()
+                # A retained, removed root has no trailing slash. Do not
+                # confuse a live sibling with a literal suffix.
+                if target == root_name + ' (deleted)' and st.st_nlink != 0:
+                    return
+                key = st.st_dev, st.st_ino
+                objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
+                if st.st_nlink == 0:
+                    deleted.add(key)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
+    # A disappearing process/reference is normal. Denied inspection cannot
+    # establish whether an unlinked scratch object still occupies space.
+    for pid, _ in processes:
+        process = pathlib.Path('/proc') / str(pid)
+        # cwd and root can retain directory inodes with no open FD or mapping.
+        # The common inode key also deduplicates them against visible paths/FDs.
+        for name in ['cwd', 'root']:
+            account_reference(process / name)
+        try:
+            for fd in (process / 'fd').iterdir():
+                account_reference(fd)
         except (FileNotFoundError, ProcessLookupError):
             pass
     # An mmap can pin an unlinked inode after its last FD closes. Do not
