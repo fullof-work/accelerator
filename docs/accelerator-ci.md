@@ -160,13 +160,13 @@ normal product builds use the Plan path.
 Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent and
 output root must be disjoint; the output root must not exist. A Registry input
 must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
-by relative path: each entry includes `type`, `mode`, `uid`, `gid`, plus file
+by relative path, including `.` for the root directory: each entry includes `type`, `mode`, `uid`, `gid`, plus file
 `size`/`sha256`, symlink `target` or special-file `device` and numeric `kind` (`stat.S_IFMT(st_mode)`, distinguishing
 FIFO, socket, character and block device). For each regular-file
 hard-link group in the selected tree, the lexicographically first relative path
 is canonical; other members include `hardlink_to` naming that path. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
-contents and metadata must match. This extra extraction is outside measurement.
+contents and metadata must match. This extra extraction is outside measurement. Scratch permission or I/O errors fail the measurement; directories removed by the producer during sampling are tolerated.
 
 ```bash
 python3 test/scripts/bench_flatten.py \

@@ -29,6 +29,41 @@ class BenchmarkLifecycle(unittest.TestCase):
             self.assertEqual(measured['scratch_blocks'], sum(path.lstat().st_blocks*512 for path in
                              [root, root/'directory', root/'payload', root/'alias']))
 
+    def test_scratch_unreadable_subtree_fails_measurement(self):
+        if os.geteuid() == 0:
+            self.skipTest('requires ordinary UID to observe directory permissions')
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root = pathlib.Path(directory)
+            hidden = root/'hidden'
+            hidden.mkdir()
+            (hidden/'payload').write_bytes(b'x'*8192)
+            hidden.chmod(0o100)
+            try:
+                with self.assertRaises(PermissionError):
+                    bench_flatten.scratch_usage(root, [])
+            finally:
+                hidden.chmod(0o700)
+
+    def test_scratch_disappearing_directory_is_not_a_permission_failure(self):
+        def vanished(*args, onerror, **kwargs):
+            onerror(FileNotFoundError('producer removed its owned directory'))
+            return iter(())
+        with mock.patch.object(os, 'walk', side_effect=vanished):
+            self.assertEqual(bench_flatten.scratch_usage(pathlib.Path('/unused'), [])['scratch_inodes'], 0)
+
+    def test_content_fingerprint_includes_root_metadata(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            tree = pathlib.Path(directory)
+            (tree/'file').write_bytes(b'unchanged')
+            before = bench_flatten.tree_contents(tree)
+            self.assertEqual(before['.'], {'type': 'directory', 'mode': 0o700,
+                                          'uid': os.getuid(), 'gid': os.getgid()})
+            tree.chmod(0o750)
+            after = bench_flatten.tree_contents(tree)
+            self.assertEqual(before['file'], after['file'])
+            self.assertNotEqual(before, after)
+            self.assertEqual(after['.']['mode'], 0o750)
+
     def test_content_fingerprint_distinguishes_hardlinks_from_duplicate_files(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             tree = pathlib.Path(directory)

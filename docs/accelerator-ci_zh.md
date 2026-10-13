@@ -137,12 +137,12 @@ stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 wri
 
 在既有 Workbench 中使用 Python 3.11 或更新版本。输入、scratch parent 与 output root
 须互不包含，output root 须不存在。Registry 输入必须固定 SHA-256 digest。提供按相对
-路径索引的预期内容 JSON：每项包含 `type`、`mode`、`uid`、`gid`，文件另含
+路径索引的预期内容 JSON，其中 `.` 表示根目录：每项包含 `type`、`mode`、`uid`、`gid`，文件另含
 `size`/`sha256`，符号链接含 `target`，特殊文件含 `device` 以及数值 `kind`（`stat.S_IFMT(st_mode)`，
 区分 FIFO、socket、字符设备和块设备）。对选集内每组普通文件
 硬链接，以字典序最小的相对路径为规范路径，其他成员用 `hardlink_to` 指向该路径。
 每个首次出现的 artifact
-身份都经所选 native fsck 提取，核验实际内容和元数据；额外提取在测量区间外执行。
+身份都经所选 native fsck 提取，核验实际内容和元数据；额外提取在测量区间外执行。scratch 遍历遇到权限或 I/O 错误时，测量明确失败；生产者在采样期间删除自有目录不算遍历失败。
 
 ```bash
 python3 test/scripts/bench_flatten.py \

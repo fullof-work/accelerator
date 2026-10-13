@@ -14,7 +14,7 @@ import (
 // A private directory protects the name used by renameat from other users of a
 // writable destination directory. All I/O stays on the originally reserved FD;
 // retained directory FDs also prevent substituted ancestor paths from selecting
-// another object at commit or cleanup. No procfs or extra raw output copy is used.
+// another object at commit or cleanup. No extra raw output copy is used.
 type pendingRawOutput struct {
 	file, dir, parent  *os.File
 	fileInfo, dirInfo  os.FileInfo
@@ -68,6 +68,19 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 	p.dirInfo, err = p.dir.Stat()
 	if err != nil {
 		return nil, err
+	}
+	// mkdir applies the process umask too. Restore owner access through the
+	// retained descriptor, without changing the umask or following a name in
+	// the destination directory. Linux 6.1 needs the procfs descriptor path;
+	// ordinary umasks need neither this fallback nor fchmodat2.
+	if st.Mode&0700 != 0700 {
+		err = unix.Fchmodat(dirFD, "", 0700, unix.AT_EMPTY_PATH)
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) {
+			err = os.Chmod(fmt.Sprintf("/proc/self/fd/%d", dirFD), 0700)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("restore private staging directory permissions: %w", err)
+		}
 	}
 	fileFD, err := unix.Openat(dirFD, "image", unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode))
 	if err != nil {

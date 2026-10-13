@@ -8,6 +8,7 @@ This host harness does not measure Guest ext4 or Host COW and is not VM evidence
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import pathlib
@@ -48,7 +49,13 @@ def process_tree(root):
 
 def scratch_usage(scratch, processes):
     objects = {}
-    for directory, directories, files in os.walk(scratch):
+    def scan_error(error):
+        # A producer can remove its own directory between enumeration and scan.
+        # Permission and I/O failures are incomplete measurements, not zero use.
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for directory, directories, files in os.walk(scratch, onerror=scan_error):
         # os.walk lists symlinked directories but does not descend into them.
         links = [name for name in directories if (pathlib.Path(directory) / name).is_symlink()]
         for name in ['.', *files, *links]:
@@ -121,7 +128,7 @@ def stop_owned_group(producer, leader_start):
 
 def tree_contents(tree):
     actual, links = {}, {}
-    for path in tree.rglob('*'):
+    for path in itertools.chain((tree,), tree.rglob('*')):
         name = str(path.relative_to(tree))
         info = path.lstat()
         row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
