@@ -9,6 +9,7 @@ import pathlib
 import select
 import signal
 import time
+import threading
 import subprocess
 import sys
 import tempfile
@@ -599,6 +600,25 @@ class MeasurementInputIdentity(unittest.TestCase):
 
 
 class MeasurementScanLifetime(unittest.TestCase):
+    def test_new_thread_invalidates_captured_task_set(self):
+        process=pathlib.Path('/proc')/str(os.getpid())
+        fields=(process/'stat').read_text(errors='surrogateescape').rsplit(') ',1)[1].split()
+        identity=fields[19],fields[3]
+        tasks=bench_flatten.live_task_stats(process,identity)
+        self.assertTrue(bench_flatten.task_scan_unchanged(process,identity,tasks))
+        ready,stop=threading.Event(),threading.Event()
+        def worker():
+            ready.set();stop.wait()
+        thread=threading.Thread(target=worker)
+        try:
+            thread.start();self.assertTrue(ready.wait(5))
+            self.assertFalse(bench_flatten.task_scan_unchanged(process,identity,tasks),
+                             'new live thread was absent from the captured resource scan')
+        finally:
+            stop.set();thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(bench_flatten.task_scan_unchanged(process,identity,tasks))
+
     def test_identity_change_during_resource_reads_discards_contributions(self):
         for when in ['before-references','during-references','failed-references','changed-task']:
             with self.subTest(when=when), tempfile.TemporaryDirectory(prefix='scan-lifetime-') as directory:

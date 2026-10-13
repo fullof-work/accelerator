@@ -123,18 +123,12 @@ def open_tree_directory(root_fd, parts, repair=False):
 
 
 def task_scan_unchanged(process, identity, tasks):
-    try:
-        fields = (process / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
-        if (fields[19], fields[3]) != identity:
-            return False
-        for task, previous in tasks:
-            fields = (task / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
-            if fields[0] in ('Z', 'X', 'x') or (fields[19], fields[3]) != (previous[19], previous[3]):
-                return False
-        fields = (process / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
-        return (fields[19], fields[3]) == identity
-    except (FileNotFoundError, ProcessLookupError):
-        return False
+    # New siblings may own private FD/FS tables too. Re-enumerate the complete
+    # live set, including identities, instead of checking only captured rows.
+    current = live_task_stats(process, identity)
+    def identities(rows):
+        return {(task, fields[19], fields[3]) for task, fields in rows}
+    return bool(current) and identities(current) == identities(tasks)
 
 
 def scratch_usage(scratch, processes):
