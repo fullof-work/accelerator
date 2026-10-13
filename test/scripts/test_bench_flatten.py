@@ -125,7 +125,7 @@ sys.exit(17)
                 return original_iterdir(path)
             with mock.patch.object(pathlib.Path, 'iterdir', new=list_references), mock.patch.object(os,'open',new=open_reference), \
                     mock.patch.object(os,'readlink',new=read_reference), mock.patch.object(os,'fstat',new=stat_reference):
-                return bench_flatten.scratch_usage(scratch, [(os.getpid(), 0)])
+                return bench_flatten.scratch_usage(scratch, bench_flatten.process_tree(os.getpid()))
 
     def test_process_file_inspection_permission_errors_fail(self):
         for operation in ['enumerate', 'open', 'readlink', 'stat']:
@@ -166,15 +166,15 @@ sys.exit(17)
             path=root/'literal (deleted)'
             path.write_bytes(b'x'*8192)
             with path.open('rb') as opened:
-                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                sample=bench_flatten.scratch_usage(root,bench_flatten.process_tree(os.getpid()))
                 self.assertEqual(sample['deleted_open_files'],0)
                 alias=root/'alias'
                 os.link(path,alias)
                 path.unlink()
-                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                sample=bench_flatten.scratch_usage(root,bench_flatten.process_tree(os.getpid()))
                 self.assertEqual(sample['deleted_open_files'],0)
                 alias.unlink()
-                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                sample=bench_flatten.scratch_usage(root,bench_flatten.process_tree(os.getpid()))
                 self.assertEqual(sample['deleted_open_files'],1)
                 self.assertEqual(sample['deleted_open_blocks'],os.fstat(opened.fileno()).st_blocks*512)
 
@@ -242,10 +242,10 @@ while not (root/'exit').exists():time.sleep(0.01)
                     time.sleep(0.01)
                 child=int((root/'ready').read_text())
                 (root/'exit').touch();parent.wait(timeout=5)
-                self.assertNotIn(child,dict(bench_flatten.process_tree(parent.pid)))
+                self.assertNotIn(child,{pid: rss for pid, rss, _ in bench_flatten.process_tree(parent.pid)})
                 observed=bench_flatten.process_tree(parent.pid,start)
-                self.assertIn(child,dict(observed))
-                self.assertGreater(dict(observed)[child],0)
+                self.assertIn(child,{pid: rss for pid, rss, _ in observed})
+                self.assertGreater({pid: rss for pid, rss, _ in observed}[child],0)
                 self.assertEqual(bench_flatten.scratch_usage(root,observed)['deleted_open_files'],1)
             finally:
                 try:os.killpg(parent.pid,signal.SIGKILL)
@@ -277,7 +277,7 @@ while not (root/'exit').exists():time.sleep(0.01)
                 path=entry/'stat';path.write_text(f'{pid} (fixture) '+ ' '.join(fields))
                 rows.append(path)
             with mock.patch.object(pathlib.Path,'glob',return_value=rows):
-                self.assertEqual(bench_flatten.process_tree(100),[(102,7*os.sysconf('SC_PAGE_SIZE'))])
+                self.assertEqual(bench_flatten.process_tree(100),[(102,7*os.sysconf('SC_PAGE_SIZE'),('0','100'))])
 
     def test_resource_pass_without_observed_process_is_invalid(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
@@ -713,7 +713,7 @@ with (scratch/'active').open('wb') as out:
                         raise FileNotFoundError(path)
                     return original_read(path, *args, **kwargs)
                 with mock.patch.object(pathlib.Path, 'read_text', without_children):
-                    observed = dict(bench_flatten.process_tree(pids[0]))
+                    observed = {pid: rss for pid, rss, _ in bench_flatten.process_tree(pids[0])}
                 self.assertTrue(set(pids).issubset(observed), observed)
                 self.assertTrue(all(observed[pid] > 0 for pid in pids), observed)
                 harness.send_signal(signal.SIGTERM)

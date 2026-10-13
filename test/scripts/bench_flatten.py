@@ -62,7 +62,7 @@ def process_tree(root, leader_start=None):
             fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
             pid, parent = int(path.parent.name), int(fields[1])
             if fields[0] not in ('Z', 'X', 'x'):
-                rows[pid] = int(fields[21]) * page_size
+                rows[pid] = int(fields[21]) * page_size, (fields[19], fields[3])
             else:
                 # Inspect siblings only for owned groups during traversal.
                 # Keep parent edges even when the entire group has exited.
@@ -82,13 +82,14 @@ def process_tree(root, leader_start=None):
             continue
         seen.add(pid)
         if pid in rows:
-            result.append((pid, rows[pid]))
+            rss, identity = rows[pid]
+            result.append((pid, rss, identity))
         elif pid in exited:
             process, start, session = exited[pid]
             tasks = live_task_stats(process, (start, session))
             if tasks:
                 # Threads share an address space; count one live task's RSS.
-                result.append((pid, int(tasks[0][1][21]) * page_size))
+                result.append((pid, int(tasks[0][1][21]) * page_size, (start, session)))
         pending.extend(children.get(pid, []))
     return result
 
@@ -147,8 +148,8 @@ def scratch_usage(scratch, processes):
     # File and filesystem tables can differ between threads. Inspect all live
     # tasks, retaining the common inode key for shared tables and references.
     process_tasks = []
-    for pid, _ in processes:
-        tasks = live_task_stats(pathlib.Path('/proc') / str(pid))
+    for pid, _, identity in processes:
+        tasks = live_task_stats(pathlib.Path('/proc') / str(pid), identity)
         process_tasks.append(tasks)
         for task, _ in tasks:
             for name in ['cwd', 'root']:
@@ -213,6 +214,25 @@ def scratch_usage(scratch, processes):
 def file_digest(path):
     with open(path, 'rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+def producer_config(path):
+    # Inputs remain caller-owned and immutable. Record the bytes and identity
+    # without saving config contents or including reads in producer timing.
+    if not path:
+        return None
+    path = pathlib.Path(path).resolve(strict=True)
+    def identity(info):
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    with path.open('rb') as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError('producer config must be a regular file')
+        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        after = os.fstat(source.fileno())
+    if identity(before) != identity(after) or identity(after) != identity(path.stat()):
+        raise RuntimeError('producer config changed while being read')
+    return {'path': str(path), 'sha256': digest, 'identity': identity(after)}
 
 
 @contextlib.contextmanager
@@ -399,6 +419,7 @@ def write_all(output, block):
 
 def measure_one(args, variant, trial, result_root, verified):
     name, cli, mkfs = variant
+    config = producer_config(args.config or os.environ.get('FLATTEN_CONFIG'))
     run = result_root / f'{trial}-{name}'
     run.mkdir()
     scratch = pathlib.Path(tempfile.mkdtemp(prefix='flatten-bench-', dir=args.scratch_parent)).resolve()
@@ -410,8 +431,8 @@ def measure_one(args, variant, trial, result_root, verified):
     command = [cli, 'export', '--tmpdir', str(scratch), '--output', '-']
     if not args.progress_timing:
         command.append('--no-progress')
-    if args.config:
-        command += ['--config', str(args.config)]
+    if config:
+        command += ['--config', config['path']]
     command.append(args.input)
     environment = dict(os.environ, MKFS_EROFS_PATH=mkfs, TMPDIR=str(scratch))
     stopped = False
@@ -445,7 +466,7 @@ def measure_one(args, variant, trial, result_root, verified):
                         processes = process_tree(producer.pid, leader_start)
                         samples.append(dict(seconds=time.monotonic()-started,
                                             processes=len(processes),
-                                            process_rss=sum(rss for _, rss in processes),
+                                            process_rss=sum(rss for _, rss, _ in processes),
                                             **scratch_usage(scratch, processes)))
                     except Exception as error:
                         failures.append(str(error))
@@ -515,8 +536,17 @@ def measure_one(args, variant, trial, result_root, verified):
         identity = digest.hexdigest()
         if identity not in verified:
             verify_contents(args, artifact, run)
+        if config:
+            try:
+                unchanged = producer_config(config['path']) == config
+            except OSError as error:
+                raise RuntimeError('producer config changed or became unreadable') from error
+            if not unchanged:
+                raise RuntimeError('producer config changed during measurement')
+        if identity not in verified:
             verified[identity] = str(run / 'content-check.log')
         result = {'variant': name, 'trial': trial, 'command': command,
+                  'producer_config': config,
                   # Keep historical field names/values; make the units explicit
                   # for both sampled rows and their reported peak fields.
                   'metric_units': {'artifact_blocks': 'bytes', 'scratch_blocks': 'bytes',

@@ -49,7 +49,7 @@ class MappingAndLinkMeasurements(unittest.TestCase):
                 file.close()
                 self.assertEqual(ctypes.string_at(address, 8), b'mapped!!')
                 with self.assertRaisesRegex(RuntimeError, 'unmeasured scratch mapping'):
-                    bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                    bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
             self.assertEqual(list(root.iterdir()), [])
 
     def test_mapped_file_accounted_by_fd_or_link_is_counted_once(self):
@@ -63,7 +63,7 @@ class MappingAndLinkMeasurements(unittest.TestCase):
                             file.close()
                         else:
                             (root/name).unlink()
-                        sample = bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                        sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
                         self.assertEqual(sample['scratch_blocks'], root.stat().st_blocks * 512 + blocks)
                         self.assertEqual(sample['scratch_inodes'], 2)
                         self.assertEqual(sample['deleted_open_files'], 0 if linked else 1)
@@ -75,7 +75,7 @@ class MappingAndLinkMeasurements(unittest.TestCase):
                 blocks = os.fstat(file.fileno()).st_blocks * 512
                 file.close()
                 with mock.patch.object(bench_flatten.os, 'fwalk', return_value=[]):
-                    sample = bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                    sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
                 self.assertEqual(sample['scratch_blocks'], blocks)
 
     def test_maps_permission_error_fails_but_disappearance_is_tolerated(self):
@@ -91,9 +91,9 @@ class MappingAndLinkMeasurements(unittest.TestCase):
                 with self.subTest(error=error), mock.patch.object(pathlib.Path, 'open', new=open_path):
                     if error is PermissionError:
                         with self.assertRaises(PermissionError):
-                            bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                            bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
                     else:
-                        self.assertEqual(bench_flatten.scratch_usage(root, [(os.getpid(), 0)])['deleted_open_files'], 0)
+                        self.assertEqual(bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))['deleted_open_files'], 0)
 
     def test_nonregular_hard_links_differ_from_split_inodes(self):
         with tempfile.TemporaryDirectory(prefix='special-links-') as directory:
@@ -132,7 +132,7 @@ class ReceiverAndRootMeasurements(unittest.TestCase):
                 root.rmdir(); root.mkdir()
                 retained = os.fstat(fd)
                 self.assertEqual(retained.st_nlink, 0)
-                sample = bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
                 self.assertEqual(sample['scratch_inodes'], 2)
                 self.assertEqual(sample['deleted_open_files'], 1)
                 self.assertEqual(sample['scratch_blocks'], (root.stat().st_blocks + retained.st_blocks) * 512)
@@ -252,7 +252,7 @@ class ProcessDirectoryReferences(unittest.TestCase):
             try:
                 self.assertTrue(select.select([child.stdout], [], [], 5)[0], 'child did not become ready')
                 self.assertEqual(child.stdout.readline(), b'ready\n')
-                processes = [(child.pid, 0)]
+                processes = bench_flatten.process_tree(child.pid)
                 self.assertEqual(bench_flatten.scratch_usage(scratch, processes)['scratch_inodes'], 2)
                 held.rmdir()
                 reference = pathlib.Path('/proc')/str(child.pid)/('cwd' if kind=='cwd' else 'root')
@@ -289,9 +289,9 @@ class ProcessDirectoryReferences(unittest.TestCase):
                     with self.subTest(name=name,error=error), mock.patch.object(os,'open',new=open_reference):
                         if error is PermissionError:
                             with self.assertRaisesRegex(PermissionError,'directory reference inspection'):
-                                bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
+                                bench_flatten.scratch_usage(scratch, bench_flatten.process_tree(os.getpid()))
                         else:
-                            self.assertEqual(bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])['scratch_inodes'], 1)
+                            self.assertEqual(bench_flatten.scratch_usage(scratch, bench_flatten.process_tree(os.getpid()))['scratch_inodes'], 1)
 
 
 class ProcessNameEncoding(unittest.TestCase):
@@ -325,7 +325,7 @@ class ProcessNameEncoding(unittest.TestCase):
 
     def test_sampling_accepts_non_utf8_owned_and_unrelated_names(self):
         with self.processes_with_byte_names() as (owned, unrelated, started):
-            observed = dict(bench_flatten.process_tree(owned.pid, started))
+            observed = {pid: rss for pid, rss, _ in bench_flatten.process_tree(owned.pid, started)}
             self.assertGreater(observed[owned.pid], 0)
             self.assertNotIn(unrelated.pid, observed)
 
@@ -380,7 +380,7 @@ class BoundMeasurementReferences(unittest.TestCase):
             before = len(os.listdir('/proc/self/fd'))
             try:
                 with mock.patch.object(os, 'readlink', new=readlink):
-                    sample = bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
+                    sample = bench_flatten.scratch_usage(scratch, bench_flatten.process_tree(os.getpid()))
                 self.assertTrue(swapped)
                 self.assertEqual(sample['scratch_blocks'], (scratch.stat().st_blocks+retained.st_blocks)*512)
                 self.assertEqual(sample['deleted_open_blocks'], retained.st_blocks*512)
@@ -463,7 +463,7 @@ while True:time.sleep(1)
                 return original(path)
             with mock.patch.object(pathlib.Path, 'iterdir', new=tasks):
                 with self.assertRaisesRegex(PermissionError, 'owned tasks denied'):
-                    bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
+                    bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
 
     def test_reused_zombie_group_is_not_observed(self):
         for reuse in ['before-tasks', 'during-tasks']:
@@ -488,3 +488,77 @@ while True:time.sleep(1)
                 with mock.patch.object(pathlib.Path, 'glob', return_value=[group_stat]), \
                      mock.patch.object(pathlib.Path, 'read_text', new=read):
                     self.assertEqual(bench_flatten.process_tree(100, '10'), [])
+
+
+
+class MeasurementInputIdentity(unittest.TestCase):
+    def test_resource_scan_retains_observed_process_identity(self):
+        for changed in ['start', 'session']:
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix='sample-identity-') as directory:
+                root = pathlib.Path(directory)
+                held = root/'held';held.write_bytes(b'x'*8192)
+                with held.open('rb'):
+                    held.unlink()
+                    observed = bench_flatten.process_tree(os.getpid())
+                    target = pathlib.Path('/proc')/str(os.getpid())/'stat'
+                    original = pathlib.Path.read_text
+                    def reused(path, *args, **kwargs):
+                        value = original(path, *args, **kwargs)
+                        if path == target:
+                            prefix, tail = value.rsplit(') ', 1);fields = tail.split()
+                            index = 19 if changed == 'start' else 3
+                            fields[index] = str(int(fields[index])+1)
+                            return prefix+') '+' '.join(fields)
+                        return value
+                    with mock.patch.object(pathlib.Path, 'read_text', new=reused):
+                        sample = bench_flatten.scratch_usage(root, observed)
+                    self.assertEqual(sample['deleted_open_files'], 0)
+
+    def run_config(self, source='flag', mutation=None):
+        with tempfile.TemporaryDirectory(prefix='producer-config-') as directory:
+            root = pathlib.Path(directory)
+            scratch = root/'scratch';scratch.mkdir()
+            results = root/'results';results.mkdir()
+            config = root/'remote.yaml';config.write_text('platform: linux/amd64\n')
+            alias = root/'config-link';alias.symlink_to(config.name)
+            expected = root/'expected.json';expected.write_text('{}')
+            producer = root/'producer'
+            code = '#!/usr/bin/env python3\nimport pathlib,sys,time\ntime.sleep(.02)\n'
+            if mutation:
+                code += 'config=pathlib.Path(sys.argv[sys.argv.index("--config")+1])\n'
+                if mutation == 'content':code += 'config.write_text("platform: linux/arm64\\n")\n'
+                if mutation == 'replace':code += 'data=config.read_bytes();config.unlink();config.write_bytes(data)\n'
+                if mutation == 'remove':code += 'config.unlink()\n'
+            producer.write_text(code+'print("fixture")\n');producer.chmod(0o755)
+            consumer = root/'consumer'
+            consumer.write_text('#!/usr/bin/env python3\nprint(\'{"config":{}}\')\n');consumer.chmod(0o755)
+            args = SimpleNamespace(scratch_parent=scratch, progress_timing=False,
+                config=alias if source=='flag' else None, input='fixture', timing_only=True,
+                consumer=str(consumer), fsck='/bin/true', fsync=False, expected=expected,
+                expected_config=expected, keep_artifacts=False)
+            verified = {}
+            # A flag overrides a stale inherited path, exactly as in the CLI.
+            environment = {'FLATTEN_CONFIG':str(alias) if source=='env' else str(root/'absent') if source=='flag' else ''}
+            with mock.patch.dict(os.environ, environment), mock.patch.object(bench_flatten,'verify_contents'):
+                if mutation:
+                    with self.assertRaisesRegex(RuntimeError, 'producer config changed'):
+                        bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,verified)
+                    self.assertFalse(verified)
+                    self.assertFalse(list(results.glob('*/result.json')))
+                else:
+                    result = bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,verified)
+                    if source == 'default':
+                        self.assertIsNone(result['producer_config'])
+                    else:
+                        self.assertEqual(result['producer_config']['path'],str(config.resolve()))
+                        self.assertEqual(result['producer_config']['sha256'],bench_flatten.file_digest(config))
+                        self.assertEqual(result['command'][result['command'].index('--config')+1],str(config.resolve()))
+            self.assertEqual(list(scratch.iterdir()),[])
+
+    def test_producer_config_provenance(self):
+        for source in ['flag','env','default']:
+            with self.subTest(source=source):self.run_config(source)
+
+    def test_changed_producer_config_rejects_result(self):
+        for mutation in ['content','replace','remove']:
+            with self.subTest(mutation=mutation):self.run_config(mutation=mutation)
