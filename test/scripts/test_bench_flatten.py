@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Exercise measurement cancellation with live owned/background writers."""
 import os
+import io
+import json
+import hashlib
+import threading
 import pathlib
 import signal
 import socket
@@ -17,6 +21,175 @@ import bench_flatten
 
 
 class BenchmarkLifecycle(unittest.TestCase):
+
+    def test_deleted_open_uses_link_count(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root=pathlib.Path(directory)
+            path=root/'literal (deleted)'
+            path.write_bytes(b'x'*8192)
+            with path.open('rb') as opened:
+                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                self.assertEqual(sample['deleted_open_files'],0)
+                alias=root/'alias'
+                os.link(path,alias)
+                path.unlink()
+                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                self.assertEqual(sample['deleted_open_files'],0)
+                alias.unlink()
+                sample=bench_flatten.scratch_usage(root,[(os.getpid(),0)])
+                self.assertEqual(sample['deleted_open_files'],1)
+                self.assertEqual(sample['deleted_open_blocks'],os.fstat(opened.fileno()).st_blocks*512)
+
+    def test_readonly_verification_tree_is_cleaned_after_check(self):
+        for mismatch in [False,True]:
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+                root=pathlib.Path(directory)
+                outside=root/'outside'
+                outside.mkdir();outside.chmod(0o555)
+                run=root/'run';run.mkdir()
+                expected=root/'expected.json'
+                common={'uid':os.getuid(),'gid':os.getgid()}
+                rows={'.':dict(common,type='directory',mode=0o555 if not mismatch else 0o755),
+                      'child':dict(common,type='directory',mode=0o555),
+                      'child/file':dict(common,type='file',mode=0o444,size=1,sha256=hashlib.sha256(b'x').hexdigest()),
+                      'external':dict(common,type='symlink',mode=0o777,target=str(outside))}
+                expected.write_text(json.dumps(rows))
+                args=SimpleNamespace(expected=expected,consumer='consumer',fsck='fsck')
+                def extract(command,**kwargs):
+                    if command[0]=='consumer':
+                        (run/'verify.erofs').write_bytes(b'raw')
+                    else:
+                        tree=run/'verify-root';child=tree/'child';child.mkdir()
+                        (child/'file').write_bytes(b'x');(child/'file').chmod(0o444)
+                        (tree/'external').symlink_to(outside,target_is_directory=True)
+                        child.chmod(0o555);tree.chmod(0o555)
+                    return subprocess.CompletedProcess(command,0)
+                try:
+                    with mock.patch.object(bench_flatten.subprocess,'run',side_effect=extract):
+                        if mismatch:
+                            with self.assertRaisesRegex(RuntimeError,'content or metadata differs'):
+                                bench_flatten.verify_contents(args,root/'artifact',run)
+                        else:
+                            bench_flatten.verify_contents(args,root/'artifact',run)
+                    self.assertFalse((run/'verify-root').exists())
+                    self.assertFalse((run/'verify.erofs').exists())
+                    self.assertEqual(stat.S_IMODE(outside.stat().st_mode),0o555)
+                finally:
+                    outside.chmod(0o700)
+
+    def test_owned_session_sample_retains_reparented_writer(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root=pathlib.Path(directory)
+            child_code="""import os,pathlib,sys,time
+root=pathlib.Path(sys.argv[1])
+path=root/'unlinked'
+with path.open('wb') as owned:
+    owned.write(b'x'*8192);owned.flush();path.unlink()
+    (root/'ready').write_text(str(os.getpid()))
+    time.sleep(60)
+"""
+            parent_code="""import pathlib,subprocess,sys,time
+root=pathlib.Path(sys.argv[1])
+subprocess.Popen([sys.executable,'-c',sys.argv[2],str(root)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+while not (root/'exit').exists():time.sleep(0.01)
+"""
+            parent=subprocess.Popen([sys.executable,'-c',parent_code,str(root),child_code],start_new_session=True)
+            try:
+                start=(pathlib.Path('/proc')/str(parent.pid)/'stat').read_text().rsplit(') ',1)[1].split()[19]
+                deadline=time.monotonic()+5
+                while not (root/'ready').exists():
+                    if time.monotonic()>deadline:self.fail('background fixture not ready')
+                    time.sleep(0.01)
+                child=int((root/'ready').read_text())
+                (root/'exit').touch();parent.wait(timeout=5)
+                self.assertNotIn(child,dict(bench_flatten.process_tree(parent.pid)))
+                observed=bench_flatten.process_tree(parent.pid,start)
+                self.assertIn(child,dict(observed))
+                self.assertGreater(dict(observed)[child],0)
+                self.assertEqual(bench_flatten.scratch_usage(root,observed)['deleted_open_files'],1)
+            finally:
+                try:os.killpg(parent.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                parent.wait(timeout=5)
+
+    def test_resource_pass_without_samples_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root=pathlib.Path(directory)
+            scratch=root/'scratch';scratch.mkdir()
+            results=root/'results';results.mkdir()
+            producer=root/'producer'
+            producer.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(0.02)\nprint("fixture")\n')
+            producer.chmod(0o755)
+            expected=root/'expected.json';expected.write_text('{}')
+            args=SimpleNamespace(scratch_parent=scratch,progress_timing=False,config=None,input='fixture',
+                                 timing_only=False,interval=0.1,consumer='/bin/true',fsync=False,
+                                 expected=expected,keep_artifacts=False)
+            with mock.patch.object(bench_flatten.threading,'Thread'), mock.patch.object(bench_flatten,'verify_contents'):
+                with self.assertRaisesRegex(RuntimeError,'resource pass produced no samples'):
+                    bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+            self.assertFalse(list(results.glob('*/result.json')))
+            self.assertEqual(list(scratch.iterdir()),[])
+
+    def test_progress_reader_stops_with_live_writer(self):
+        reader,writer=os.pipe()
+        output=io.BytesIO();events=[];abort=threading.Event()
+        thread=threading.Thread(target=bench_flatten.read_progress_stream,
+                                args=(os.fdopen(reader,'rb'),output,events,time.monotonic(),abort))
+        thread.start()
+        try:
+            os.write(writer,b'complete line\npartial line')
+            deadline=time.monotonic()+2
+            while not events:
+                if time.monotonic()>deadline:self.fail('reader did not consume progress')
+                time.sleep(0.01)
+            abort.set();thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(),'reader waited for a surviving writer to close')
+            self.assertEqual(output.getvalue(),b'complete line\npartial line')
+            self.assertEqual([entry['message'] for entry in events],['complete line','partial line'])
+        finally:
+            abort.set();os.close(writer);thread.join(timeout=2)
+
+    def test_teardown_failure_surfaces_with_stderr_still_open(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            root=pathlib.Path(directory)
+            scratch=root/'scratch';scratch.mkdir()
+            results=root/'results';results.mkdir()
+            producer=root/'producer'
+            producer.write_text("""#!/usr/bin/env python3
+import subprocess,sys,time
+subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=subprocess.DEVNULL)
+time.sleep(0.02)
+print('fixture')
+""")
+            producer.chmod(0o755)
+            args=SimpleNamespace(scratch_parent=scratch,progress_timing=True,config=None,input='fixture',timing_only=True)
+            owned=[];errors=[]
+            original=subprocess.Popen
+            def launch(*args,**kwargs):
+                process=original(*args,**kwargs);owned.append(process);return process
+            def measure():
+                try:
+                    bench_flatten.one(args,('fixture',str(producer),'/bin/true'),1,results,{})
+                except Exception as error:
+                    errors.append(error)
+            worker=threading.Thread(target=measure)
+            with mock.patch.object(bench_flatten.subprocess,'Popen',side_effect=launch), \
+                 mock.patch.object(bench_flatten,'stop_owned_group',side_effect=RuntimeError('injected teardown failure')):
+                worker.start()
+                try:
+                    worker.join(timeout=3)
+                    self.assertFalse(worker.is_alive(),'teardown error blocked on live stderr writer')
+                    self.assertEqual(len(errors),1)
+                    self.assertIn('injected teardown failure',str(errors[0]))
+                    self.assertTrue(list(scratch.iterdir()),'failed teardown scratch must be retained')
+                    self.assertFalse(list(results.glob('*/result.json')))
+                finally:
+                    for process in owned:
+                        try:os.killpg(process.pid,signal.SIGKILL)
+                        except ProcessLookupError:pass
+                        process.wait(timeout=5)
+                    worker.join(timeout=5)
+
     def test_scratch_counts_symlink_directories_and_deduplicates_hardlinks(self):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root = pathlib.Path(directory)

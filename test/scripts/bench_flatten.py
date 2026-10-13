@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import resource
+import select
 import signal
 import stat
 import shutil
@@ -22,10 +23,10 @@ import threading
 import time
 
 
-def process_tree(root):
+def process_tree(root, leader_start=None):
     # Minimal Guest/host kernels need not expose task/TID/children. Build the
     # descendant set from procfs PPIDs instead of silently missing subprocesses.
-    rows, children = {}, {}
+    rows, children, owned = {}, {}, set()
     page_size = os.sysconf('SC_PAGE_SIZE')
     for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
         try:
@@ -33,9 +34,14 @@ def process_tree(root):
             pid, parent = int(path.parent.name), int(fields[1])
             rows[pid] = int(fields[21]) * page_size
             children.setdefault(parent, []).append(pid)
+            if leader_start is not None:
+                if pid == root and fields[19] != leader_start:
+                    raise RuntimeError('producer PID was reused; refusing resource sample')
+                if int(fields[3]) == root and int(fields[19]) >= int(leader_start):
+                    owned.add(pid)
         except (FileNotFoundError, ProcessLookupError):
             pass
-    pending, result, seen = [root], [], set()
+    pending, result, seen = [root, *owned], [], set()
     while pending:
         pid = pending.pop()
         if pid in seen:
@@ -73,8 +79,8 @@ def scratch_usage(scratch, processes):
                     if target.startswith(str(scratch) + '/'):
                         st = fd.stat()
                         key = st.st_dev, st.st_ino
-                        objects[key] = (st.st_blocks * 512, target.endswith(' (deleted)'))
-                        if target.endswith(' (deleted)'):
+                        objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
+                        if st.st_nlink == 0:
                             deleted.add(key)
                 except (FileNotFoundError, PermissionError):
                     pass
@@ -150,6 +156,54 @@ def tree_contents(tree):
     return actual
 
 
+def remove_verification_tree(tree):
+    # fsck and metadata verification have finished. Recover directory access
+    # only in this private extraction; symlink targets are never visited.
+    if not stat.S_ISDIR(tree.lstat().st_mode):
+        raise RuntimeError('verification root is not a directory')
+    tree.chmod(0o700)
+    for directory, directories, _ in os.walk(tree):
+        for name in directories:
+            child = pathlib.Path(directory) / name
+            if stat.S_ISDIR(child.lstat().st_mode):
+                os.chmod(child, 0o700, follow_symlinks=False)
+    shutil.rmtree(tree)
+
+
+def read_progress_stream(stream, output, events, started, abort):
+    # Poll an owned descriptor so failed writer teardown can stop this reader
+    # even when a surviving process still has the write end open.
+    pending = bytearray()
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    try:
+        while not abort.is_set():
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            try:
+                block = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not block:
+                break
+            output.write(block)
+            pending.extend(block)
+            while pending:
+                newline = pending.find(b'\n', 0, 65536)
+                length = newline+1 if newline >= 0 else min(len(pending), 65536)
+                if newline < 0 and length < 65536:
+                    break
+                line = pending[:length]
+                del pending[:length]
+                events.append({'seconds': time.monotonic()-started,
+                               'message': line[:8192].decode(errors='replace').rstrip()})
+        if pending:
+            events.append({'seconds': time.monotonic()-started,
+                           'message': pending[:8192].decode(errors='replace').rstrip()})
+    finally:
+        stream.close()
+
+
 def verify_contents(args, artifact, run):
     # This extra extraction is outside the timed producer/receiver interval.
     # Its raw file and extracted tree are evidence scratch, never producer peak.
@@ -170,7 +224,7 @@ def verify_contents(args, artifact, run):
     finally:
         raw.unlink(missing_ok=True)
         if tree.exists():
-            shutil.rmtree(tree)
+            remove_verification_tree(tree)
 
 
 def one(args, variant, trial, result_root, verified):
@@ -195,6 +249,7 @@ def one(args, variant, trial, result_root, verified):
     leader_start = None
     sampler = None
     stderr_reader = None
+    progress_abort = threading.Event()
     progress_events = []
     first_output_seconds = None
     output_read = None
@@ -206,14 +261,9 @@ def one(args, variant, trial, result_root, verified):
             if args.progress_timing:
                 def read_progress():
                     try:
-                        while line := producer.stderr.readline(65536):
-                            errors.write(line)
-                            progress_events.append({'seconds': time.monotonic()-started,
-                                                    'message': line[:8192].decode(errors='replace').rstrip()})
+                        read_progress_stream(producer.stderr, errors, progress_events, started, progress_abort)
                     except Exception as error:
                         failures.append('progress reader: '+str(error))
-                    finally:
-                        producer.stderr.close()
                 stderr_reader = threading.Thread(target=read_progress)
                 stderr_reader.start()
             leader_start = (pathlib.Path('/proc') / str(producer.pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
@@ -222,7 +272,7 @@ def one(args, variant, trial, result_root, verified):
             def monitor():
                 while not done.is_set():
                     try:
-                        processes = process_tree(producer.pid)
+                        processes = process_tree(producer.pid, leader_start)
                         samples.append(dict(seconds=time.monotonic()-started,
                                             process_rss=sum(rss for _, rss in processes),
                                             **scratch_usage(scratch, processes)))
@@ -260,11 +310,15 @@ def one(args, variant, trial, result_root, verified):
                     if sampler is not None:
                         sampler.join()
                     if stderr_reader is not None:
+                        if not stopped:
+                            progress_abort.set()
                         stderr_reader.join()
         if code:
             raise RuntimeError(f'{name}: producer exit {code}; see {run / "producer.stderr"}')
         if failures:
             raise RuntimeError(f'measurement failed: {failures}')
+        if not args.timing_only and not samples:
+            raise RuntimeError('resource pass produced no samples')
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         validation_started = time.monotonic()
         with (run / 'consumer.json').open('wb') as output:
@@ -324,6 +378,8 @@ def one(args, variant, trial, result_root, verified):
                     sampler.join()
                 producer.stdout.close()
                 if stderr_reader is not None:
+                    if not stopped:
+                        progress_abort.set()
                     stderr_reader.join()
         if stopped or producer is None:
             shutil.rmtree(scratch)

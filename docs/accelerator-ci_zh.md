@@ -87,7 +87,7 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 | 原生布局与顺序输出 | Guest native patch series；`pkg/flatten/plan_linux.go` | Raw/Plan 身份及提取内容；损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾前失败。Native exact-read 注入沿用 guest-runtime 的 `test-erofs`。 |
 | 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
 | 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
-| 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
+| 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
 
 最后一行包含显式启用的真实挂载测试。普通用户编译测试程序，再在新的私有 mount
 namespace 中以挂载权限仅运行这些用例。将 `TMPDIR` 设为私有测试目录，
@@ -121,7 +121,7 @@ artifact reader，默认交替顺序执行三轮。记录工具摘要、进程�
 stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 writer 才能输出 artifact 头。部分宿主不提供 child rusage I/O 计数；
 采样 RSS 与块峰值受记录的采样间隔限制。
 
-进程枚举使用 procfs 的父 PID，不依赖可选的逐任务 `children` 接口。
+进程枚举使用 procfs 的父 PID，并在核对会话首进程启动时间后纳入重新归属父进程的自有会话成员，不依赖可选的逐任务 `children` 接口。资源轮次没有样本时明确失败，不发布零峰值。已删除但仍打开的文件按 inode 链接数判定，不依赖 procfs 文件名后缀。清理失败时终止进度读取并保留 scratch，避免无限等待 stderr。
 
 宽目录的块数/inode 遍历可能干扰管道接收和源文件 I/O。资源采样轮次之外，再在相同
 资源、存储和缓存条件下使用 `--timing-only` 测量该影响。此模式仍核验身份和实际内容、
@@ -142,7 +142,7 @@ stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 wri
 区分 FIFO、socket、字符设备和块设备）。对选集内每组普通文件
 硬链接，以字典序最小的相对路径为规范路径，其他成员用 `hardlink_to` 指向该路径。
 每个首次出现的 artifact
-身份都经所选 native fsck 提取，核验实际内容和元数据；额外提取在测量区间外执行。scratch 遍历遇到权限或 I/O 错误时，测量明确失败；生产者在采样期间删除自有目录不算遍历失败。
+身份都经所选 native fsck 提取，核验实际内容和元数据；额外提取在测量区间外执行。校验结束后，仅为本次自有提取目录树恢复删除所需的目录访问权限，不改变外部符号链接目标。scratch 遍历遇到权限或 I/O 错误时，测量明确失败；生产者在采样期间删除自有目录不算遍历失败。
 
 ```bash
 python3 test/scripts/bench_flatten.py \

@@ -100,7 +100,7 @@ defines input, source lifetime, native plan and artifact completion contracts.
 | Native layout and sequential emission | Guest native patch series; `pkg/flatten/plan_linux.go` | Raw/Plan identity and extracted contents; corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail failure. Native exact-read injection runs in guest-runtime's existing `test-erofs` target. |
 | Archive and entry-point equivalence | `pkg/flatten/archive_linux.go`, `raw_linux.go` | Seekable archive, pipe spool and directory comparisons; truncated/concatenated archive and index-budget rejection. Guest CLI tests cover file, stdout and upload/error paths. |
 | Persistent cache publication and ownership | `pkg/remote/prepare_linux.go`, `prefetch_linux.go`, cache/GC | Unverified EOF is not a hit; explicit byte budget, bypass, current-layer priority, duplicates, concurrent GC leases and joined cancellation. Conversion-policy tests retain explicit old-artifact reading while rejecting stale conversion hits. |
-| Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file/UID/GID preservation, reserved-file and directory substitution rejection, read-only private-tree cleanup without following external symlinks, and open/deleted FD checks. |
+| Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file/UID/GID/rwx/access-ACL preservation, inherited directory GID, privileged empty-root chmod, EMFILE cleanup, reserved-file and directory substitution rejection, read-only private-tree cleanup without following external symlinks, and open/deleted FD checks. |
 
 The last row includes opt-in real mount tests. Compile the test executable as an
 ordinary user, then run only those cases with mount privilege in a new private
@@ -142,8 +142,12 @@ ends before the artifact writer can emit its header. Child rusage I/O counters m
 sampled RSS and block peaks have the recorded sampling resolution.
 
 Walking a wide tree for block/inode samples can perturb the pipe receiver and
-source I/O. Process enumeration follows procfs parent PIDs and does not require
-the optional per-task `children` interface. Pair the resource pass with `--timing-only` under the same resource,
+source I/O. Process enumeration follows procfs parent PIDs and includes owned-session
+members after reparenting, checking the leader start time; it does not require
+the optional per-task `children` interface. A resource pass without samples fails
+instead of publishing zero peaks. Deleted-open accounting uses inode link count,
+not the procfs filename suffix. Failed teardown aborts the progress reader and
+retains scratch instead of waiting indefinitely for stderr. Pair the resource pass with `--timing-only` under the same resource,
 storage and cache conditions to measure that effect. Timing-only results keep
 identity/content checks, child CPU/I/O accounting and owned teardown, but record
 sampled peaks and the sampling interval as null. Retain both results; a timing
@@ -166,7 +170,9 @@ FIFO, socket, character and block device). For each regular-file
 hard-link group in the selected tree, the lexicographically first relative path
 is canonical; other members include `hardlink_to` naming that path. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
-contents and metadata must match. This extra extraction is outside measurement. Scratch permission or I/O errors fail the measurement; directories removed by the producer during sampling are tolerated.
+contents and metadata must match. This extra extraction is outside measurement. After verification, only the owned
+extraction tree has directory access restored for removal; external symlink
+targets remain untouched. Scratch permission or I/O errors fail the measurement; directories removed by the producer during sampling are tolerated.
 
 ```bash
 python3 test/scripts/bench_flatten.py \

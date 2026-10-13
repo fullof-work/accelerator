@@ -2,6 +2,9 @@ package flatten
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
 	"os/exec"
@@ -91,6 +94,275 @@ func TestRawPendingRestrictiveUmask(t *testing.T) {
 		cmd.Env = append(os.Environ(), helper+"="+mode)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("umask child %s: %v\n%s", mode, err, output)
+		}
+	}
+}
+
+func pendingACL(owner uint16) []byte {
+	value := make([]byte, 44)
+	binary.LittleEndian.PutUint32(value, 2)
+	for i, entry := range [][3]uint32{{1, uint32(owner), 0xffffffff}, {2, 4, 12345}, {4, 0, 0xffffffff}, {16, 4, 0xffffffff}, {32, 0, 0xffffffff}} {
+		offset := 4 + i*8
+		binary.LittleEndian.PutUint16(value[offset:], uint16(entry[0]))
+		binary.LittleEndian.PutUint16(value[offset+2:], uint16(entry[1]))
+		binary.LittleEndian.PutUint32(value[offset+4:], entry[2])
+	}
+	return value
+}
+
+func setPendingACL(t *testing.T, path, name string, value []byte) {
+	t.Helper()
+	if err := unix.Setxattr(path, name, value, 0); err != nil {
+		if errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skip("fixture filesystem has no POSIX ACL support")
+		}
+		t.Fatal(err)
+	}
+}
+
+func TestRawPendingAccessACL(t *testing.T) {
+	for _, owner := range []uint16{6, 2} {
+		t.Run(fmt.Sprintf("owner-%o", owner), func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, "output")
+			if err := os.WriteFile(output, []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			acl := pendingACL(owner)
+			setPendingACL(t, output, "system.posix_acl_access", acl)
+			pending, err := reserveRawOutput(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pending.Close()
+			if _, err := pending.file.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.closeFile(); err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.commit(); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, 64)
+			n, err := unix.Lgetxattr(output, "system.posix_acl_access", got)
+			if err != nil {
+				t.Fatalf("read access ACL: %v", err)
+			}
+			if !bytes.Equal(got[:n], acl) {
+				t.Fatalf("access ACL changed: %x", got[:n])
+			}
+		})
+	}
+	t.Run("remove-inherited-acl", func(t *testing.T) {
+		dir := t.TempDir()
+		output := filepath.Join(dir, "output")
+		if err := os.WriteFile(output, []byte("old"), 0640); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(output, 0640); err != nil {
+			t.Fatal(err)
+		}
+		setPendingACL(t, dir, "system.posix_acl_default", pendingACL(7))
+		pending, err := reserveRawOutput(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pending.Close()
+		if err := pending.closeFile(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.commit(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := unix.Lgetxattr(output, "system.posix_acl_access", make([]byte, 64)); !errors.Is(err, unix.ENODATA) {
+			t.Fatalf("inherited ACL retained: %v", err)
+		}
+		info, err := os.Stat(output)
+		if err != nil || info.Mode().Perm() != 0640 {
+			t.Fatalf("mode: %v %v", info, err)
+		}
+	})
+}
+
+func denyPendingSyscall(t *testing.T, call uintptr, errno unix.Errno) {
+	t.Helper()
+	runtime.LockOSThread()
+	filter := []unix.SockFilter{
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(call), Jf: 1},
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(errno)},
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+	}
+	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRawPendingFailureBoundaries(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_PENDING_FAILURE"
+	if kind := os.Getenv(helper); kind != "" {
+		dir := t.TempDir()
+		output := filepath.Join(dir, "output")
+		switch kind {
+		case "access-acl":
+			if err := os.WriteFile(output, []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			setPendingACL(t, output, "system.posix_acl_access", pendingACL(6))
+			denyPendingSyscall(t, unix.SYS_FSETXATTR, unix.EPERM)
+			pending, err := reserveRawOutput(output)
+			if pending != nil {
+				pending.Close()
+			}
+			if !errors.Is(err, unix.EPERM) {
+				t.Fatalf("ACL restoration failure: %v", err)
+			}
+			got, err := os.ReadFile(output)
+			if err != nil || string(got) != "old" {
+				t.Fatalf("old output: %q %v", got, err)
+			}
+			if err := os.Remove(output); err != nil {
+				t.Fatal(err)
+			}
+		case "directory-open":
+			var limit unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+				t.Fatal(err)
+			}
+			old := limit
+			limit.Cur = 128
+			if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+				t.Fatal(err)
+			}
+			fds := []int{}
+			for {
+				fd, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+				if errors.Is(err, unix.EMFILE) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				fds = append(fds, fd)
+			}
+			if len(fds) == 0 {
+				t.Fatal("no room for parent descriptor")
+			}
+			unix.Close(fds[len(fds)-1])
+			fds = fds[:len(fds)-1]
+			pending, err := reserveRawOutput(output)
+			unix.Setrlimit(unix.RLIMIT_NOFILE, &old)
+			for _, fd := range fds {
+				unix.Close(fd)
+			}
+			if pending != nil {
+				pending.Close()
+			}
+			if !errors.Is(err, unix.EMFILE) {
+				t.Fatalf("directory open failure: %v", err)
+			}
+		default:
+			t.Fatal(kind)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("staging leaked: %v %v", entries, err)
+		}
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"access-acl", "directory-open"} {
+		cmd := exec.Command(executable, "-test.run=^TestRawPendingFailureBoundaries$")
+		cmd.Env = append(os.Environ(), helper+"="+kind)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", kind, err, out)
+		}
+	}
+}
+
+func TestRawPendingGroupAndEmptyRoot(t *testing.T) {
+	const helper = "KUASAR_TEST_Raw_PENDING_GROUP"
+	if kind := os.Getenv(helper); kind != "" {
+		dir := t.TempDir()
+		if err := os.Chown(dir, os.Geteuid(), 12345); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, os.ModeSetgid|0770); err != nil {
+			t.Fatal(err)
+		}
+		if kind == "empty-root" {
+			// Only this already-running test child enters its private empty
+			// root. There is no procfs, loader or helper executable inside.
+			if err := unix.Chroot(dir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chdir("/"); err != nil {
+				t.Fatal(err)
+			}
+			dir = "/"
+			denyPendingSyscall(t, unix.SYS_FCHMODAT2, unix.ENOSYS)
+		}
+		syscall.Umask(0707)
+		output := filepath.Join(dir, "output")
+		pending, err := reserveRawOutput(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stage, err := pending.dir.Stat()
+		if err != nil || stage.Mode().Perm() != 0700 || stage.Mode()&os.ModeSetgid == 0 {
+			t.Fatalf("staging mode: %v %v", stage, err)
+		}
+		if _, err := pending.file.Write([]byte("image")); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.closeFile(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.Close(); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gid := info.Sys().(*syscall.Stat_t).Gid; gid != 12345 {
+			t.Fatalf("output GID %d, want 12345", gid)
+		}
+		if info.Mode().Perm() != 0060 {
+			t.Fatalf("umask output mode %o", info.Mode().Perm())
+		}
+		if err := os.Remove(output); err != nil {
+			t.Fatal(err)
+		}
+		if kind == "empty-root" {
+			os.Exit(0)
+		} // Parent owns and removes the host fixture.
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root for distinct GID and chroot fixtures")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"group", "empty-root"} {
+		temporary := t.TempDir()
+		cmd := exec.Command(executable, "-test.run=^TestRawPendingGroupAndEmptyRoot$")
+		cmd.Env = append(os.Environ(), helper+"="+kind, "TMPDIR="+temporary)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", kind, err, out)
 		}
 	}
 }
