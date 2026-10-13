@@ -5,13 +5,11 @@ package flatten
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
@@ -125,35 +123,24 @@ func BuildFromDir(root, outputPath string, opts Options, dopts DirOptions) error
 }
 
 func writeRawFile(ctx context.Context, output string, prepare func(string) (*PreparedImage, error)) (retErr error) {
-	f, err := createPendingOutput(output, ".flatten-output-")
+	pending, err := reserveRawOutput(output)
 	if err != nil {
 		return err
 	}
-	pending := f.Name()
-	defer func() {
-		if f != nil {
-			retErr = errors.Join(retErr, f.Close())
-		}
-		if err := os.Remove(pending); err != nil && !errors.Is(err, os.ErrNotExist) {
-			retErr = errors.Join(retErr, err)
-		}
-	}()
-	p, err := prepare(pending)
+	defer func() { retErr = errors.Join(retErr, pending.Close()) }()
+	// Exclude the complete private staging directory before planning.
+	p, err := prepare(pending.path)
 	if err != nil {
 		return err
 	}
-	err = p.WriteRaw(ctx, f)
-	// Close input resources and the destination before committing; any late
-	// error leaves the previous destination untouched. No extra fsync is needed.
-	err = errors.Join(err, f.Close(), p.Close())
-	f = nil
+	err = p.WriteRaw(ctx, pending.file)
+	// Close input resources and the output before commit. Every late failure
+	// preserves the previous destination; no additional fsync is introduced.
+	err = errors.Join(err, pending.closeFile(), p.Close())
 	if err != nil {
 		return err
 	}
-	if _, _, err = outputPermissions(output); err != nil {
-		return err
-	}
-	return os.Rename(pending, output)
+	return pending.commit()
 }
 
 // outputPermissions accepts only ordinary destination files. Atomic replacement
@@ -170,41 +157,4 @@ func outputPermissions(output string) (os.FileMode, *syscall.Stat_t, error) {
 		return 0, nil, fmt.Errorf("destination is not a regular file: %s", output)
 	}
 	return st.Mode().Perm(), st.Sys().(*syscall.Stat_t), nil
-}
-
-func createPendingOutput(output, prefix string) (*os.File, error) {
-	mode, previous, err := outputPermissions(output)
-	if err != nil {
-		return nil, err
-	}
-	for range 10 {
-		name := filepath.Join(filepath.Dir(output), prefix+rand.Text())
-		// A new output keeps normal 0666 & umask semantics. Existing output
-		// permissions are restored explicitly, unaffected by this process's umask.
-		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
-		if errors.Is(err, os.ErrExist) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if previous != nil {
-			info, statErr := f.Stat()
-			if statErr != nil {
-				return nil, errors.Join(statErr, f.Close(), os.Remove(name))
-			}
-			current := info.Sys().(*syscall.Stat_t)
-			if current.Uid != previous.Uid || current.Gid != previous.Gid {
-				if err = f.Chown(int(previous.Uid), int(previous.Gid)); err != nil {
-					return nil, errors.Join(err, f.Close(), os.Remove(name))
-				}
-			}
-			// Restore the mode after chown, which can clear permission bits.
-			if err = f.Chmod(mode); err != nil {
-				return nil, errors.Join(err, f.Close(), os.Remove(name))
-			}
-		}
-		return f, nil
-	}
-	return nil, fmt.Errorf("reserve pending output: %w", os.ErrExist)
 }

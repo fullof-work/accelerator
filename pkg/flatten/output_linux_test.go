@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -195,5 +196,86 @@ func TestRawOutputOwnershipFailure(t *testing.T) {
 	entries, err := os.ReadDir(root)
 	if err != nil || len(entries) != 2 {
 		t.Fatalf("pending file remains: %v %v", entries, err)
+	}
+}
+
+func TestRawOutputRejectsReplacedTemporary(t *testing.T) {
+	requirePlan(t)
+	for _, kind := range []string{"symlink", "regular", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			root, dir, scratch := t.TempDir(), t.TempDir(), t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "payload"), []byte("raw payload"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			output, sentinel := filepath.Join(dir, "output"), filepath.Join(dir, "sentinel")
+			previous, target := []byte("previous raw output"), []byte("untouched target")
+			if err := os.WriteFile(output, previous, 0640); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sentinel, target, 0644); err != nil {
+				t.Fatal(err)
+			}
+			var moved, replacement string
+			err := writeRawFile(context.Background(), output, func(pending string) (*PreparedImage, error) {
+				if kind == "directory" {
+					moved = pending + "-moved"
+					if err := os.Rename(pending, moved); err != nil {
+						return nil, err
+					}
+					if err := os.Mkdir(pending, 0700); err != nil {
+						return nil, err
+					}
+					replacement = filepath.Join(pending, "image")
+					if err := os.WriteFile(replacement, target, 0644); err != nil {
+						return nil, err
+					}
+				} else {
+					file := filepath.Join(pending, "image")
+					if err := os.Remove(file); err != nil {
+						return nil, err
+					}
+					if kind == "symlink" {
+						if err := os.Symlink(sentinel, file); err != nil {
+							return nil, err
+						}
+					} else if err := os.WriteFile(file, target, 0644); err != nil {
+						return nil, err
+					}
+				}
+				return PrepareDir(context.Background(), root, Options{TmpDir: scratch}, DirOptions{OutputPaths: []string{output, pending}})
+			})
+			if err == nil || !strings.Contains(err.Error(), "temporary object was replaced") {
+				t.Fatalf("replacement accepted: %v", err)
+			}
+			for path, want := range map[string][]byte{output: previous, sentinel: target} {
+				got, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("changed %s: %v", path, err)
+				}
+				info, err := os.Lstat(path)
+				if err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("replaced %s: %v", path, err)
+				}
+			}
+			entries, err := os.ReadDir(scratch)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("scratch remains: %v %v", entries, err)
+			}
+			if moved != "" {
+				entries, err := os.ReadDir(moved)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("owned raw remains: %v %v", entries, err)
+				}
+				got, err := os.ReadFile(replacement)
+				if err != nil || !bytes.Equal(got, target) {
+					t.Fatalf("replacement tree changed: %v", err)
+				}
+			} else {
+				entries, err := os.ReadDir(dir)
+				if err != nil || len(entries) != 2 {
+					t.Fatalf("pending output remains: %v %v", entries, err)
+				}
+			}
+		})
 	}
 }
