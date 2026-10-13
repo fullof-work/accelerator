@@ -26,6 +26,28 @@ class BenchmarkLifecycle(unittest.TestCase):
             self.assertEqual(measured['scratch_blocks'], sum(path.lstat().st_blocks*512 for path in
                              [root, root/'directory', root/'payload', root/'alias']))
 
+    def test_content_fingerprint_distinguishes_hardlinks_from_duplicate_files(self):
+        with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
+            tree = pathlib.Path(directory)
+            # Create the canonical path last so directory enumeration order
+            # cannot choose the identity of a hard-link group.
+            (tree/'z').write_bytes(b'payload')
+            os.link(tree/'z', tree/'a')
+            (tree/'copy').write_bytes(b'payload')
+            linked = bench_flatten.tree_contents(tree)
+            self.assertEqual(linked['z']['hardlink_to'], 'a')
+            self.assertNotIn('hardlink_to', linked['a'])
+            self.assertNotIn('hardlink_to', linked['copy'])
+            self.assertEqual(linked['a'], linked['copy'])
+            (tree/'z').unlink()
+            (tree/'z').write_bytes(b'payload')
+            copied = bench_flatten.tree_contents(tree)
+            self.assertEqual({k: v for k, v in linked['z'].items() if k != 'hardlink_to'}, copied['z'])
+            self.assertNotEqual(linked, copied)
+
+    def test_cancel_joins_writer_in_another_owned_process_group(self):
+        self.cancel_measurement(True, timing_only=True, new_group=True)
+
     def test_cancel_joins_background_writer_and_preserves_unrelated_process(self):
         self.cancel_measurement(False)
 
@@ -35,7 +57,7 @@ class BenchmarkLifecycle(unittest.TestCase):
     def test_cancel_without_resource_sampler_joins_writers(self):
         self.cancel_measurement(True, timing_only=True)
 
-    def cancel_measurement(self, progress, timing_only=False):
+    def cancel_measurement(self, progress, timing_only=False, new_group=False):
         with tempfile.TemporaryDirectory(prefix='flatten-bench-test-') as directory:
             root = pathlib.Path(directory)
             scratch = root / 'scratch'
@@ -49,12 +71,19 @@ class BenchmarkLifecycle(unittest.TestCase):
 import os, pathlib, subprocess, sys, time
 root = pathlib.Path(__file__).parent
 scratch = pathlib.Path(sys.argv[sys.argv.index('--tmpdir')+1])
-child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+child_code = ("import pathlib,sys,time\\n"
+              "out=(pathlib.Path(sys.argv[1])/'background').open('wb')\\n"
+              "while True:\\n out.write(b'x'); out.flush(); time.sleep(0.02)\\n")
+child = subprocess.Popen([sys.executable, '-c', child_code, str(scratch)],
+                         process_group=CHILD_GROUP)
+while not (scratch/'background').exists():
+    if child.poll() is not None: raise RuntimeError('background writer failed')
+    time.sleep(0.01)
 (root/'writers').write_text(str(os.getpid())+' '+str(child.pid))
 with (scratch/'active').open('wb') as out:
     while True:
         out.write(b'x'); out.flush(); time.sleep(0.02)
-""")
+""".replace("CHILD_GROUP", "0" if new_group else "None"))
             producer.chmod(0o755)
             unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
                                          start_new_session=True)
@@ -67,6 +96,7 @@ with (scratch/'active').open('wb') as out:
             if timing_only:
                 command.append('--timing-only')
             harness = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            owned = {}
             try:
                 deadline = time.monotonic()+10
                 while not (root/'writers').exists():
@@ -74,6 +104,11 @@ with (scratch/'active').open('wb') as out:
                         self.fail('measurement fixture did not become ready')
                     time.sleep(0.02)
                 pids = [int(value) for value in (root/'writers').read_text().split()]
+                owned = {pid: (pathlib.Path('/proc')/str(pid)/'stat').read_text().rsplit(') ', 1)[1].split()[19]
+                         for pid in pids}
+                if new_group:
+                    self.assertEqual(os.getsid(pids[1]), pids[0])
+                    self.assertNotEqual(os.getpgid(pids[1]), pids[0])
                 # Even without task/children, collect the live producer and
                 # its actual subprocess. This caught undercounting on the
                 # maintained Guest kernel; no synthetic process tree is used.
@@ -105,6 +140,15 @@ with (scratch/'active').open('wb') as out:
                         harness.wait(timeout=20)
                     except subprocess.TimeoutExpired:
                         harness.kill(); harness.wait()
+                # Rescue a deliberately regressed harness without touching
+                # reused PIDs or the unrelated comparison session.
+                for pid, started in owned.items():
+                    try:
+                        fields = (pathlib.Path('/proc')/str(pid)/'stat').read_text().rsplit(') ', 1)[1].split()
+                        if fields[19] == started:
+                            os.kill(pid, signal.SIGKILL)
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
                 harness.stderr.close()
                 unrelated.terminate()
                 unrelated.wait()

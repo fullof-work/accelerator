@@ -130,7 +130,7 @@ tests or these mount fixtures do not replace real VM evidence.
 pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated
 scratch blocks/inodes and deleted-open files, and waits for the owned producer
-session before cleaning scratch. Receiving artifact P and its optional fsync are
+session, including children in different process groups, before cleaning scratch. Receiving artifact P and its optional fsync are
 reported separately. Optional `--progress-timing` timestamps existing CLI progress
 lines and the first available stdout bytes for phase attribution; preparation
 ends before the artifact writer can emit its header. Child rusage I/O counters may be unavailable on some hosts;
@@ -156,7 +156,9 @@ Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent a
 output root must be disjoint; the output root must not exist. A Registry input
 must include its fixed SHA-256 digest. Supply a fixed expected-content JSON keyed
 by relative path: each entry includes `type`, `mode`, `uid`, `gid`, plus file
-`size`/`sha256`, symlink `target` or special-file `device`. The first occurrence of
+`size`/`sha256`, symlink `target` or special-file `device`. For each regular-file
+hard-link group in the selected tree, the lexicographically first relative path
+is canonical; other members include `hardlink_to` naming that path. The first occurrence of
 each artifact identity is extracted with the selected native fsck, and its actual
 contents and metadata must match. This extra extraction is outside measurement.
 

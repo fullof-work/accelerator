@@ -84,34 +84,63 @@ def file_digest(path):
 
 
 def stop_owned_group(producer, leader_start):
-    def active_members():
-        active = []
+    def active_groups():
+        groups = set()
         for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
             try:
                 fields = path.read_text().rsplit(') ', 1)[1].split()
                 if int(path.parent.name) == producer.pid and fields[19] != leader_start:
                     raise RuntimeError('producer PID was reused; refusing group termination')
-                if int(fields[2]) == producer.pid and fields[0] != 'Z':
-                    if int(fields[3]) != producer.pid or int(fields[19]) < int(leader_start):
+                if int(fields[3]) == producer.pid and fields[0] != 'Z':
+                    group = int(fields[2])
+                    if group <= 1 or int(fields[19]) < int(leader_start):
                         raise RuntimeError('unexpected member of owned producer session')
-                    active.append(path.parent.name)
+                    groups.add(group)
             except (FileNotFoundError, ProcessLookupError):
                 pass
-        return active
+        return groups
 
     for sig, seconds in [(signal.SIGTERM, 10), (signal.SIGKILL, 5)]:
-        if not active_members():
-            producer.wait()
-            return
-        try:
-            os.killpg(producer.pid, sig)
-        except ProcessLookupError:
-            pass
         deadline = time.monotonic() + seconds
-        while active_members() and time.monotonic() < deadline:
+        while True:
+            groups = active_groups()
+            if not groups:
+                producer.wait()
+                return
+            for group in groups:
+                try:
+                    os.killpg(group, sig)
+                except ProcessLookupError:
+                    pass
             producer.poll()
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.05)
     raise RuntimeError('owned producer session did not stop; scratch retained')
+
+
+def tree_contents(tree):
+    actual, links = {}, {}
+    for path in tree.rglob('*'):
+        name = str(path.relative_to(tree))
+        info = path.lstat()
+        row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
+        if stat.S_ISREG(info.st_mode):
+            row.update(type='file', size=info.st_size, sha256=file_digest(path))
+            links.setdefault((info.st_dev, info.st_ino), []).append(name)
+        elif stat.S_ISDIR(info.st_mode):
+            row.update(type='directory')
+        elif stat.S_ISLNK(info.st_mode):
+            row.update(type='symlink', target=os.readlink(path))
+        else:
+            row.update(type='special', device=info.st_rdev)
+        actual[name] = row
+    for names in links.values():
+        canonical = min(names)
+        for name in names:
+            if name != canonical:
+                actual[name]['hardlink_to'] = canonical
+    return actual
 
 
 def verify_contents(args, artifact, run):
@@ -127,19 +156,7 @@ def verify_contents(args, artifact, run):
         with (run / 'content-check.log').open('wb') as output:
             subprocess.run([args.fsck, '--extract=' + str(tree), str(raw)],
                            stdout=output, stderr=subprocess.STDOUT, check=True)
-        actual = {}
-        for path in tree.rglob('*'):
-            info = path.lstat()
-            row = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
-            if stat.S_ISREG(info.st_mode):
-                row.update(type='file', size=info.st_size, sha256=file_digest(path))
-            elif stat.S_ISDIR(info.st_mode):
-                row.update(type='directory')
-            elif stat.S_ISLNK(info.st_mode):
-                row.update(type='symlink', target=os.readlink(path))
-            else:
-                row.update(type='special', device=info.st_rdev)
-            actual[str(path.relative_to(tree))] = row
+        actual = tree_contents(tree)
         if actual != expected:
             (run / 'actual-content.json').write_text(json.dumps(actual, indent=2) + '\n')
             raise RuntimeError('extracted content or metadata differs from fixed fixture')
