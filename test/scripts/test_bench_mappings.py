@@ -69,14 +69,21 @@ class MappingAndLinkMeasurements(unittest.TestCase):
                         self.assertEqual(sample['deleted_open_files'], 0 if linked else 1)
 
     def test_mapping_created_after_tree_walk_is_counted(self):
-        with tempfile.TemporaryDirectory(prefix='mapped-scratch-') as directory:
+        with tempfile.TemporaryDirectory(prefix='mapped-scratch-') as directory, contextlib.ExitStack() as mappings:
             root = pathlib.Path(directory)
-            with mapped_file(root/'literal (deleted)') as (file, _):
-                blocks = os.fstat(file.fileno()).st_blocks * 512
-                file.close()
-                with mock.patch.object(bench_flatten.os, 'fwalk', return_value=[]):
-                    sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
-                self.assertEqual(sample['scratch_blocks'], blocks)
+            original = bench_flatten.live_task_stats
+            blocks = None
+            def after_tree(*args, **kwargs):
+                nonlocal blocks
+                if blocks is None:
+                    file, _ = mappings.enter_context(mapped_file(root/'literal (deleted)'))
+                    blocks = os.fstat(file.fileno()).st_blocks * 512
+                    file.close()  # Only the newly created mapping retains it.
+                return original(*args, **kwargs)
+            with mock.patch.object(bench_flatten, 'live_task_stats', side_effect=after_tree):
+                sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(os.getpid()))
+            self.assertIsNotNone(blocks)
+            self.assertEqual(sample['scratch_blocks'], root.stat().st_blocks * 512 + blocks)
 
     def test_maps_permission_error_fails_but_disappearance_is_tolerated(self):
         with tempfile.TemporaryDirectory(prefix='mapped-scratch-') as directory:
@@ -562,3 +569,84 @@ class MeasurementInputIdentity(unittest.TestCase):
     def test_changed_producer_config_rejects_result(self):
         for mutation in ['content','replace','remove']:
             with self.subTest(mutation=mutation):self.run_config(mutation=mutation)
+
+
+
+class MeasurementScanLifetime(unittest.TestCase):
+    def test_identity_change_during_resource_reads_discards_contributions(self):
+        for when in ['before-references','during-references','failed-references','changed-task']:
+            with self.subTest(when=when), tempfile.TemporaryDirectory(prefix='scan-lifetime-') as directory:
+                root=pathlib.Path(directory);held=root/'held';held.write_bytes(b'x'*8192)
+                with held.open('rb'):
+                    held.unlink();observed=bench_flatten.process_tree(os.getpid())
+                    group=pathlib.Path('/proc')/str(os.getpid())/'stat'
+                    original_read=pathlib.Path.read_text;original_tasks=bench_flatten.live_task_stats
+                    original_open=os.open;changed=False
+                    def tasks(*args,**kwargs):
+                        nonlocal changed
+                        result=original_tasks(*args,**kwargs)
+                        if when=='before-references':changed=True
+                        return result
+                    def opened(path,*args,**kwargs):
+                        nonlocal changed
+                        if '/task/' in str(path) and when=='failed-references':
+                            changed=True
+                            raise PermissionError('replacement process is inaccessible')
+                        result=original_open(path,*args,**kwargs)
+                        if when in ['during-references','changed-task'] and '/task/' in str(path):changed=True
+                        return result
+                    def read(path,*args,**kwargs):
+                        value=original_read(path,*args,**kwargs)
+                        target = group.parent/'task'/str(os.getpid())/'stat' if when=='changed-task' else group
+                        if changed and path==target:
+                            prefix,tail=value.rsplit(') ',1);fields=tail.split();fields[19]=str(int(fields[19])+1)
+                            return prefix+') '+' '.join(fields)
+                        return value
+                    with mock.patch.object(bench_flatten,'live_task_stats',side_effect=tasks), \
+                         mock.patch.object(os,'open',side_effect=opened), \
+                         mock.patch.object(pathlib.Path,'read_text',new=read):
+                        sample=bench_flatten.scratch_usage(root,observed)
+                    self.assertTrue(changed)
+                    self.assertEqual(sample['deleted_open_files'],0)
+
+    def check_depth(self, operation):
+        code=r"""
+import os,pathlib,resource,sys,tempfile
+sys.path.insert(0,sys.argv[1]);import bench_flatten as b
+depth=int(sys.argv[2]);operation=sys.argv[3];limit=int(sys.argv[4])
+root=pathlib.Path(tempfile.mkdtemp(prefix='scan-depth-'));tree=root/'tree';tree.mkdir();nodes=[tree]
+old=resource.getrlimit(resource.RLIMIT_NOFILE)
+try:
+ for _ in range(depth):
+  path=nodes[-1]/'d';path.mkdir();nodes.append(path)
+ outside=root/'outside';outside.write_text('unchanged')
+ (nodes[-1]/'external').symlink_to(outside)
+ if limit:resource.setrlimit(resource.RLIMIT_NOFILE,(limit,old[1]))
+ descriptors=len(os.listdir('/proc/self/fd'))
+ if operation=='scan':
+  result=b.scratch_usage(tree,[]);assert result['scratch_inodes']==depth+2,result
+ else:
+  for path in reversed(nodes):path.chmod(0)
+  b.remove_verification_tree(tree);assert not tree.exists()
+ assert outside.read_text()=='unchanged'
+ assert len(os.listdir('/proc/self/fd'))==descriptors,'descriptor leak'
+finally:
+ resource.setrlimit(resource.RLIMIT_NOFILE,old)
+ for path in nodes:
+  if path.exists():path.chmod(0o700)
+ link=nodes[-1]/'external'
+ if link.is_symlink():link.unlink()
+ for path in reversed(nodes):
+  if path.exists():path.rmdir()
+ (root/'outside').unlink(missing_ok=True);root.rmdir()
+"""
+        for depth,limit in [(1050,0),(64,32)]:
+            with self.subTest(depth=depth,fd_limit=limit):
+                result=subprocess.run([sys.executable,'-B','-c',code,str(pathlib.Path(bench_flatten.__file__).parent),str(depth),operation,str(limit)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stdout[-3000:])
+
+    def test_scratch_traversal_has_bounded_descriptor_depth(self):
+        self.check_depth('scan')
+
+    def test_verification_cleanup_has_bounded_descriptor_depth(self):
+        self.check_depth('cleanup')

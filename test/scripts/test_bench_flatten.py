@@ -404,12 +404,9 @@ print('fixture')
                 hidden.chmod(0o700)
 
     def test_scratch_disappearing_directory_is_not_a_permission_failure(self):
-        def vanished(*args, onerror, **kwargs):
-            onerror(FileNotFoundError('producer removed its owned directory'))
-            return iter(())
         with tempfile.TemporaryDirectory(prefix='vanished-scratch-') as directory:
-            with mock.patch.object(os, 'fwalk', side_effect=vanished):
-                self.assertEqual(bench_flatten.scratch_usage(pathlib.Path(directory), [])['scratch_inodes'], 0)
+            os.rmdir(directory)
+            self.assertEqual(bench_flatten.scratch_usage(pathlib.Path(directory), [])['scratch_inodes'], 0)
 
     def test_content_fingerprint_records_mtime_without_atime(self):
         with tempfile.TemporaryDirectory(prefix='flatten-time-test-') as directory:

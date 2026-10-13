@@ -19,7 +19,6 @@ import re
 import select
 import signal
 import stat
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,35 +93,85 @@ def process_tree(root, leader_start=None):
     return result
 
 
+def directory_identity(info):
+    return info.st_dev, info.st_ino
+
+
+def open_tree_directory(root_fd, parts, repair=False):
+    # Reopen from the anchored root one component at a time. Pending entries
+    # retain identities, not ancestor FDs or Python recursion frames.
+    current = os.dup(root_fd)
+    try:
+        for name, expected in parts:
+            held = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
+            try:
+                info = os.fstat(held)
+                if directory_identity(info) != expected:
+                    raise FileNotFoundError('scratch directory changed during traversal')
+                if repair and stat.S_IMODE(info.st_mode) != 0o700:
+                    # Writers have joined; chmod this bound owned directory,
+                    # including mode-000 directories, without following entries.
+                    os.chmod(f'/proc/self/fd/{held}', 0o700)
+                child = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=held)
+            finally:
+                os.close(held)
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def task_scan_unchanged(process, identity, tasks):
+    try:
+        fields = (process / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+        if (fields[19], fields[3]) != identity:
+            return False
+        for task, previous in tasks:
+            fields = (task / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+            if fields[0] in ('Z', 'X', 'x') or (fields[19], fields[3]) != (previous[19], previous[3]):
+                return False
+        fields = (process / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+        return (fields[19], fields[3]) == identity
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 def scratch_usage(scratch, processes):
     objects = {}
-    def scan_error(error):
-        # A producer can remove its own directory between enumeration and scan.
-        # Permission and I/O failures are incomplete measurements, not zero use.
-        if not isinstance(error, FileNotFoundError):
-            raise error
-
     try:
         root_fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         root_fd = None
     if root_fd is not None:
         try:
-            # fwalk binds each directory and checks its identity before descent.
-            # Relative no-follow stat never resolves entries through a replaced
-            # pathname. The collector's descriptors close before process scans.
-            for _, directories, files, directory_fd in os.fwalk('.', dir_fd=root_fd,
-                    onerror=scan_error, follow_symlinks=False):
-                for name in ['.', *directories, *files]:
-                    try:
-                        st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                        objects[(st.st_dev, st.st_ino)] = (st.st_blocks * 512, False)
-                    except FileNotFoundError:
-                        pass
+            pending = [()]
+            while pending:
+                parts = pending.pop()
+                try:
+                    directory_fd = open_tree_directory(root_fd, parts)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                try:
+                    info = os.fstat(directory_fd)
+                    objects[directory_identity(info)] = (info.st_blocks * 512, False)
+                    with os.scandir(directory_fd) as entries:
+                        for entry in entries:
+                            try:
+                                info = entry.stat(follow_symlinks=False)
+                            except FileNotFoundError:
+                                continue
+                            key = directory_identity(info)
+                            objects[key] = (info.st_blocks * 512, False)
+                            if stat.S_ISDIR(info.st_mode):
+                                pending.append(parts + ((entry.name, key),))
+                finally:
+                    os.close(directory_fd)
         finally:
             os.close(root_fd)
     deleted = set()
-    def account_reference(reference):
+    def account_reference(reference, found, removed):
         try:
             # Bind the referenced object before classifying its path or stats:
             # the producer may close/reuse an FD or change cwd/root meanwhile.
@@ -139,73 +188,75 @@ def scratch_usage(scratch, processes):
                 if target == root_name + ' (deleted)' and st.st_nlink != 0:
                     return
                 key = st.st_dev, st.st_ino
-                objects[key] = (st.st_blocks * 512, st.st_nlink == 0)
+                found[key] = (st.st_blocks * 512, st.st_nlink == 0)
                 if st.st_nlink == 0:
-                    deleted.add(key)
+                    removed.add(key)
         except (FileNotFoundError, ProcessLookupError):
             pass
 
     # File and filesystem tables can differ between threads. Inspect all live
     # tasks, retaining the common inode key for shared tables and references.
-    process_tasks = []
     for pid, _, identity in processes:
-        tasks = live_task_stats(pathlib.Path('/proc') / str(pid), identity)
-        process_tasks.append(tasks)
-        for task, _ in tasks:
-            for name in ['cwd', 'root']:
-                account_reference(task / name)
-            try:
-                for fd in (task / 'fd').iterdir():
-                    account_reference(fd)
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-    # An mmap can pin an unlinked inode after its last FD closes. Do not
-    # silently accept an incomplete resource sample when that inode is absent.
-    for tasks in process_tasks:
-        mappings = None
-        for task, _ in tasks:
-            try:
-                mappings = (task / 'maps').open(errors='surrogateescape')
-                break
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-        if mappings is None:
-            continue
+        process = pathlib.Path('/proc') / str(pid)
+        tasks = live_task_stats(process, identity)
+        found, removed, failure = {}, set(), None
         try:
-            # The thread group's mappings are shared; one live task suffices.
-            with mappings:
-                for line in mappings:
-                    fields = line.rstrip('\n').split(None, 5)
-                    if len(fields) < 6 or fields[4] == '0':
-                        continue
-                    major, minor = (int(part, 16) for part in fields[3].split(':'))
-                    key = os.makedev(major, minor), int(fields[4])
-                    if key in objects:
-                        continue
-                    # maps quotes newlines as octal; map_files gives the exact
-                    # pathname for the uncommon, not-yet-accounted candidate.
-                    shown = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[5])
-                    if not any(name.startswith(str(scratch) + '/') for name in (fields[5], shown)):
-                        continue
-                    # map_files is exposed by the direct TID proc directory,
-                    # not beneath the thread-group task/TID directory.
-                    reference = pathlib.Path('/proc') / task.name / 'map_files' / fields[0]
-                    try:
-                        target = os.readlink(reference)
-                        # A newly created linked file may have missed the tree
-                        # walk. Only accept a stat of that same mapped inode.
-                        try:
-                            st = os.stat(target)
-                        except FileNotFoundError:
-                            st = None
-                        if st is not None and (st.st_dev, st.st_ino) == key:
-                            objects[key] = (st.st_blocks * 512, False)
-                        else:
-                            raise RuntimeError('unmeasured scratch mapping retained by owned process')
-                    except (FileNotFoundError, ProcessLookupError):
-                        pass  # The mapping/process disappeared during sampling.
-        except (FileNotFoundError, ProcessLookupError):
-            pass
+            for task, _ in tasks:
+                for name in ['cwd', 'root']:
+                    account_reference(task / name, found, removed)
+                try:
+                    for fd in (task / 'fd').iterdir():
+                        account_reference(fd, found, removed)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+            # Mappings are shared by the thread group; one live task suffices.
+            mappings = None
+            for task, _ in tasks:
+                try:
+                    mappings = (task / 'maps').open(errors='surrogateescape')
+                    break
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+            if mappings is not None:
+                try:
+                    with mappings:
+                        for line in mappings:
+                            fields = line.rstrip('\n').split(None, 5)
+                            if len(fields) < 6 or fields[4] == '0':
+                                continue
+                            major, minor = (int(part, 16) for part in fields[3].split(':'))
+                            key = os.makedev(major, minor), int(fields[4])
+                            if key in objects or key in found:
+                                continue
+                            shown = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[5])
+                            if not any(name.startswith(str(scratch) + '/') for name in (fields[5], shown)):
+                                continue
+                            # map_files is exposed by direct TID, not task/TID.
+                            reference = pathlib.Path('/proc') / task.name / 'map_files' / fields[0]
+                            try:
+                                target = os.readlink(reference)
+                                try:
+                                    info = os.stat(target)
+                                except FileNotFoundError:
+                                    info = None
+                                if info is not None and directory_identity(info) == key:
+                                    found[key] = (info.st_blocks * 512, False)
+                                else:
+                                    raise RuntimeError('unmeasured scratch mapping retained by owned process')
+                            except (FileNotFoundError, ProcessLookupError):
+                                pass
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+        except (OSError, RuntimeError) as error:
+            failure = error
+        # Reads above still resolve procfs paths. Only merge their allocations
+        # (or report their errors) if the same group/tasks survived the scan.
+        if not task_scan_unchanged(process, identity, tasks):
+            continue
+        if failure is not None:
+            raise failure
+        objects.update(found)
+        deleted.update(removed)
     return {'scratch_blocks': sum(v[0] for v in objects.values()),
             'scratch_inodes': len(objects), 'deleted_open_files': len(deleted),
             'deleted_open_blocks': sum(objects[k][0] for k in deleted)}
@@ -329,17 +380,52 @@ def tree_contents(tree):
 
 
 def remove_verification_tree(tree):
-    # All writers and metadata checks have finished. Recover directory access
-    # only in this owned tree; symlink targets are never visited.
-    if not stat.S_ISDIR(tree.lstat().st_mode):
+    # All writers and metadata checks have finished. Only this owned tree is
+    # removed; pending traversal state stores identities rather than open FDs.
+    info = tree.lstat()
+    if not stat.S_ISDIR(info.st_mode):
         raise RuntimeError('verification root is not a directory')
-    tree.chmod(0o700)
-    for directory, directories, _ in os.walk(tree):
-        for name in directories:
-            child = pathlib.Path(directory) / name
-            if stat.S_ISDIR(child.lstat().st_mode):
-                os.chmod(child, 0o700, follow_symlinks=False)
-    shutil.rmtree(tree)
+    root_identity = directory_identity(info)
+    held = os.open(tree, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if directory_identity(os.fstat(held)) != root_identity:
+            raise RuntimeError('verification root changed')
+        os.chmod(f'/proc/self/fd/{held}', 0o700)
+        root_fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=held)
+    finally:
+        os.close(held)
+    try:
+        pending = [((), False)]
+        while pending:
+            parts, visited = pending.pop()
+            if visited:
+                if parts:
+                    parent = open_tree_directory(root_fd, parts[:-1], repair=True)
+                    try:
+                        name, expected = parts[-1]
+                        if directory_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != expected:
+                            raise RuntimeError('verification directory changed')
+                        os.rmdir(name, dir_fd=parent)
+                    finally:
+                        os.close(parent)
+                continue
+            directory_fd = open_tree_directory(root_fd, parts, repair=True)
+            try:
+                pending.append((parts, True))
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISDIR(info.st_mode):
+                            pending.append((parts + ((entry.name, directory_identity(info)),), False))
+                        else:
+                            os.unlink(entry.name, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+        if directory_identity(tree.lstat()) != root_identity:
+            raise RuntimeError('verification root changed')
+        os.rmdir(tree)
+    finally:
+        os.close(root_fd)
 
 
 def read_progress_stream(stream, output, events, started, abort):
