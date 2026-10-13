@@ -101,7 +101,7 @@ sys.exit(17)
         with tempfile.TemporaryDirectory(prefix='flatten-fd-test-') as directory:
             scratch = pathlib.Path(directory)
             visible = scratch/'visible'; visible.write_bytes(b'fixture')
-            reference = pathlib.Path('/proc')/str(os.getpid())/'fd/fixture'
+            reference = pathlib.Path('/proc')/str(os.getpid())/'task'/str(os.getpid())/'fd/fixture'
             original_open, original_readlink, original_stat = os.open, os.readlink, os.fstat
             bound = set()
             def open_reference(path, *args, **kwargs):
@@ -117,8 +117,13 @@ sys.exit(17)
             def stat_reference(fd):
                 if fd in bound and operation=='stat':raise error
                 return original_stat(fd)
-            with mock.patch.object(pathlib.Path, 'iterdir', side_effect=error if operation=='enumerate' else None,
-                    return_value=iter([reference])), mock.patch.object(os,'open',new=open_reference), \
+            original_iterdir = pathlib.Path.iterdir
+            def list_references(path):
+                if path == reference.parent:
+                    if operation == 'enumerate':raise error
+                    return iter([reference])
+                return original_iterdir(path)
+            with mock.patch.object(pathlib.Path, 'iterdir', new=list_references), mock.patch.object(os,'open',new=open_reference), \
                     mock.patch.object(os,'readlink',new=read_reference), mock.patch.object(os,'fstat',new=stat_reference):
                 return bench_flatten.scratch_usage(scratch, [(os.getpid(), 0)])
 

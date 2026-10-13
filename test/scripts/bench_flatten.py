@@ -27,19 +27,38 @@ import threading
 import time
 
 
+def live_task_stats(process):
+    # Threads can unshare FD/FS tables, and a zombie leader may still have
+    # live siblings. A denied task inspection is an incomplete observation.
+    tasks = []
+    try:
+        for task in (process / 'task').iterdir():
+            try:
+                fields = (task / 'stat').read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
+                if fields[0] not in ('Z', 'X', 'x'):
+                    tasks.append((task, fields))
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    return tasks
+
+
 def process_tree(root, leader_start=None):
     # Minimal Guest/host kernels need not expose task/TID/children. Build the
     # descendant set from procfs PPIDs instead of silently missing subprocesses.
-    rows, children, owned = {}, {}, set()
+    rows, children, owned, exited = {}, {}, set(), {}
     page_size = os.sysconf('SC_PAGE_SIZE')
     for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
         try:
             fields = path.read_text(encoding='utf-8', errors='surrogateescape').rsplit(') ', 1)[1].split()
             pid, parent = int(path.parent.name), int(fields[1])
-            # Exited rows have no resident memory to measure. Keep their
-            # edges below so an observed descendant is still traversed.
             if fields[0] not in ('Z', 'X', 'x'):
                 rows[pid] = int(fields[21]) * page_size
+            else:
+                # Inspect siblings only for owned groups during traversal.
+                # Keep parent edges even when the entire group has exited.
+                exited[pid] = path.parent
             children.setdefault(parent, []).append(pid)
             if leader_start is not None:
                 if pid == root and fields[19] != leader_start:
@@ -56,6 +75,11 @@ def process_tree(root, leader_start=None):
         seen.add(pid)
         if pid in rows:
             result.append((pid, rows[pid]))
+        elif pid in exited:
+            tasks = live_task_stats(exited[pid])
+            if tasks:
+                # Threads share an address space; count one live task's RSS.
+                result.append((pid, int(tasks[0][1][21]) * page_size))
         pending.extend(children.get(pid, []))
     return result
 
@@ -111,24 +135,35 @@ def scratch_usage(scratch, processes):
         except (FileNotFoundError, ProcessLookupError):
             pass
 
-    # A disappearing process/reference is normal. Denied inspection cannot
-    # establish whether an unlinked scratch object still occupies space.
+    # File and filesystem tables can differ between threads. Inspect all live
+    # tasks, retaining the common inode key for shared tables and references.
+    process_tasks = []
     for pid, _ in processes:
-        process = pathlib.Path('/proc') / str(pid)
-        # cwd and root can retain directory inodes with no open FD or mapping.
-        # The common inode key also deduplicates them against visible paths/FDs.
-        for name in ['cwd', 'root']:
-            account_reference(process / name)
-        try:
-            for fd in (process / 'fd').iterdir():
-                account_reference(fd)
-        except (FileNotFoundError, ProcessLookupError):
-            pass
+        tasks = live_task_stats(pathlib.Path('/proc') / str(pid))
+        process_tasks.append(tasks)
+        for task, _ in tasks:
+            for name in ['cwd', 'root']:
+                account_reference(task / name)
+            try:
+                for fd in (task / 'fd').iterdir():
+                    account_reference(fd)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
     # An mmap can pin an unlinked inode after its last FD closes. Do not
     # silently accept an incomplete resource sample when that inode is absent.
-    for pid, _ in processes:
+    for tasks in process_tasks:
+        mappings = None
+        for task, _ in tasks:
+            try:
+                mappings = (task / 'maps').open(errors='surrogateescape')
+                break
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        if mappings is None:
+            continue
         try:
-            with (pathlib.Path('/proc') / str(pid) / 'maps').open(errors='surrogateescape') as mappings:
+            # The thread group's mappings are shared; one live task suffices.
+            with mappings:
                 for line in mappings:
                     fields = line.rstrip('\n').split(None, 5)
                     if len(fields) < 6 or fields[4] == '0':
@@ -142,7 +177,9 @@ def scratch_usage(scratch, processes):
                     shown = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[5])
                     if not any(name.startswith(str(scratch) + '/') for name in (fields[5], shown)):
                         continue
-                    reference = pathlib.Path('/proc') / str(pid) / 'map_files' / fields[0]
+                    # map_files is exposed by the direct TID proc directory,
+                    # not beneath the thread-group task/TID directory.
+                    reference = pathlib.Path('/proc') / task.name / 'map_files' / fields[0]
                     try:
                         target = os.readlink(reference)
                         # A newly created linked file may have missed the tree
@@ -209,7 +246,7 @@ def stop_owned_group(producer, leader_start):
                                 continue
                         except ChildProcessError:
                             pass
-                    if fields[0] != 'Z':
+                    if fields[0] not in ('Z', 'X', 'x') or live_task_stats(path.parent):
                         groups.add(group)
             except (FileNotFoundError, ProcessLookupError):
                 pass
@@ -219,7 +256,7 @@ def stop_owned_group(producer, leader_start):
         deadline = time.monotonic() + seconds
         while True:
             groups = active_groups()
-            if not groups:
+            if not groups and producer.poll() is not None:
                 producer.wait()
                 if not active_groups():
                     return

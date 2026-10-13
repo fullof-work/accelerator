@@ -7,6 +7,8 @@ import json
 import os
 import pathlib
 import select
+import signal
+import time
 import subprocess
 import sys
 import tempfile
@@ -79,7 +81,7 @@ class MappingAndLinkMeasurements(unittest.TestCase):
     def test_maps_permission_error_fails_but_disappearance_is_tolerated(self):
         with tempfile.TemporaryDirectory(prefix='mapped-scratch-') as directory:
             root = pathlib.Path(directory)
-            target = pathlib.Path('/proc')/str(os.getpid())/'maps'
+            target = pathlib.Path('/proc')/str(os.getpid())/'task'/str(os.getpid())/'maps'
             original = pathlib.Path.open
             for error in [PermissionError, FileNotFoundError, ProcessLookupError]:
                 def open_path(path, *args, **kwargs):
@@ -279,7 +281,7 @@ class ProcessDirectoryReferences(unittest.TestCase):
             scratch = pathlib.Path(directory)
             original_open = os.open
             for name in ['cwd', 'root']:
-                target = pathlib.Path('/proc')/str(os.getpid())/name
+                target = pathlib.Path('/proc')/str(os.getpid())/'task'/str(os.getpid())/name
                 for error in [PermissionError, FileNotFoundError, ProcessLookupError]:
                     def open_reference(path, *args, **kwargs):
                         if path==target:raise error('directory reference inspection')
@@ -386,3 +388,79 @@ class BoundMeasurementReferences(unittest.TestCase):
                 self.assertEqual(len(os.listdir('/proc/self/fd')), before, 'proc scan leaked descriptors')
             finally:
                 os.close(source_fd); os.close(other_fd)
+
+
+class ThreadGroupMeasurements(unittest.TestCase):
+    @contextlib.contextmanager
+    def worker(self, mode, scratch):
+        code = """import ctypes,os,pathlib,sys,threading,time
+libc=ctypes.CDLL(None,use_errno=True)
+mode=sys.argv[1];scratch=pathlib.Path(sys.argv[2]);ready=threading.Event()
+def work():
+ if mode=='files' and libc.unshare(0x400):
+  print('UNSHARE',ctypes.get_errno(),flush=True);os._exit(3)
+ path=scratch/'held';path.write_bytes(b'x'*8192);fd=os.open(path,os.O_RDONLY);os.dup(fd);path.unlink()
+ print('READY',os.fstat(fd).st_blocks*512,flush=True);ready.set()
+ while True:time.sleep(1)
+threading.Thread(target=work).start();ready.wait()
+if mode=='zombie':libc.pthread_exit(None)
+while True:time.sleep(1)
+"""
+        process = subprocess.Popen([sys.executable, '-B', '-c', code, mode, str(scratch)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, text=True)
+        wait = process.wait
+        try:
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'worker did not become ready')
+            ready = process.stdout.readline().strip()
+            if ready.startswith('UNSHARE '):
+                self.skipTest('CLONE_FILES fixture unavailable: errno '+ready.split()[1])
+            self.assertTrue(ready.startswith('READY '), ready)
+            path = pathlib.Path('/proc')/str(process.pid)/'stat'
+            fields = path.read_text().rsplit(') ',1)[1].split()
+            if mode == 'zombie':
+                deadline = time.monotonic()+5
+                while fields[0] != 'Z' and time.monotonic() < deadline:
+                    time.sleep(.01);fields = path.read_text().rsplit(') ',1)[1].split()
+                self.assertEqual(fields[0], 'Z', 'main thread did not exit')
+            # Bound a regressed unbounded wait in the test, then always kill
+            # and join this fixture's own session in the finally block.
+            process.wait = lambda timeout=None: wait(timeout=1 if timeout is None else timeout)
+            yield process, fields[19], int(ready.split()[1])
+        finally:
+            if process.poll() is None:os.killpg(process.pid, signal.SIGKILL)
+            wait(timeout=5);process.stdout.close();process.stderr.close()
+
+    def test_private_worker_file_table_is_counted_once(self):
+        with tempfile.TemporaryDirectory(prefix='thread-fds-') as directory:
+            root = pathlib.Path(directory)
+            with self.worker('files', root) as (process, start, blocks):
+                sample = bench_flatten.scratch_usage(root, bench_flatten.process_tree(process.pid, start))
+                self.assertEqual(sample['deleted_open_files'], 1)
+                self.assertEqual(sample['deleted_open_blocks'], blocks)
+                self.assertEqual(sample['scratch_blocks'], root.stat().st_blocks*512+blocks)
+
+    def test_zombie_leader_keeps_live_worker_observed_and_stoppable(self):
+        with tempfile.TemporaryDirectory(prefix='thread-leader-') as directory:
+            root = pathlib.Path(directory)
+            with self.worker('zombie', root) as (process, start, blocks):
+                observed = bench_flatten.process_tree(process.pid, start)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(observed[0][0], process.pid)
+                self.assertGreater(observed[0][1], 0)
+                sample = bench_flatten.scratch_usage(root, observed)
+                self.assertEqual(sample['deleted_open_files'], 1)
+                self.assertEqual(sample['deleted_open_blocks'], blocks)
+                bench_flatten.stop_owned_group(process, start)
+                self.assertIsNotNone(process.poll())
+
+    def test_denied_task_enumeration_invalidates_sample(self):
+        with tempfile.TemporaryDirectory(prefix='thread-inspection-') as directory:
+            root = pathlib.Path(directory)
+            target = pathlib.Path('/proc')/str(os.getpid())/'task'
+            original = pathlib.Path.iterdir
+            def tasks(path):
+                if path == target:raise PermissionError('owned tasks denied')
+                return original(path)
+            with mock.patch.object(pathlib.Path, 'iterdir', new=tasks):
+                with self.assertRaisesRegex(PermissionError, 'owned tasks denied'):
+                    bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
