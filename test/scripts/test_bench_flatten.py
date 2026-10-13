@@ -100,31 +100,36 @@ sys.exit(17)
     def process_file_scan_error(self, operation, error):
         with tempfile.TemporaryDirectory(prefix='flatten-fd-test-') as directory:
             scratch = pathlib.Path(directory)
-            fd = pathlib.Path('/proc')/str(os.getpid())/'fd/fixture'
-            with contextlib.ExitStack() as patches:
-                patches.enter_context(mock.patch.object(pathlib.Path, 'iterdir',
-                    side_effect=error if operation == 'enumerate' else None,
-                    return_value=iter([fd])))
-                patches.enter_context(mock.patch.object(os, 'readlink',
-                    side_effect=error if operation == 'readlink' else None,
-                    return_value=str(scratch/'unlinked')))
-                if operation == 'stat':
-                    original_stat = pathlib.Path.stat
-                    def stat_path(path, *args, **kwargs):
-                        if path == fd:
-                            raise error
-                        return original_stat(path, *args, **kwargs)
-                    patches.enter_context(mock.patch.object(pathlib.Path, 'stat', new=stat_path))
+            visible = scratch/'visible'; visible.write_bytes(b'fixture')
+            reference = pathlib.Path('/proc')/str(os.getpid())/'fd/fixture'
+            original_open, original_readlink, original_stat = os.open, os.readlink, os.fstat
+            bound = set()
+            def open_reference(path, *args, **kwargs):
+                if path==reference:
+                    if operation=='open':raise error
+                    fd=original_open(visible, os.O_PATH | os.O_CLOEXEC)
+                    bound.add(fd)
+                    return fd
+                return original_open(path, *args, **kwargs)
+            def read_reference(path, *args, **kwargs):
+                if str(path) in {f'/proc/self/fd/{fd}' for fd in bound} and operation=='readlink':raise error
+                return original_readlink(path, *args, **kwargs)
+            def stat_reference(fd):
+                if fd in bound and operation=='stat':raise error
+                return original_stat(fd)
+            with mock.patch.object(pathlib.Path, 'iterdir', side_effect=error if operation=='enumerate' else None,
+                    return_value=iter([reference])), mock.patch.object(os,'open',new=open_reference), \
+                    mock.patch.object(os,'readlink',new=read_reference), mock.patch.object(os,'fstat',new=stat_reference):
                 return bench_flatten.scratch_usage(scratch, [(os.getpid(), 0)])
 
     def test_process_file_inspection_permission_errors_fail(self):
-        for operation in ['enumerate', 'readlink', 'stat']:
+        for operation in ['enumerate', 'open', 'readlink', 'stat']:
             with self.subTest(operation=operation):
                 with self.assertRaisesRegex(PermissionError, 'inspection denied'):
                     self.process_file_scan_error(operation, PermissionError('inspection denied'))
 
     def test_disappearing_process_files_are_tolerated(self):
-        for operation in ['enumerate', 'readlink', 'stat']:
+        for operation in ['enumerate', 'open', 'readlink', 'stat']:
             for error in [FileNotFoundError, ProcessLookupError]:
                 with self.subTest(operation=operation, error=error):
                     sample = self.process_file_scan_error(operation, error('process or FD vanished'))
@@ -397,8 +402,9 @@ print('fixture')
         def vanished(*args, onerror, **kwargs):
             onerror(FileNotFoundError('producer removed its owned directory'))
             return iter(())
-        with mock.patch.object(os, 'walk', side_effect=vanished):
-            self.assertEqual(bench_flatten.scratch_usage(pathlib.Path('/unused'), [])['scratch_inodes'], 0)
+        with tempfile.TemporaryDirectory(prefix='vanished-scratch-') as directory:
+            with mock.patch.object(os, 'fwalk', side_effect=vanished):
+                self.assertEqual(bench_flatten.scratch_usage(pathlib.Path(directory), [])['scratch_inodes'], 0)
 
     def test_content_fingerprint_records_mtime_without_atime(self):
         with tempfile.TemporaryDirectory(prefix='flatten-time-test-') as directory:

@@ -68,22 +68,38 @@ def scratch_usage(scratch, processes):
         if not isinstance(error, FileNotFoundError):
             raise error
 
-    for directory, directories, files in os.walk(scratch, onerror=scan_error):
-        # os.walk lists symlinked directories but does not descend into them.
-        links = [name for name in directories if (pathlib.Path(directory) / name).is_symlink()]
-        for name in ['.', *files, *links]:
-            try:
-                st = (pathlib.Path(directory) / name).lstat()
-                objects[(st.st_dev, st.st_ino)] = (st.st_blocks * 512, False)
-            except FileNotFoundError:
-                pass
+    try:
+        root_fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        root_fd = None
+    if root_fd is not None:
+        try:
+            # fwalk binds each directory and checks its identity before descent.
+            # Relative no-follow stat never resolves entries through a replaced
+            # pathname. The collector's descriptors close before process scans.
+            for _, directories, files, directory_fd in os.fwalk('.', dir_fd=root_fd,
+                    onerror=scan_error, follow_symlinks=False):
+                for name in ['.', *directories, *files]:
+                    try:
+                        st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        objects[(st.st_dev, st.st_ino)] = (st.st_blocks * 512, False)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            os.close(root_fd)
     deleted = set()
     def account_reference(reference):
         try:
-            target = os.readlink(reference)
+            # Bind the referenced object before classifying its path or stats:
+            # the producer may close/reuse an FD or change cwd/root meanwhile.
+            bound = os.open(reference, os.O_PATH | os.O_CLOEXEC)
+            try:
+                target = os.readlink(f'/proc/self/fd/{bound}')
+                st = os.fstat(bound)
+            finally:
+                os.close(bound)
             root_name = str(scratch)
             if target.startswith(root_name + '/') or target in (root_name, root_name + ' (deleted)'):
-                st = reference.stat()
                 # A retained, removed root has no trailing slash. Do not
                 # confuse a live sibling with a literal suffix.
                 if target == root_name + ' (deleted)' and st.st_nlink != 0:

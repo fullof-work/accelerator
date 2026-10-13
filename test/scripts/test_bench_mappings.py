@@ -72,7 +72,7 @@ class MappingAndLinkMeasurements(unittest.TestCase):
             with mapped_file(root/'literal (deleted)') as (file, _):
                 blocks = os.fstat(file.fileno()).st_blocks * 512
                 file.close()
-                with mock.patch.object(bench_flatten.os, 'walk', return_value=[]):
+                with mock.patch.object(bench_flatten.os, 'fwalk', return_value=[]):
                     sample = bench_flatten.scratch_usage(root, [(os.getpid(), 0)])
                 self.assertEqual(sample['scratch_blocks'], blocks)
 
@@ -277,26 +277,19 @@ class ProcessDirectoryReferences(unittest.TestCase):
     def test_directory_reference_errors(self):
         with tempfile.TemporaryDirectory(prefix='directory-reference-errors-') as directory:
             scratch = pathlib.Path(directory)
-            readlink = os.readlink
-            path_stat = pathlib.Path.stat
+            original_open = os.open
             for name in ['cwd', 'root']:
                 target = pathlib.Path('/proc')/str(os.getpid())/name
-                for operation in ['readlink', 'stat']:
-                    for error in [PermissionError, FileNotFoundError, ProcessLookupError]:
-                        def read_reference(path, *args, **kwargs):
-                            if path==target:
-                                if operation=='readlink':raise error('directory reference inspection')
-                                return str(scratch/'held')
-                            return readlink(path, *args, **kwargs)
-                        def stat_reference(path, *args, **kwargs):
-                            if path==target:raise error('directory reference inspection')
-                            return path_stat(path, *args, **kwargs)
-                        with self.subTest(name=name,operation=operation,error=error), mock.patch.object(os,'readlink',new=read_reference), mock.patch.object(pathlib.Path,'stat',new=stat_reference):
-                            if error is PermissionError:
-                                with self.assertRaisesRegex(PermissionError,'directory reference inspection'):
-                                    bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
-                            else:
-                                self.assertEqual(bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])['scratch_inodes'], 1)
+                for error in [PermissionError, FileNotFoundError, ProcessLookupError]:
+                    def open_reference(path, *args, **kwargs):
+                        if path==target:raise error('directory reference inspection')
+                        return original_open(path, *args, **kwargs)
+                    with self.subTest(name=name,error=error), mock.patch.object(os,'open',new=open_reference):
+                        if error is PermissionError:
+                            with self.assertRaisesRegex(PermissionError,'directory reference inspection'):
+                                bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
+                        else:
+                            self.assertEqual(bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])['scratch_inodes'], 1)
 
 
 class ProcessNameEncoding(unittest.TestCase):
@@ -339,3 +332,57 @@ class ProcessNameEncoding(unittest.TestCase):
             bench_flatten.stop_owned_group(owned, started)
             self.assertIsNotNone(owned.poll())
             self.assertIsNone(unrelated.poll(), 'unrelated session was terminated')
+
+
+class BoundMeasurementReferences(unittest.TestCase):
+    def test_directory_swap_does_not_scan_symlink_target(self):
+        with tempfile.TemporaryDirectory(prefix='bound-scratch-walk-') as directory:
+            parent = pathlib.Path(directory)
+            scratch = parent/'scratch'; scratch.mkdir()
+            child = scratch/'changing'; child.mkdir()
+            outside = parent/'outside'; outside.mkdir()
+            payload = outside/'payload'; payload.write_bytes(b'x'*(1<<20))
+            foreign_blocks = payload.stat().st_blocks*512
+            original_scandir = os.scandir
+            swapped = False
+            def scandir(path):
+                nonlocal swapped
+                named = os.readlink(f'/proc/self/fd/{path}') if isinstance(path, int) else str(path)
+                if named==str(child) and not swapped:
+                    child.rmdir(); child.symlink_to(outside, target_is_directory=True); swapped=True
+                return original_scandir(path)
+            before = len(os.listdir('/proc/self/fd'))
+            with mock.patch.object(os, 'scandir', new=scandir):
+                sample = bench_flatten.scratch_usage(scratch, [])
+            self.assertTrue(swapped)
+            self.assertLess(sample['scratch_blocks'], foreign_blocks, 'followed replacement symlink outside scratch')
+            self.assertEqual(len(os.listdir('/proc/self/fd')), before, 'directory scan leaked descriptors')
+            self.assertEqual(payload.read_bytes(), b'x'*(1<<20))
+
+    def test_fd_reuse_keeps_path_and_stat_on_the_bound_object(self):
+        with tempfile.TemporaryDirectory(prefix='bound-proc-reference-') as directory:
+            parent = pathlib.Path(directory)
+            scratch = parent/'scratch'; scratch.mkdir()
+            held = scratch/'held'; held.write_bytes(b'h'*8192)
+            outside = parent/'outside'; outside.write_bytes(b'x'*(1<<20))
+            source_fd, other_fd = os.open(held, os.O_RDONLY), os.open(outside, os.O_RDONLY)
+            retained = os.fstat(source_fd); held.unlink()
+            original_readlink = os.readlink
+            swapped = False
+            def readlink(path, *args, **kwargs):
+                nonlocal swapped
+                target = original_readlink(path, *args, **kwargs)
+                if target==str(held)+' (deleted)' and not swapped:
+                    os.dup2(other_fd, source_fd); swapped=True
+                return target
+            before = len(os.listdir('/proc/self/fd'))
+            try:
+                with mock.patch.object(os, 'readlink', new=readlink):
+                    sample = bench_flatten.scratch_usage(scratch, [(os.getpid(),0)])
+                self.assertTrue(swapped)
+                self.assertEqual(sample['scratch_blocks'], (scratch.stat().st_blocks+retained.st_blocks)*512)
+                self.assertEqual(sample['deleted_open_blocks'], retained.st_blocks*512)
+                self.assertEqual(sample['deleted_open_files'], 1)
+                self.assertEqual(len(os.listdir('/proc/self/fd')), before, 'proc scan leaked descriptors')
+            finally:
+                os.close(source_fd); os.close(other_fd)
