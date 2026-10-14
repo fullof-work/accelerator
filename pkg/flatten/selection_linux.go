@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -108,11 +109,13 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 	}
 	h.Write([]byte(rel))
 	h.Write([]byte{0})
-	for _, n := range []uint64{id.dev, id.ino, id.size, id.nlink, uint64(id.mtime), uint64(id.ctime), uint64(id.mtimeNS), uint64(id.ctimeNS), uint64(id.mode), uint64(id.uid), uint64(id.gid), uint64(st.Rdev)} {
-		var b [8]byte
-		binary.LittleEndian.PutUint64(b[:], n)
-		h.Write(b[:])
+	// Serialize the same identity once, avoiding twelve tiny hash writes and
+	// escaping buffers per inode on wide source trees.
+	var encoded [12 * 8]byte
+	for i, n := range [...]uint64{id.dev, id.ino, id.size, id.nlink, uint64(id.mtime), uint64(id.ctime), uint64(id.mtimeNS), uint64(id.ctimeNS), uint64(id.mode), uint64(id.uid), uint64(id.gid), uint64(st.Rdev)} {
+		binary.LittleEndian.PutUint64(encoded[i*8:], n)
 	}
+	h.Write(encoded[:])
 	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
 		target, err := os.Readlink(name)
 		if err != nil {
@@ -170,10 +173,10 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 }
 
 func selectSource(ctx context.Context, root string, excludes []string, budget uint64) (*sourceSelection, error) {
-	return selectSourceWithOwned(ctx, root, excludes, nil, budget)
+	return selectSourceWithOwned(ctx, root, excludes, nil, nil, budget)
 }
 
-func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPaths []string, budget uint64) (*sourceSelection, error) {
+func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPaths []string, outputFiles []*os.File, budget uint64) (*sourceSelection, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -227,6 +230,23 @@ func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPath
 			s.excludes = dedupeSorted(append(s.excludes, rel))
 		}
 		s.owned = append(s.owned, owned)
+	}
+	for _, file := range outputFiles {
+		if file == nil {
+			return nil, fmt.Errorf("flatten: nil output file")
+		}
+		// File.Stat retains the borrowed file's poller and deadline behavior.
+		info, err := file.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("flatten: stat output file: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return nil, fmt.Errorf("flatten: output file has no filesystem identity")
+			}
+			s.owned = append(s.owned, ownedPath{dev: uint64(st.Dev), ino: st.Ino})
+		}
 	}
 	s.stamp, err = s.snapshot(ctx)
 	// The discovered aliases become part of the fixed native/read/validate

@@ -5,22 +5,22 @@ package flatten
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"syscall"
 )
 
 // Build writes an explicit raw EROFS image with the runtime-config ZIP. It
 // retains Source's reopenable, uncompressed LayerOpener contract; compressed
 // descriptor verification remains the responsibility of that Source. Every
 // complete uncompressed stream is verified against the fixed config's DiffID.
-// The destination is replaced only after preparation, output and cleanup succeed.
+// The destination is replaced only after preparation, output and source cleanup
+// succeed. Post-commit staging cleanup is reported through Options.CleanupWarning.
 func Build(src Source, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		return prepareSource(context.Background(), src, opts)
 	})
 }
@@ -94,7 +94,7 @@ func Flatten(input io.Reader, outputPath string) error {
 }
 
 func FlattenWith(input io.Reader, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		return prepareArchive(context.Background(), input, opts, nil)
 	})
 }
@@ -104,7 +104,7 @@ func FlattenFile(inputPath, outputPath string) error {
 }
 
 func FlattenFileWith(inputPath, outputPath string, opts Options) error {
-	return writeRawFile(context.Background(), outputPath, func(_ string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(_ string) (*PreparedImage, error) {
 		f, err := os.Open(inputPath)
 		if err != nil {
 			return nil, err
@@ -117,82 +117,59 @@ func FlattenFileWith(inputPath, outputPath string, opts Options) error {
 // It excludes its scratch, pending output and destination before planning. The
 // source remains owned by the caller and must stay stable until this returns.
 func BuildFromDir(root, outputPath string, opts Options, dopts DirOptions) error {
-	return writeRawFile(context.Background(), outputPath, func(pending string) (*PreparedImage, error) {
+	return writeRawFile(context.Background(), outputPath, opts.CleanupWarning, func(pending string) (*PreparedImage, error) {
 		dopts.OutputPaths = append(append([]string(nil), dopts.OutputPaths...), outputPath, pending)
 		return PrepareDir(context.Background(), root, opts, dopts)
 	})
 }
 
-func writeRawFile(ctx context.Context, output string, prepare func(string) (*PreparedImage, error)) (retErr error) {
-	f, err := createPendingOutput(output, ".flatten-output-")
+func writeRawFile(ctx context.Context, output string, warn func(error), prepare func(string) (*PreparedImage, error)) (retErr error) {
+	pending, err := reserveRawOutput(output)
 	if err != nil {
 		return err
 	}
-	pending := f.Name()
-	defer func() {
-		if f != nil {
-			retErr = errors.Join(retErr, f.Close())
+	committed := false
+	defer func() { retErr = errors.Join(retErr, finishRawOutput(pending, committed, warn)) }()
+	// Exclude the complete private staging directory before planning.
+	p, err := prepare(pending.path)
+	if err != nil {
+		return err
+	}
+	err = p.WriteRaw(ctx, pending.file)
+	// Close input resources and the output before commit. Every pre-commit failure
+	// preserves the previous destination; no additional fsync is introduced.
+	err = errors.Join(err, pending.closeFile(), p.Close())
+	if err != nil {
+		return err
+	}
+	err = pending.commit()
+	committed = err == nil
+	return err
+}
+
+func finishRawOutput(pending *pendingRawOutput, committed bool, warn func(error)) error {
+	err := pending.Close()
+	if err != nil && committed {
+		if warn != nil {
+			warn(fmt.Errorf("raw output committed; staging cleanup: %w", err))
 		}
-		if err := os.Remove(pending); err != nil && !errors.Is(err, os.ErrNotExist) {
-			retErr = errors.Join(retErr, err)
-		}
-	}()
-	p, err := prepare(pending)
-	if err != nil {
-		return err
+		return nil
 	}
-	err = p.WriteRaw(ctx, f)
-	// Close input resources and the destination before committing; any late
-	// error leaves the previous destination untouched. No extra fsync is needed.
-	err = errors.Join(err, f.Close(), p.Close())
-	f = nil
-	if err != nil {
-		return err
-	}
-	if _, _, err = outputPermissions(output); err != nil {
-		return err
-	}
-	return os.Rename(pending, output)
+	return err
 }
 
 // outputPermissions accepts only ordinary destination files. Atomic replacement
 // must not unlink a device, directory or symlink. Check again at commit time.
-func outputPermissions(output string) (os.FileMode, bool, error) {
+func outputPermissions(output string) (os.FileMode, *syscall.Stat_t, error) {
 	st, err := os.Lstat(output)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0666, false, nil
+		return 0666, nil, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, nil, err
 	}
 	if !st.Mode().IsRegular() {
-		return 0, false, fmt.Errorf("destination is not a regular file: %s", output)
+		return 0, nil, fmt.Errorf("destination is not a regular file: %s", output)
 	}
-	return st.Mode().Perm(), true, nil
-}
-
-func createPendingOutput(output, prefix string) (*os.File, error) {
-	mode, exists, err := outputPermissions(output)
-	if err != nil {
-		return nil, err
-	}
-	for range 10 {
-		name := filepath.Join(filepath.Dir(output), prefix+rand.Text())
-		// A new output keeps normal 0666 & umask semantics. Existing output
-		// permissions are restored explicitly, unaffected by this process's umask.
-		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
-		if errors.Is(err, os.ErrExist) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if exists {
-			if err = f.Chmod(mode); err != nil {
-				return nil, errors.Join(err, f.Close(), os.Remove(name))
-			}
-		}
-		return f, nil
-	}
-	return nil, fmt.Errorf("reserve pending output: %w", os.ErrExist)
+	return st.Mode().Perm(), st.Sys().(*syscall.Stat_t), nil
 }

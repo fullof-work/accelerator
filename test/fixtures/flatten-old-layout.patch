@@ -1,0 +1,117 @@
+diff --git a/pkg/flatten/prepared_linux.go b/pkg/flatten/prepared_linux.go
+index d917be5..93d5f46 100644
+--- a/pkg/flatten/prepared_linux.go
++++ b/pkg/flatten/prepared_linux.go
+@@ -35,6 +35,8 @@ type PreparedImage struct {
+ 	closeErr     error
+ 	work         string
+ 	plan         *erofsPlan
++	controlRaw   *os.File
++	controlRawID fileIdentity
+ 	source       sparse.Source
+ 	selection    *sourceSelection
+ 	writerMemory uint64
+@@ -190,26 +192,50 @@ func prepareSelected(ctx context.Context, work string, selection *sourceSelectio
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	layout, name := filepath.Join(work, "layout"), filepath.Join(work, "plan")
++	// Benchmark control only: retain the same verified umoci input and final
++	// selection checks, but materialize the old mkfs blob/raw layout.
++	raw := filepath.Join(work, "control.raw")
+ 	if opts.Progress != nil {
+ 		opts.Progress("build-erofs", 0, 0)
+ 	}
+-	if err = buildPlan(ctx, mkfs, selection, layout, name, limits); err != nil {
+-		return nil, err
++	args := []string{"-Ededupe", "--chunksize=4096", "-T0", "-b4096", "-x-1", "-U", "00000000-0000-0000-0000-000000000000", "--quiet", "--ignore-mtime"}
++	for _, exclude := range selection.excludes {
++		args = append(args, "--exclude-path="+exclude)
++	}
++	args = append(args, raw, selection.root)
++	cmd := exec.CommandContext(ctx, mkfs, args...)
++	for _, env := range os.Environ() {
++		if !strings.HasPrefix(env, "TMPDIR=") && !strings.HasPrefix(env, "SOURCE_DATE_EPOCH=") {
++			cmd.Env = append(cmd.Env, env)
++		}
+ 	}
+-	// CommandContext.Run waits for the child to exit, releasing all native
+-	// tables. No data emission can overlap native planning or layer application.
+-	readerLimits := limits
+-	readerLimits.IndexMemoryBytes /= 2
+-	p, err := openPlan(ctx, selection.root, layout, name, readerLimits)
++	cmd.Env = append(cmd.Env, "TMPDIR="+work)
++	var diagnostic boundedDiagnostic
++	cmd.Stdout, cmd.Stderr = io.Discard, &diagnostic
++	if err = cmd.Run(); err != nil {
++		return nil, fmt.Errorf("flatten control: old mkfs: %w: %s", errors.Join(err, ctx.Err()), diagnostic.String())
++	}
++	f, err := os.Open(raw)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	defer func() {
+ 		if retErr != nil {
+-			retErr = errors.Join(retErr, p.Close())
++			retErr = errors.Join(retErr, f.Close())
+ 		}
+ 	}()
++	identity, err := fileID(f)
++	if err != nil {
++		return nil, err
++	}
++	holes, err := sparse.ProbeHoles(f)
++	if err != nil {
++		return nil, err
++	}
++	payload, err := sparse.NewSource(f, identity.size, holes)
++	if err != nil {
++		return nil, err
++	}
+ 	if err = selection.validate(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -228,11 +254,11 @@ func prepareSelected(ctx context.Context, work string, selection *sourceSelectio
+ 		return nil, fmt.Errorf("flatten: runtime config exceeds index budget")
+ 	}
+ 	writerMemory -= uint64(len(tail)) * 2
+-	src, err := tailzip.Append(p, tail, tailzip.Options{})
++	src, err := tailzip.Append(payload, tail, tailzip.Options{})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &PreparedImage{work: work, plan: p, source: src, selection: selection, writerMemory: writerMemory}, nil
++	return &PreparedImage{work: work, controlRaw: f, controlRawID: identity, source: src, selection: selection, writerMemory: writerMemory}, nil
+ }
+ 
+ type boundedDiagnostic struct{ bytes.Buffer }
+@@ -282,6 +308,16 @@ func (p *PreparedImage) begin(ctx context.Context) (context.Context, func(), err
+ }
+ 
+ func (p *PreparedImage) validate(ctx context.Context) error {
++	if p.controlRaw != nil {
++		id, err := fileID(p.controlRaw)
++		if err != nil {
++			return err
++		}
++		if id != p.controlRawID {
++			return fmt.Errorf("flatten control: raw source changed")
++		}
++		return p.selection.validate(ctx)
++	}
+ 	if p.plan.current != nil {
+ 		err := p.plan.current.Close()
+ 		p.plan.current, p.plan.currentID, p.plan.dataValid = nil, 0, 0
+@@ -358,7 +394,11 @@ func (p *PreparedImage) Close() error {
+ 		p.mu.Unlock()
+ 		p.writeMu.Lock()
+ 		defer p.writeMu.Unlock()
+-		p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
++		if p.controlRaw != nil {
++			p.closeErr = errors.Join(p.controlRaw.Close(), removeOwnedWork(p.work))
++		} else {
++			p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
++		}
+ 	})
+ 	return p.closeErr
+ }

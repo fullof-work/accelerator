@@ -14,6 +14,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -376,5 +379,37 @@ func TestSelectionIgnoresAtimeAndExcludedChildren(t *testing.T) {
 	}
 	if err = s.validate(context.Background()); err == nil {
 		t.Fatal("included mode mutation ignored")
+	}
+}
+
+func TestPlannedSourceReplacedByFIFOIsRejectedWithoutBlocking(t *testing.T) {
+	p, root, _, _ := makePlanFixture(t, false)
+	rec, err := p.record(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Join(root, p.files[rec.source-1].name)
+	if err = os.Remove(name); err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.Mkfifo(name, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := p.chunk(context.Background(), rec); done <- err }()
+	select {
+	case err = <-done:
+		if err == nil {
+			t.Fatal("replaced FIFO accepted")
+		}
+	case <-time.After(time.Second):
+		// Release a regressed blocking FIFO opener before test-owned cleanup.
+		fd, openErr := unix.Open(name, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		unix.Close(fd)
+		<-done
+		t.Fatal("planned source open blocked on a replaced FIFO")
 	}
 }

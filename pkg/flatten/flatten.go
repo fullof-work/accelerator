@@ -39,6 +39,13 @@ type Options struct {
 	//   - "apply-layers": 1-based layer index in done, layer count in total.
 	//   - "build-erofs" / "append-config": done=total=0.
 	Progress func(stage string, done, total int)
+
+	// CleanupWarning, if non-nil, reports failure to remove an empty staging
+	// directory after an explicit raw file API has committed its destination.
+	// It runs synchronously before return. The committed output remains valid;
+	// this diagnostic does not turn success into an error. Nil stays silent.
+	// Failures before rename, including source cleanup, remain return errors.
+	CleanupWarning func(error)
 }
 
 // LayerOpener opens one layer's *uncompressed* tar stream. The caller
