@@ -68,10 +68,11 @@ func reserveRawOutput(output string) (_ *pendingRawOutput, retErr error) {
 		if err := unix.Fstatat(fd, name, &created, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return nil, err
 		}
+		// Retain the identity even when private-directory validation rejects it.
+		p.createdDir = &created
 		if created.Mode&unix.S_IFMT != unix.S_IFDIR || created.Uid != uint32(os.Geteuid()) || created.Mode&0077 != 0 {
 			return nil, errors.New("output staging directory is not private")
 		}
-		p.createdDir = &created
 		break
 	}
 	if p.name == "" {
