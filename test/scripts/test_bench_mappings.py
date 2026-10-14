@@ -1,5 +1,6 @@
 """Actual mapping and non-regular hard-link measurement regressions."""
 import contextlib
+import errno
 import ctypes
 import hashlib
 import io
@@ -655,14 +656,14 @@ class MeasurementScanLifetime(unittest.TestCase):
                     self.assertTrue(changed)
                     self.assertEqual(sample['deleted_open_files'],0)
 
-    def check_depth(self, operation):
+    def check_depth(self, operation, limited=False):
         code=r"""
-import os,pathlib,resource,sys,tempfile
+import errno,os,pathlib,resource,sys,tempfile
 sys.path.insert(0,sys.argv[1]);import bench_flatten as b
-depth=int(sys.argv[2]);operation=sys.argv[3];limit=int(sys.argv[4])
-# Exercise traversal beyond Python's recursion budget without a slow,
-# quadratic 1,050-component descriptor-reopening fixture in overlayfs CI.
-sys.setrecursionlimit(128)
+operation=sys.argv[2];limited=sys.argv[3]=='limited'
+# This is a small traversal fixture, not a supported-depth or constant-FD promise.
+sys.setrecursionlimit(64)
+depth=96
 root=pathlib.Path(tempfile.mkdtemp(prefix='scan-depth-'));tree=root/'tree';tree.mkdir();nodes=[tree]
 old=resource.getrlimit(resource.RLIMIT_NOFILE)
 try:
@@ -670,15 +671,21 @@ try:
   path=nodes[-1]/'d';path.mkdir();nodes.append(path)
  outside=root/'outside';outside.write_text('unchanged')
  (nodes[-1]/'external').symlink_to(outside)
- if limit:resource.setrlimit(resource.RLIMIT_NOFILE,(limit,old[1]))
- descriptors=len(os.listdir('/proc/self/fd'))
- if operation=='contents':
-  result=b.tree_contents(tree);assert len(result)==depth+2,result
- elif operation=='scan':
-  result=b.scratch_usage(tree,[]);assert result['scratch_inodes']==depth+2,result
- else:
+ if operation=='cleanup':
   for path in reversed(nodes):path.chmod(0)
-  b.remove_verification_tree(tree);assert not tree.exists()
+ if limited:resource.setrlimit(resource.RLIMIT_NOFILE,(32,old[1]))
+ descriptors=len(os.listdir('/proc/self/fd'))
+ try:
+  if operation=='contents':
+   result=b.tree_contents(tree);assert len(result)==depth+2,result
+  elif operation=='scan':
+   result=b.scratch_usage(tree,[]);assert result['scratch_inodes']==depth+2,result
+  else:
+   b.remove_verification_tree(tree);assert not tree.exists()
+ except OSError as error:
+  assert limited and error.errno==errno.EMFILE,error
+ else:
+  assert not limited,'descriptor exhaustion was silently accepted'
  assert outside.read_text()=='unchanged'
  assert len(os.listdir('/proc/self/fd'))==descriptors,'descriptor leak'
 finally:
@@ -691,16 +698,55 @@ finally:
   if path.exists():path.rmdir()
  (root/'outside').unlink(missing_ok=True);root.rmdir()
 """
-        for depth,limit in [(256,0),(64,32)]:
-            with self.subTest(depth=depth,fd_limit=limit):
-                result=subprocess.run([sys.executable,'-B','-c',code,str(pathlib.Path(bench_flatten.__file__).parent),str(depth),operation,str(limit)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
-                self.assertEqual(result.returncode,0,result.stdout[-3000:])
+        result=subprocess.run([sys.executable,'-B','-c',code,str(pathlib.Path(bench_flatten.__file__).parent),operation,'limited' if limited else 'normal'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stdout[-3000:])
 
-    def test_scratch_traversal_has_bounded_descriptor_depth(self):
+    def test_scratch_traversal_releases_ancestors(self):
         self.check_depth('scan')
 
-    def test_verification_cleanup_has_bounded_descriptor_depth(self):
+    def test_verification_cleanup_releases_ancestors(self):
         self.check_depth('cleanup')
+
+    def test_traversal_descriptor_exhaustion_fails_without_leaks(self):
+        for operation in ['scan','cleanup']:
+            with self.subTest(operation=operation):self.check_depth(operation, limited=True)
+
+    def test_traversal_open_work_grows_linearly(self):
+        for operation in ['scan','cleanup']:
+            counts=[]
+            for depth in [16,32,64]:
+                with self.subTest(operation=operation,depth=depth), tempfile.TemporaryDirectory(prefix='walk-cost-') as directory:
+                    tree=pathlib.Path(directory)/'tree';tree.mkdir();path=tree
+                    for _ in range(depth):path=path/'d';path.mkdir()
+                    (path/'payload').write_bytes(b'content')
+                    before=len(os.listdir('/proc/self/fd'))
+                    with mock.patch.object(os,'open',wraps=os.open) as opened:
+                        if operation=='scan':bench_flatten.scratch_usage(tree,[])
+                        else:bench_flatten.remove_verification_tree(tree)
+                    self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+                    counts.append(opened.call_count)
+                    self.assertLessEqual(opened.call_count,4*(depth+1), 'repeated ancestor resolution')
+            self.assertLessEqual(counts[1],2*counts[0]+4)
+            self.assertLessEqual(counts[2],2*counts[1]+4)
+
+    def test_traversal_scan_error_releases_ancestors(self):
+        for operation in ['scan','cleanup']:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory(prefix='walk-error-') as directory:
+                tree=pathlib.Path(directory)/'tree';tree.mkdir();path=tree
+                for _ in range(8):path=path/'d';path.mkdir()
+                original=os.scandir;calls=0
+                def scandir(fd):
+                    nonlocal calls
+                    calls+=1
+                    if calls==4:raise OSError(errno.EIO,'injected directory scan error')
+                    return original(fd)
+                before=len(os.listdir('/proc/self/fd'))
+                with mock.patch.object(os,'scandir',new=scandir), self.assertRaises(OSError) as caught:
+                    if operation=='scan':bench_flatten.scratch_usage(tree,[])
+                    else:bench_flatten.remove_verification_tree(tree)
+                self.assertEqual(caught.exception.errno,errno.EIO)
+                self.assertEqual(calls,4)
+                self.assertEqual(len(os.listdir('/proc/self/fd')),before)
 
 
 class VerificationTreeMeasurements(unittest.TestCase):

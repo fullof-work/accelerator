@@ -96,30 +96,37 @@ def directory_identity(info):
     return info.st_dev, info.st_ino
 
 
-def open_tree_directory(root_fd, parts, repair=False):
-    # Reopen from the anchored root one component at a time. Pending entries
-    # retain identities, not ancestor FDs or Python recursion frames.
-    current = os.dup(root_fd)
+def open_child_directory(parent_fd, name, expected, repair=False):
+    held = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
     try:
-        for name, expected in parts:
-            held = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
-            try:
-                info = os.fstat(held)
-                if directory_identity(info) != expected:
-                    raise FileNotFoundError('scratch directory changed during traversal')
-                if repair and stat.S_IMODE(info.st_mode) != 0o700:
-                    # Writers have joined; chmod this bound owned directory,
-                    # including mode-000 directories, without following entries.
-                    os.chmod(f'/proc/self/fd/{held}', 0o700)
-                child = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=held)
-            finally:
-                os.close(held)
-            os.close(current)
-            current = child
-        return current
+        info = os.fstat(held)
+        if directory_identity(info) != expected:
+            raise FileNotFoundError('scratch directory changed during traversal')
+        if repair and stat.S_IMODE(info.st_mode) != 0o700:
+            # Writers have joined; repair only this bound owned directory.
+            os.chmod(f'/proc/self/fd/{held}', 0o700)
+        return os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=held)
+    finally:
+        os.close(held)
+
+
+def push_directory(stack, fd, name=None, identity=None):
+    # The stack owns fd, including when opening its scan fails. Ancestors stay
+    # open until backtracking, avoiding repeated resolution from the root.
+    try:
+        entries = os.scandir(fd)
     except BaseException:
-        os.close(current)
+        os.close(fd)
         raise
+    stack.append((fd, entries, name, identity))
+
+
+def close_directory(frame):
+    fd, entries, _, _ = frame
+    try:
+        entries.close()
+    finally:
+        os.close(fd)
 
 
 def task_scan_unchanged(process, identity, tasks):
@@ -138,31 +145,33 @@ def scratch_usage(scratch, processes):
     except FileNotFoundError:
         root_fd = None
     if root_fd is not None:
+        stack = []
         try:
-            pending = [()]
-            while pending:
-                parts = pending.pop()
+            push_directory(stack, root_fd)
+            info = os.fstat(root_fd)
+            objects[directory_identity(info)] = (info.st_blocks * 512, False)
+            while stack:
+                directory_fd, entries, _, _ = stack[-1]
                 try:
-                    directory_fd = open_tree_directory(root_fd, parts)
-                except (FileNotFoundError, NotADirectoryError):
+                    entry = next(entries)
+                except StopIteration:
+                    close_directory(stack.pop())
                     continue
                 try:
-                    info = os.fstat(directory_fd)
-                    objects[directory_identity(info)] = (info.st_blocks * 512, False)
-                    with os.scandir(directory_fd) as entries:
-                        for entry in entries:
-                            try:
-                                info = entry.stat(follow_symlinks=False)
-                            except FileNotFoundError:
-                                continue
-                            key = directory_identity(info)
-                            objects[key] = (info.st_blocks * 512, False)
-                            if stat.S_ISDIR(info.st_mode):
-                                pending.append(parts + ((entry.name, key),))
-                finally:
-                    os.close(directory_fd)
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                key = directory_identity(info)
+                objects[key] = (info.st_blocks * 512, False)
+                if stat.S_ISDIR(info.st_mode):
+                    try:
+                        child = open_child_directory(directory_fd, entry.name, key)
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
+                    push_directory(stack, child)
         finally:
-            os.close(root_fd)
+            while stack:
+                close_directory(stack.pop())
     deleted = set()
     def account_reference(reference, found, removed):
         try:
@@ -401,8 +410,8 @@ def tree_contents(tree):
 
 
 def remove_verification_tree(tree):
-    # All writers and metadata checks have finished. Only this owned tree is
-    # removed; pending traversal state stores identities rather than open FDs.
+    # Writers and metadata checks have finished. An explicit ancestor stack
+    # visits each directory once and closes it on backtracking or any failure.
     info = tree.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise RuntimeError('verification root is not a directory')
@@ -415,38 +424,34 @@ def remove_verification_tree(tree):
         root_fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=held)
     finally:
         os.close(held)
+    stack = []
     try:
-        pending = [((), False)]
-        while pending:
-            parts, visited = pending.pop()
-            if visited:
-                if parts:
-                    parent = open_tree_directory(root_fd, parts[:-1], repair=True)
-                    try:
-                        name, expected = parts[-1]
-                        if directory_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != expected:
-                            raise RuntimeError('verification directory changed')
-                        os.rmdir(name, dir_fd=parent)
-                    finally:
-                        os.close(parent)
-                continue
-            directory_fd = open_tree_directory(root_fd, parts, repair=True)
+        push_directory(stack, root_fd)
+        while stack:
+            directory_fd, entries, name, expected = stack[-1]
             try:
-                pending.append((parts, True))
-                with os.scandir(directory_fd) as entries:
-                    for entry in entries:
-                        info = entry.stat(follow_symlinks=False)
-                        if stat.S_ISDIR(info.st_mode):
-                            pending.append((parts + ((entry.name, directory_identity(info)),), False))
-                        else:
-                            os.unlink(entry.name, dir_fd=directory_fd)
-            finally:
-                os.close(directory_fd)
+                entry = next(entries)
+            except StopIteration:
+                close_directory(stack.pop())
+                if stack:
+                    parent_fd = stack[-1][0]
+                    if directory_identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) != expected:
+                        raise RuntimeError('verification directory changed')
+                    os.rmdir(name, dir_fd=parent_fd)
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                identity = directory_identity(info)
+                child = open_child_directory(directory_fd, entry.name, identity, repair=True)
+                push_directory(stack, child, entry.name, identity)
+            else:
+                os.unlink(entry.name, dir_fd=directory_fd)
         if directory_identity(tree.lstat()) != root_identity:
             raise RuntimeError('verification root changed')
         os.rmdir(tree)
     finally:
-        os.close(root_fd)
+        while stack:
+            close_directory(stack.pop())
 
 
 def read_progress_stream(stream, output, events, started, abort):
