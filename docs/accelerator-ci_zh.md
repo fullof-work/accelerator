@@ -24,6 +24,12 @@ Native recipe、摘要、许可、来源清单与 link-map 校验仍为必需检
 Publisher 在独立 Workbench 调用中从受信源码编译归档校验器, 该调用禁用缓存恢复和
 保存. 发布步骤直接执行校验器, 不再次编译.
 
+
+块摘要计算使用已计入预算的 1 MiB 读取缓冲和固定摘要数组，最多两个 worker，
+并受 `GOMAXPROCS` 限制。复用缓冲或取消清理前必须等待全部 worker 结束；
+去重与布局分配仍按顺序执行。相邻块只有在全部 4096 字节比较相同后才复用
+完整 SHA-256，worker 数量不改变块身份与输出顺序。
+
 ## Prepared 产品 E2E 与本地证据
 
 [Accelerator E2E 指南](../test/e2e/README_zh.md) 列出预构建产品、EROFS、Redis、
@@ -75,19 +81,30 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 
 ## 流式展平回归覆盖
 
-运行 flatten 和 remote 测试前，先构建所选 guest-runtime 的 native 配方，并将
-`MKFS_EROFS_PATH` 指向该精确 `mkfs.erofs`。Plan 测试要求工具报告 v1 能力，
-不支持此能力的系统 mkfs 不能代替。[展平指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md)
-定义输入、源生命周期、原生计划和工件完成合同。
+生产规划使用固定版本的外部 `github.com/kuasar-sandbox/go-erofs` 模块，
+不查找或执行 mkfs.erofs。原生对照测试仍使用所选 guest-runtime 配方：
+`MKFS_EROFS_PATH` 指向该精确 `mkfs.erofs`，同目录放置匹配的 fsck。原生基线测试
+要求 v1 Plan 能力，不支持此能力的系统 mkfs 不能代替。Go 规划器测试还验证
+原生工具路径无效时仍可工作。[展平指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md)
+定义输入、源生命周期、计划和工件完成合同。
 
 | 要求 | 实现 | 维护中的检查及证据范围 |
 |---|---|---|
 | 固定输入身份及完整校验 | `pkg/flatten/input.go`、`layer_stream.go`；`pkg/remote/stream.go` | 层 media/size/digest/DiffID/trailer/Close 与取消用例；实际本地 Registry → umoci → Plan → pipe → 当前工件 reader。 |
 | 层文件系统语义 | `pkg/flatten/layer_apply_linux.go` | 实际 umoci 的 late whiteout/opaque、类型替换、implicit parent、链接、属性及空层；权限不足仍报错。 |
-| 原生布局与顺序输出 | Guest native patch series；`pkg/flatten/plan_linux.go` | Raw/Plan 身份及提取内容；损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾前失败。Native exact-read 注入沿用 guest-runtime 的 `test-erofs`。 |
+| Go 布局与顺序输出 | 固定 go-erofs 模块；`go_planner_linux.go`、`plan_linux.go` | 实际内容/元数据、选中硬链接、填充块共享、独立 fsck 提取、重复构建确定性、受控分配/Plan 预算、取消及清理。保留 Plan 损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾检查。原生 Raw/Plan 字节身份及 exact-read 测试作为基线对照保留；不要求 Go 与原生输出字节相同。 |
 | 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
 | 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
 | 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、粘滞目录替换权限的提前检查、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
+
+`PlanLimits.NativeMemoryBytes` 保留公开字段名和 512 MiB 默认值，现在约束 Go
+规划的受控分配。两份等额预算分别容纳来源/去重表及 go-erofs 布局结构，并计入
+容量增长时新旧存储并存的开销。`PlanBytes` 仍默认为 512 MiB，计入全部实际写入的
+元数据、来源记录和块记录。`IndexMemoryBytes` 仍默认为 128 MiB，保留选集、reader
+和 writer 的预算份额。释放的引用由 Go 回收；这些限额不等于进程 RSS 上限。
+payload 记录按来源首次出现顺序写入既有 KERPLAN v1 文件，不创建完整数据 blob
+或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`；旧转换
+结果视作 miss，显式指定的旧工件仍可读取。
 
 最后一行包含显式启用的真实挂载测试。普通用户编译测试程序，再在新的私有 mount
 namespace 中以挂载权限仅运行这些用例。将 `TMPDIR` 设为私有测试目录，
@@ -109,6 +126,8 @@ Builder 测试入口，以精确 source/artifact set 验证。接收工件字节
 证据。
 
 ### 同条件展平测量
+
+纯 Go 生成器使用 `--variant NAME,CLI`，省略原生工具。`--allow-layout-differences` 只允许不同生成器的制品身份不同；既有内容、元数据、硬链接和运行配置核验不变，各生成器重复构建仍须字节一致。`identity-comparison.json` 记录每个变体的轮数及重复身份核验结果。单轮资源测量仍可使用，但明确标为 `not_checked_single_trial`，不能作为确定性证据。比较重复输出至少需要两轮；性能验收仍保留三轮交替对照要求。
 
 `test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
 artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch

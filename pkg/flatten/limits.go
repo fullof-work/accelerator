@@ -29,10 +29,13 @@ func (l ArchiveLimits) defaults() (ArchiveLimits, error) {
 	return l, nil
 }
 
-// PlanLimits bounds native construction, on-disk metadata, and Go indexes
-// independently. The native process exits before the Go emitter starts.
+// PlanLimits bounds controlled planning allocations, on-disk metadata, and
+// reader/writer indexes independently. Planning drops its indexes before emission;
+// Go GC and allocator overhead are process-wide and are not an RSS guarantee.
 // Zero fields select the documented defaults; exceeding a limit fails closed.
 type PlanLimits struct {
+	// NativeMemoryBytes retains its name for compatibility. Half admits Go
+	// source/dedup indexes and half admits go-erofs metadata/layout allocations.
 	NativeMemoryBytes uint64
 	PlanBytes         uint64
 	IndexMemoryBytes  uint64

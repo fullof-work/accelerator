@@ -92,7 +92,6 @@ func archiveFixture(t *testing.T, codec string) ([]byte, *ImageInput) {
 }
 
 func TestArchiveLegacySkopeoAlias(t *testing.T) {
-	requirePlan(t)
 	layer := testLayerTar(t, layerEntry{name: "payload", body: "legacy save contents"})
 	digest := fmt.Sprintf("%x", sha256.Sum256(layer))
 	config := []byte(fmt.Sprintf(`{"rootfs":{"type":"layers","diff_ids":["sha256:%s"]}}`, digest))
@@ -147,7 +146,6 @@ func TestArchiveLegacySkopeoAlias(t *testing.T) {
 }
 
 func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
-	requirePlan(t)
 	for _, codec := range []string{"plain", "gzip", "zstd"} {
 		t.Run(codec, func(t *testing.T) {
 			outer, in := archiveFixture(t, codec)

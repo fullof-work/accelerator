@@ -78,7 +78,7 @@ make test-e2e-scripts           # 离线 E2E fixture/helper 回归，不是产�
 
 ### 私网与离线构建
 
-本 module 没有跨仓 Go 依赖。可将 `GOPROXY` 指向部署镜像并使用对应 checksum database 策略,或在离线时使用已填充、经过验证的 module cache。兄弟仓协调开发可使用[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox),但它不是本组件独立构建的前提。
+EROFS 规划器依赖外部模块 `github.com/kuasar-sandbox/go-erofs`。离线构建前，应将 `go.mod` 选定的精确版本（包括适用时的伪版本）镜像或预先缓存，并按 `go.sum` 校验。可将 `GOPROXY` 指向部署镜像并使用对应 checksum database 策略，或使用已填充、经过验证的 module cache。无需检出 go-erofs 源码或配置本地替换。兄弟仓协调开发可使用[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)，但它不是本组件独立构建的前提。
 
 ## 独立运行
 

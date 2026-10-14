@@ -30,6 +30,13 @@ standalone archive validator compiled from its trusted source in a separate
 Workbench invocation with cache restore/save disabled; publishing executes the
 validator without compiling it again.
 
+
+Block hashing uses the admitted 1 MiB read buffer and a fixed digest array, with
+at most two workers bounded by `GOMAXPROCS`. All workers join before buffer reuse
+or cancellation cleanup. Deduplication and layout allocation remain sequential.
+An adjacent block can reuse a full SHA-256 only after comparing all 4096 bytes;
+worker count does not change block identities or output order.
+
 ## Prepared product E2E and local evidence
 
 The [accelerator E2E guide](../test/e2e/README.md) lists the prepared-product,
@@ -87,20 +94,35 @@ not evidence of a real RocksDB build, prepared product E2E or cloud qualificatio
 
 ## Streaming flatten regression coverage
 
-Build the selected guest-runtime native recipe before running the flatten and
-remote suites, and set `MKFS_EROFS_PATH` to that exact `mkfs.erofs`. Plan tests
-require the reported v1 capability; a system mkfs without it is not a substitute.
+Production planning uses the fixed external `github.com/kuasar-sandbox/go-erofs`
+module and does not resolve or execute mkfs.erofs. The native comparison tests
+still use the selected guest-runtime recipe: set `MKFS_EROFS_PATH` to that exact
+`mkfs.erofs`, with its matching fsck beside it. Native baseline tests require v1
+Plan capability; a system mkfs without it is not a substitute. Go planner tests
+also check operation with an invalid native-tool path.
 The [flatten guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md)
-defines input, source lifetime, native plan and artifact completion contracts.
+defines input, source lifetime, plan and artifact completion contracts.
 
 | Requirement | Implementation | Maintained checks and evidence scope |
 |---|---|---|
 | Fixed input identity and complete validation | `pkg/flatten/input.go`, `layer_stream.go`; `pkg/remote/stream.go` | Layer media/size/digest/DiffID/trailer/Close and cancellation cases; actual local Registry → umoci → Plan → pipe → current artifact reader. |
 | Layer filesystem semantics | `pkg/flatten/layer_apply_linux.go` | Actual umoci late whiteout/opaque, replacements, implicit parents, links, attributes and empty-layer cases; permission failures remain errors. |
-| Native layout and sequential emission | Guest native patch series; `pkg/flatten/plan_linux.go` | Raw/Plan identity and extracted contents; corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail failure. Native exact-read injection runs in guest-runtime's existing `test-erofs` target. |
+| Go layout and sequential emission | Fixed go-erofs module; `go_planner_linux.go`, `plan_linux.go` | Actual content/metadata, selected hard links, padded-block sharing, independent fsck extraction, deterministic repeated builds, controlled allocation/Plan budgets, cancellation and cleanup. Existing Plan corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail checks remain. Native Raw/Plan byte identity and exact-read tests are retained as baseline controls; Go/native output identity is not required. |
 | Archive and entry-point equivalence | `pkg/flatten/archive_linux.go`, `raw_linux.go` | Seekable archive, pipe spool and directory comparisons; truncated/concatenated archive and index-budget rejection. Guest CLI tests cover file, stdout and upload/error paths. |
 | Persistent cache publication and ownership | `pkg/remote/prepare_linux.go`, `prefetch_linux.go`, cache/GC | Unverified EOF is not a hit; explicit byte budget, bypass, current-layer priority, duplicates, concurrent GC leases and joined cancellation. Conversion-policy tests retain explicit old-artifact reading while rejecting stale conversion hits. |
 | Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file/UID/GID/rwx/access-ACL preservation, inherited directory GID, privileged empty-root chmod, fail-fast sticky-directory replacement permissions, EMFILE cleanup, reserved-file and directory substitution rejection, read-only private-tree cleanup without following external symlinks, and open/deleted FD checks. |
+
+`PlanLimits.NativeMemoryBytes` keeps its public name and 512 MiB default, but
+now bounds controlled Go planning allocations. Its two equal shares admit the
+source/dedup tables and go-erofs layout structures respectively, including
+capacity-growth overlap. `PlanBytes` still defaults to 512 MiB and accounts for
+all materialized metadata, source records and chunk records. `IndexMemoryBytes`
+still defaults to 128 MiB and retains the selection, reader and writer shares.
+Released references are reclaimed by Go; these limits do not bound total RSS.
+All payload records remain in first-seen source order and are streamed to the
+existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
+Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`; older conversion
+results miss, while explicitly selected old artifacts remain readable.
 
 The last row includes opt-in real mount tests. Compile the test executable as an
 ordinary user, then run only those cases with mount privilege in a new private
@@ -125,6 +147,8 @@ separately from scratch; include index/decoder memory and owned teardown. Packag
 tests or these mount fixtures do not replace real VM evidence.
 
 ### Matched flatten measurements
+
+For a linked Go generator, use `--variant NAME,CLI` without a native tool. `--allow-layout-differences` permits different artifact identities across generators only after the existing content, metadata, hard-link and runtime-config checks; repeated builds of each generator must still be byte-identical. `identity-comparison.json` records the trial count and repeated-identity check for each variant. A one-trial resource pass remains valid for resource measurements but explicitly reports `not_checked_single_trial`; it is not determinism evidence. Use at least two trials to compare repeated output, and retain the three alternating trials required for performance acceptance.
 
 `test/scripts/bench_flatten.py` uses prebuilt native producers, a real stdout
 pipe and the current artifact reader. It alternates variant order for three

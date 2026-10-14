@@ -20,7 +20,6 @@ func TestPreparedReadOnlyTreeCleanup(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("requires ordinary UID to exercise directory permission cleanup")
 	}
-	requirePlan(t)
 	for _, failed := range []bool{false, true} {
 		name := "after-output"
 		if failed {

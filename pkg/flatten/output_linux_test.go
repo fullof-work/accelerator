@@ -17,7 +17,6 @@ import (
 )
 
 func TestRawOutputPermissions(t *testing.T) {
-	requirePlan(t)
 	root, outputDir := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "payload"), []byte("content"), 0644); err != nil {
 		t.Fatal(err)
@@ -79,7 +78,6 @@ func TestRawOutputPreservesExistingOwnership(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root to replace a foreign-owned output")
 	}
-	requirePlan(t)
 	root, dir, scratch := t.TempDir(), t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "payload"), []byte("raw owner regression"), 0644); err != nil {
 		t.Fatal(err)
@@ -202,7 +200,6 @@ func TestRawOutputOwnershipFailure(t *testing.T) {
 }
 
 func TestRawOutputRejectsReplacedTemporary(t *testing.T) {
-	requirePlan(t)
 	for _, kind := range []string{"symlink", "regular", "directory"} {
 		t.Run(kind, func(t *testing.T) {
 			root, dir, scratch := t.TempDir(), t.TempDir(), t.TempDir()

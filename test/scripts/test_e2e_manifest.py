@@ -94,7 +94,6 @@ class ManifestScriptsTest(unittest.TestCase):
         }
         self.control = {"store": "ready", "cached": False, "sudo": True}
         self.write_control()
-        self.stub("mkfs.erofs", "raise SystemExit('mkfs must not run in boundary tests')")
         self.stub("manifest-ctl", "raise SystemExit('manifest must not run in boundary tests')")
         self.stub("sudo", '''
 with (root / "sudo.log").open("a") as log:
@@ -222,7 +221,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         self.assertNotEqual(images[0][1]["fixture/changed.bin"][1], images[1][1]["fixture/changed.bin"][1])
 
     def test_required_tools_and_binaries_fail_before_store(self):
-        for tool in ("python3", "openssl", "unzip", "flock", "grep", "mkfs.erofs",
+        for tool in ("python3", "openssl", "unzip", "flock", "grep",
                      "flatten-ctl", "manifest-ctl", "store-ctl"):
             with self.subTest(tool=tool):
                 path = self.bin / tool
@@ -251,12 +250,14 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
                 finally:
                     shutil.copyfile(E2E / "lib" / helper, path)
 
-    def test_explicit_invalid_erofs_tool_fails_before_store(self):
+    def test_retired_erofs_selector_does_not_block_the_linked_generator(self):
         self.env["MKFS_EROFS_PATH"] = str(self.case / "missing-mkfs")
+        self.assertFalse((self.bin / "mkfs.erofs").exists())
         code, output = self.run_script()
-        self.assertEqual(code, 1, output)
-        self.assertIn("required mkfs.erofs", output)
-        self.assertFalse((self.case / "store.log").exists())
+        self.assertEqual(code, 73, output)  # The intended export-error sentinel.
+        record = json.loads((self.case / "flatten.json").read_text())
+        self.assertNotIn("MKFS_EROFS_PATH", record["env"])
+        self.assertTrue((self.case / "store.term").exists())
 
     def test_missing_generated_archive_fails_before_store(self):
         (self.tree / "lib/accelerator/manifest_fixture.py").write_text("# Deliberately produce no archives.\n")
@@ -323,7 +324,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         record = json.loads((self.case / "flatten.json").read_text())
         self.assertEqual(record["input"], hashlib.sha256((self.fixtures / "image-a.tar").read_bytes()).hexdigest())
         self.assert_isolated(record["env"])
-        self.assertEqual(record["env"]["MKFS_EROFS_PATH"], str(self.bin / "mkfs.erofs"))
+        self.assertNotIn("MKFS_EROFS_PATH", record["env"])
         self.assertTrue(Path(record["env"]["TMPDIR"]).is_relative_to(self.scratch))
 
     def test_readiness_does_not_impose_the_old_nonfatal_probe_deadline(self):

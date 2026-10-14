@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -75,13 +76,10 @@ func TestUnescapeMountPath(t *testing.T) {
 	}
 }
 
-func requireMkfs(t *testing.T) {
+func requireLinuxExport(t *testing.T) {
 	t.Helper()
-	if os.Getenv("MKFS_EROFS_PATH") != "" {
-		return
-	}
-	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
-		t.Skip("mkfs.erofs not available")
+	if runtime.GOOS != "linux" {
+		t.Skip("EROFS generation requires Linux")
 	}
 }
 
@@ -106,7 +104,7 @@ func fixtureRootfs(t *testing.T) string {
 }
 
 func TestBuildFromDir(t *testing.T) {
-	requireMkfs(t)
+	requireLinuxExport(t)
 	root := fixtureRootfs(t)
 	out := filepath.Join(t.TempDir(), "img.erofs")
 
@@ -152,7 +150,7 @@ func TestBuildFromDir(t *testing.T) {
 }
 
 func TestBuildFromDirDeterministic(t *testing.T) {
-	requireMkfs(t)
+	requireLinuxExport(t)
 	root := fixtureRootfs(t)
 	dir := t.TempDir()
 	out1 := filepath.Join(dir, "a.erofs")
@@ -190,7 +188,7 @@ func TestBuildFromDirRootGuard(t *testing.T) {
 }
 
 func TestBuildFromDirOutputSelfExclusion(t *testing.T) {
-	requireMkfs(t)
+	requireLinuxExport(t)
 	root := fixtureRootfs(t)
 	out := filepath.Join(root, "self.erofs") // output inside the rootfs
 	var warned []string

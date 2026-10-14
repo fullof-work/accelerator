@@ -87,11 +87,14 @@ a local release bundle; the official cache payload must retain RocksDB support.
 
 ### Private-network and offline builds
 
-This module has no cross-repository Go dependencies. Point `GOPROXY` at the
-deployment's mirror, with its checksum-database policy, or use a populated
-verified module cache when offline. Coordinated sibling development can use the
-[project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox); it is not a
-prerequisite for this component's standalone build.
+The EROFS planner depends on the external `github.com/kuasar-sandbox/go-erofs`
+module. Mirror or pre-cache the exact version selected by `go.mod`, including
+its pseudo-version when applicable, and verify it against `go.sum` before
+building offline. Point `GOPROXY` at the deployment's mirror, with its
+checksum-database policy, or use a populated verified module cache. A checkout
+of go-erofs or a local replacement is not required. Coordinated sibling
+development can use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox);
+it is not a prerequisite for this component's standalone build.
 
 ## Running independently
 
@@ -108,7 +111,9 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 The selected owner source explicitly declares its compiled E2E helper inventory in `release/helper-inputs.json`. The current inventory is empty. Future helpers and their build recipe belong in this owner declaration; aggregate packaging discovers them without a platform filename list.
 
-Release tests need the matching native EROFS Plan capability. Preflight admits
+Production flatten planning uses the fixed external go-erofs module and has no
+mkfs.erofs runtime dependency. Release comparison tests retain the matching
+native EROFS Plan capability. Preflight admits
 the `guest-runtime` source branch on the same release line once and records its
 exact commit. The existing fixed-input transport carries that tree to both
 architecture jobs, which use the native EROFS recipe/cache and check its Plan

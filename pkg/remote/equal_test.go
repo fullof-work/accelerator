@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -24,9 +24,9 @@ import (
 // syntheticImage builds a small single-layer image whose files have normal
 // 0644 modes. ggcr's random.Image / crane.Image emit mode-0 (0000) tar
 // entries, which flatten faithfully writes to the staging tree — then a
-// non-root mkfs.erofs can't read them. Real-world images use readable modes
-// (and the data-plane flattens as root), so a 0644 layer is the realistic
-// fixture for an as-non-root unit test.
+// an ordinary-user exporter cannot read them. Readable modes are needed
+// for this fixture; production image export preserves ownership as root
+// or with CAP_CHOWN.
 func syntheticImage(t *testing.T) v1.Image {
 	t.Helper()
 	var buf bytes.Buffer
@@ -65,14 +65,6 @@ func syntheticImage(t *testing.T) v1.Image {
 	return img
 }
 
-func mkfsAvailable() bool {
-	if os.Getenv("MKFS_EROFS_PATH") != "" {
-		return true
-	}
-	_, err := exec.LookPath("mkfs.erofs")
-	return err == nil
-}
-
 func sha256File(t *testing.T, path string) string {
 	t.Helper()
 	f, err := os.Open(path)
@@ -90,11 +82,11 @@ func sha256File(t *testing.T, path string) string {
 // TestCrossSourceByteEqual — the same image flattened from a registry pull and
 // from an equivalent docker-archive must produce byte-identical EROFS. This is
 // the core determinism guarantee of routing both sources through flatten.Build.
-// It needs mkfs.erofs at runtime, so it is skipped in pure-unit environments
-// and runs in e2e / CI where the binary is built.
+// The linked Go planner needs no external generator. Linux and image ownership
+// privileges remain prerequisites for applying the fixture's numeric owners.
 func TestCrossSourceByteEqual(t *testing.T) {
-	if !mkfsAvailable() {
-		t.Skip("mkfs.erofs not found (set MKFS_EROFS_PATH or add to PATH); cross-source equality runs in e2e")
+	if runtime.GOOS != "linux" {
+		t.Skip("EROFS generation requires Linux")
 	}
 	if err := flatten.RequireOwnershipCap(); err != nil {
 		t.Skipf("flatten preserves image file ownership and needs root/CAP_CHOWN (%v); cross-source equality runs in e2e/CI", err)

@@ -63,7 +63,7 @@ make test-e2e-scripts
 
 真实用例按各自契约检查条件，而不是依赖一个全局 owner runner 环境。常见要求包括 Linux、Bash 4+、Python 3、GNU 常用工具、可写临时空间以及通过 `BIN` 提供的精确 prepared 二进制。
 
-Manifest/flatten 覆盖要求真实 `mkfs.erofs`，并支持产品实际使用的布局。需要保留镜像所有权的 flatten export 要求 root 或非交互式 `sudo -n`。用例不使用 `sudo -E`，只把自有临时目录/配置和解析后的 EROFS 工具路径传给提权操作。
+Manifest/flatten 覆盖使用已准备的 `flatten-ctl` 内含的生成器，不要求或选择外部 `mkfs.erofs`。需要保留镜像所有权的 flatten export 要求 root 或非交互式 `sudo -n`。用例不使用 `sudo -E`，只把自有临时目录/配置传给提权操作。
 
 涉及 Redis 的 tiered/cache 用例要求 `PATH` 中存在 `redis-server`，或显式提供对应可执行文件。测试自行启动并清理临时实例，不依赖外部 Redis 服务。
 

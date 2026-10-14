@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// A selection is fixed before invoking native mkfs and used unchanged for the
+// A selection is fixed before planning and used unchanged for the
 // final validation. It detects changes; it is not an atomic filesystem snapshot.
 type sourceSelection struct {
 	root     string
@@ -46,7 +46,7 @@ func (s *sourceSelection) excluded(name string) bool {
 func (s *sourceSelection) snapshot(ctx context.Context) ([32]byte, error) {
 	h := sha256.New()
 	remaining := s.budget
-	err := s.walk(ctx, ".", h, &remaining)
+	err := s.walk(ctx, ".", h, &remaining, nil)
 	var sum [32]byte
 	copy(sum[:], h.Sum(nil))
 	return sum, err
@@ -63,7 +63,11 @@ func (s *sourceSelection) validate(ctx context.Context) error {
 	return nil
 }
 
-func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, remaining *uint64) error {
+// selectionVisitor sees exactly the same selected objects used by validation.
+// A directory has one entry callback and one successful leave callback.
+type selectionVisitor func(rel string, st *unix.Stat_t, leave bool) error
+
+func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, remaining *uint64, visit selectionVisitor) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -101,9 +105,14 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 			}
 		}
 	}
+	if visit != nil {
+		if err := visit(rel, &st, false); err != nil {
+			return err
+		}
+	}
 	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
 		// Directory size/link count and times include excluded children. Their
-		// exported values are derived by mkfs from the selected entries, and
+		// exported values are derived by the planner from the selected entries, and
 		// output times are fixed. Hash selected children and identity/mode/owner.
 		id.size, id.nlink, id.mtime, id.ctime, id.mtimeNS, id.ctimeNS = 0, 0, 0, 0, 0, 0
 	}
@@ -165,9 +174,12 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 	}
 	sort.Strings(entries)
 	for _, entry := range entries {
-		if err := s.walk(ctx, filepath.Join(rel, entry), h, remaining); err != nil {
+		if err := s.walk(ctx, filepath.Join(rel, entry), h, remaining, visit); err != nil {
 			return err
 		}
+	}
+	if visit != nil {
+		return visit(rel, &st, true)
 	}
 	return nil
 }
@@ -249,7 +261,7 @@ func selectSourceWithOwned(ctx context.Context, root string, excludes, ownedPath
 		}
 	}
 	s.stamp, err = s.snapshot(ctx)
-	// The discovered aliases become part of the fixed native/read/validate
+	// The discovered aliases become part of the fixed plan/read/validate
 	// selection; final validation never grows a fresh set of exclusions.
 	s.owned = nil
 	return s, err

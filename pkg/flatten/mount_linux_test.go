@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -32,7 +33,6 @@ func requirePrivateMounts(t *testing.T) {
 	if err != nil || self == init {
 		t.Fatal("refusing mount tests without a private mount namespace:", err)
 	}
-	requirePlan(t)
 }
 
 func privateTestMount(t *testing.T, source, target, kind string, flags uintptr, data string) {
@@ -171,4 +171,77 @@ func TestMountedSourceSelection(t *testing.T) {
 		t.Fatalf("source-contained scratch survived: %v %v", entries, err)
 	}
 	assertNoOwnedFDs(t, root, alias)
+}
+
+func TestMountedGoPlanSemantics(t *testing.T) {
+	requirePrivateMounts(t)
+	root, work, mounted := t.TempDir(), t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("kernel checks compact primary-device chunk references\n"), 400)
+	if err := os.WriteFile(filepath.Join(root, "data"), data, 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(filepath.Join(root, "data"), 12345, 23456); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "data"), filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "fifo"), filepath.Join(root, "fifo-alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mknod(filepath.Join(root, "device"), unix.S_IFCHR|0600, int(unix.Mkdev(1, 3))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("data", filepath.Join(root, "symlink")); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(work, "image.raw")
+	if err := BuildFromDir(root, output, Options{TmpDir: work}, DirOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("mount", "-t", "erofs", "-o", "loop,ro", output, mounted).CombinedOutput(); err != nil {
+		t.Fatalf("kernel EROFS mount: %v %s", err, out)
+	}
+	t.Cleanup(func() {
+		if out, err := exec.Command("umount", mounted).CombinedOutput(); err != nil {
+			t.Errorf("owned EROFS teardown: %v %s", err, out)
+		}
+	})
+	for _, name := range []string{"data", "alias", "symlink"} {
+		got, err := os.ReadFile(filepath.Join(mounted, name))
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("kernel content %s: %v", name, err)
+		}
+	}
+	for _, pair := range [][2]string{{"data", "alias"}, {"fifo", "fifo-alias"}} {
+		a, err := os.Lstat(filepath.Join(mounted, pair[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.Lstat(filepath.Join(mounted, pair[1]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(a, b) || a.Sys().(*syscall.Stat_t).Nlink != 2 {
+			t.Fatalf("kernel link identity: %v", pair)
+		}
+	}
+	info, err := os.Stat(filepath.Join(mounted, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := info.Sys().(*syscall.Stat_t)
+	if st.Uid != 12345 || st.Gid != 23456 || info.Mode().Perm() != 0640 {
+		t.Fatalf("kernel ownership/mode: %+v", st)
+	}
+	info, err = os.Lstat(filepath.Join(mounted, "device"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Sys().(*syscall.Stat_t).Rdev != unix.Mkdev(1, 3) {
+		t.Fatal("kernel device number")
+	}
 }

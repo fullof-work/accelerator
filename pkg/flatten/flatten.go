@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-
-	"github.com/kuasar-sandbox/accelerator/internal/util"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.
@@ -109,23 +107,6 @@ func Verify(input1, input2 io.ReadSeeker) (bool, string, string, error) {
 	}
 
 	return hash1 == hash2, hash1, hash2, nil
-}
-
-// locateMkfsErofs resolves the mkfs.erofs binary with a fixed
-// precedence: $MKFS_EROFS_PATH > directory of running flatten-ctl
-// executable > $PATH. The hint message in the returned error keeps
-// users pointed at `make deps-erofs`.
-func locateMkfsErofs() (string, error) {
-	if p := os.Getenv("MKFS_EROFS_PATH"); p != "" {
-		return p, nil
-	}
-	p, err := util.LocateBinary("mkfs.erofs")
-	if err != nil {
-		return "", fmt.Errorf("flatten: mkfs.erofs not found " +
-			"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
-			"or add it to PATH; run `make deps-erofs` to build it)")
-	}
-	return p, nil
 }
 
 // hashFile computes the SHA-256 hex digest of a file.

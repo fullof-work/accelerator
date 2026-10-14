@@ -25,18 +25,6 @@ BIN="$(cd "$BIN" && pwd)"
 for helper in manifest_fixture.py port_lease.sh; do
     [ -r "$ACCELERATOR_LIB/$helper" ] || die "required prepared accelerator helper missing: $ACCELERATOR_LIB/$helper"
 done
-if [ -z "${MKFS_EROFS_PATH:-}" ]; then
-    FLATTEN_DIR=$(dirname "$(readlink -f "$BIN/flatten-ctl")")
-    if [ -x "$FLATTEN_DIR/mkfs.erofs" ]; then
-        MKFS_EROFS_PATH="$FLATTEN_DIR/mkfs.erofs"
-    else
-        MKFS_EROFS_PATH=$(command -v mkfs.erofs || true)
-    fi
-fi
-if [ -z "$MKFS_EROFS_PATH" ] || [ ! -x "$MKFS_EROFS_PATH" ]; then
-    die "required mkfs.erofs not found (set MKFS_EROFS_PATH or place it beside flatten-ctl/on PATH)"
-fi
-MKFS_EROFS_PATH=$(readlink -f "$MKFS_EROFS_PATH")
 SUDO=()
 if [ "$EUID" -ne 0 ]; then
     command -v sudo >/dev/null || die "sudo is required to preserve image ownership during flatten export"
@@ -117,10 +105,9 @@ cached_archive() {
 }
 
 flatten_archive() {
-    # Only the owned scratch directories and resolved tool path cross sudo.
+    # Only the owned scratch/config paths cross sudo; the CLI links its generator.
     "${SUDO[@]}" env -i PATH=/usr/bin:/bin "HOME=$TMPDIR/home" \
         "DOCKER_CONFIG=$TMPDIR/docker-config" "TMPDIR=$TMPDIR/flatten" \
-        "MKFS_EROFS_PATH=$MKFS_EROFS_PATH" \
         "$BIN/flatten-ctl" export --output "$2" --no-progress < "$1" 2>&1
 }
 

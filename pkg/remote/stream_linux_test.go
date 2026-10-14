@@ -66,9 +66,6 @@ func streamingImage(t *testing.T, marker string) v1.Image {
 }
 
 func TestRegistryStreamFixedIdentityToPlanPipe(t *testing.T) {
-	if !mkfsAvailable() {
-		t.Skip("native EROFS tool required")
-	}
 	img := streamingImage(t, "original")
 	mfst, _ := img.Manifest()
 	layerPath := "/v2/test/stream/blobs/" + mfst.Layers[0].Digest.String()
@@ -196,9 +193,6 @@ func TestRegistryStreamFixedIdentityToPlanPipe(t *testing.T) {
 }
 
 func TestRegistryPreparePersistentCacheValidation(t *testing.T) {
-	if !mkfsAvailable() {
-		t.Skip("native EROFS tool required")
-	}
 	for _, tc := range []struct {
 		name, budget          string
 		required, wrongDiffID bool

@@ -63,7 +63,7 @@ This target runs the port-lease regression and offline Manifest/cache boundary t
 
 The real cases require the prerequisites of the selected contract rather than one global owner-runner environment. Common requirements include Linux, Bash 4+, Python 3, GNU userland tools, writable scratch space, and the exact prepared binaries exposed through `BIN`.
 
-Manifest/flatten coverage requires a real `mkfs.erofs` supporting the layout used by the product. Root or noninteractive `sudo -n` is needed where flatten export must preserve image ownership. The case does not use `sudo -E` and forwards only owned scratch/config paths and the resolved EROFS tool into that privileged operation.
+Manifest/flatten coverage uses the generator linked into the prepared `flatten-ctl`; no external `mkfs.erofs` is required or selected. Root or noninteractive `sudo -n` is needed where flatten export must preserve image ownership. The case does not use `sudo -E` and forwards only owned scratch/config paths into that privileged operation.
 
 Tiered/cache cases that exercise Redis require `redis-server` on `PATH` or the explicitly supplied server executable. They start disposable owned instances; no external Redis service is implied.
 

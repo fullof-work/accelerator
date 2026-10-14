@@ -529,6 +529,37 @@ def write_all(output, block):
         pending = pending[written:]
 
 
+def producer_environment(scratch, mkfs):
+    environment = dict(os.environ, TMPDIR=str(scratch))
+    if mkfs is None:
+        environment.pop('MKFS_EROFS_PATH', None)
+    else:
+        environment['MKFS_EROFS_PATH'] = mkfs
+    return environment
+
+
+def check_artifact_identities(results, allow_layout_differences=False):
+    by_variant, counts = {}, {}
+    for result in results:
+        name = result['variant']
+        by_variant.setdefault(name, set()).add(result['artifact_sha256'])
+        counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        raise RuntimeError('no artifact identities to compare')
+    if any(len(identities) != 1 for identities in by_variant.values()):
+        raise RuntimeError('repeated builds of one variant are not deterministic')
+    if not allow_layout_differences and len({r['artifact_sha256'] for r in results}) != 1:
+        raise RuntimeError('normal-corpus artifact identities differ')
+    # A standalone resource pass can intentionally use one trial. Preserve its
+    # measurements without representing that pass as a determinism check.
+    return {
+        'cross_variant_identity_required': not allow_layout_differences,
+        'variants': {name: {'trials': count, 'repeated_identity_check':
+                           'passed' if count >= 2 else 'not_checked_single_trial'}
+                     for name, count in counts.items()},
+    }
+
+
 def measure_one(args, variant, trial, result_root, verified):
     name, cli, mkfs = variant
     config = producer_config(args.config or os.environ.get('FLATTEN_CONFIG'))
@@ -546,7 +577,7 @@ def measure_one(args, variant, trial, result_root, verified):
     if config:
         command += ['--config', config['path']]
     command.append(args.input)
-    environment = dict(os.environ, MKFS_EROFS_PATH=mkfs, TMPDIR=str(scratch))
+    environment = producer_environment(scratch, mkfs)
     stopped = False
     producer = None
     leader_start = None
@@ -666,7 +697,7 @@ def measure_one(args, variant, trial, result_root, verified):
                                    'child_io_input_512blocks': '512-byte blocks',
                                    'child_io_output_512blocks': '512-byte blocks'},
                   'producer_sha256': file_digest(cli),
-                  'mkfs_sha256': file_digest(mkfs),
+                  'mkfs_sha256': file_digest(mkfs) if mkfs is not None else None,
                   'consumer': str(pathlib.Path(args.consumer).resolve(strict=True)),
                   'consumer_sha256': file_digest(args.consumer),
                   'fsck': str(pathlib.Path(args.fsck).resolve(strict=True)),
@@ -727,7 +758,7 @@ def measure_one(args, variant, trial, result_root, verified):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--variant', action='append', required=True, help='NAME,CLI,MKFS (prebuilt, native)')
+    parser.add_argument('--variant', action='append', required=True, help='NAME,CLI[,MKFS] (prebuilt; omit MKFS for a linked Go generator)')
     parser.add_argument('--input', required=True, help='fixed Registry digest, directory or seekable Docker-save file')
     parser.add_argument('--consumer', required=True, help='current flatten-ctl')
     parser.add_argument('--config', type=pathlib.Path)
@@ -742,17 +773,20 @@ def main():
     parser.add_argument('--progress-timing', action='store_true', help='timestamp existing CLI progress lines for stage attribution')
     parser.add_argument('--keep-artifacts', action='store_true')
     parser.add_argument('--timing-only', action='store_true', help='omit intrusive inode/FD/RSS sampling; run resource measurements separately')
+    parser.add_argument('--allow-layout-differences', action='store_true', help='compare filesystem/config semantics across variants; check per-variant byte determinism when trials >= 2')
     args = parser.parse_args()
     variants = [value.split(',') for value in args.variant]
     if args.trials < 1 or not 0.01 <= args.interval <= 1:
         parser.error('positive trials and a 0.01..1 second sampling interval are required')
-    if any(len(v) != 3 or not v[0].replace('-', '').isalnum() for v in variants):
+    if any(len(v) not in (2,3) or not v[0].replace('-', '').isalnum() for v in variants):
         parser.error('invalid variant')
     if len({v[0] for v in variants}) != len(variants):
         parser.error('duplicate variant')
     for v in variants:
-        for index in [1,2]:
+        for index in range(1, len(v)):
             v[index] = str(pathlib.Path(v[index]).resolve(strict=True))
+        if len(v) == 2:
+            v.append(None)
     args.consumer = str(pathlib.Path(args.consumer).resolve(strict=True))
     args.fsck = str(pathlib.Path(args.fsck).resolve(strict=True))
     args.expected = args.expected.resolve(strict=True)
@@ -779,8 +813,8 @@ def main():
             result = one(args, variant, trial, args.output_root, verified)
             results.append(result)
             print(json.dumps(result), flush=True)
-    if len({r['artifact_sha256'] for r in results}) != 1:
-        raise RuntimeError('normal-corpus artifact identities differ')
+    comparison = check_artifact_identities(results, args.allow_layout_differences)
+    (args.output_root / 'identity-comparison.json').write_text(json.dumps(comparison, indent=2)+'\n')
     (args.output_root / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
 
 

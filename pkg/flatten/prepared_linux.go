@@ -3,16 +3,12 @@
 package flatten
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -119,7 +115,7 @@ func PrepareDir(ctx context.Context, root string, opts Options, dopts DirOptions
 }
 
 // PrepareImage verifies and applies each complete layer into one private rootfs.
-// On failure the whole rootfs is discarded after the applier/body/native process
+// On failure the whole rootfs is discarded after the applier/body/owned planning work
 // has stopped. Reusing the immutable ImageInput starts from a fresh rootfs.
 func PrepareImage(ctx context.Context, in *ImageInput, opts Options) (_ *PreparedImage, retErr error) {
 	return prepareImage(ctx, in, opts, nil)
@@ -186,19 +182,15 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 }
 
 func prepareSelected(ctx context.Context, work string, selection *sourceSelection, cfg *image.RuntimeConfig, opts Options, limits PlanLimits) (_ *PreparedImage, retErr error) {
-	mkfs, err := locateMkfsErofs()
-	if err != nil {
-		return nil, err
-	}
 	layout, name := filepath.Join(work, "layout"), filepath.Join(work, "plan")
 	if opts.Progress != nil {
 		opts.Progress("build-erofs", 0, 0)
 	}
-	if err = buildPlan(ctx, mkfs, selection, layout, name, limits); err != nil {
+	if err := buildGoPlan(ctx, selection, layout, name, limits); err != nil {
 		return nil, err
 	}
-	// CommandContext.Run waits for the child to exit, releasing all native
-	// tables. No data emission can overlap native planning or layer application.
+	// Planning has returned and released its indexes. No data emission overlaps
+	// planning or layer application; GC remains the Go runtime's responsibility.
 	readerLimits := limits
 	readerLimits.IndexMemoryBytes /= 2
 	p, err := openPlan(ctx, selection.root, layout, name, readerLimits)
@@ -233,38 +225,6 @@ func prepareSelected(ctx context.Context, work string, selection *sourceSelectio
 		return nil, err
 	}
 	return &PreparedImage{work: work, plan: p, source: src, selection: selection, writerMemory: writerMemory}, nil
-}
-
-type boundedDiagnostic struct{ bytes.Buffer }
-
-func (b *boundedDiagnostic) Write(p []byte) (int, error) {
-	n := len(p)
-	if remaining := 64<<10 - b.Len(); remaining > 0 {
-		b.Buffer.Write(p[:min(remaining, n)])
-	}
-	return n, nil
-}
-
-func buildPlan(ctx context.Context, mkfs string, selection *sourceSelection, layout, name string, limits PlanLimits) error {
-	args := []string{"-Ededupe", "--chunksize=4096", "-T0", "-b4096", "-x-1", "-U", "00000000-0000-0000-0000-000000000000", "--quiet", "--ignore-mtime",
-		"--plan=" + name, "--plan-memory=" + strconv.FormatUint(limits.NativeMemoryBytes, 10), "--plan-bytes=" + strconv.FormatUint(limits.PlanBytes, 10)}
-	for _, p := range selection.excludes {
-		args = append(args, "--exclude-path="+p)
-	}
-	args = append(args, layout, selection.root)
-	cmd := exec.CommandContext(ctx, mkfs, args...)
-	for _, env := range os.Environ() {
-		if !strings.HasPrefix(env, "TMPDIR=") && !strings.HasPrefix(env, "SOURCE_DATE_EPOCH=") {
-			cmd.Env = append(cmd.Env, env)
-		}
-	}
-	cmd.Env = append(cmd.Env, "TMPDIR="+filepath.Dir(layout))
-	var diagnostic boundedDiagnostic
-	cmd.Stdout, cmd.Stderr = io.Discard, &diagnostic
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("flatten: native plan: %w: %s", errors.Join(err, ctx.Err()), strings.TrimSpace(diagnostic.String()))
-	}
-	return ctx.Err()
 }
 
 func (p *PreparedImage) begin(ctx context.Context) (context.Context, func(), error) {
