@@ -660,6 +660,9 @@ class MeasurementScanLifetime(unittest.TestCase):
 import os,pathlib,resource,sys,tempfile
 sys.path.insert(0,sys.argv[1]);import bench_flatten as b
 depth=int(sys.argv[2]);operation=sys.argv[3];limit=int(sys.argv[4])
+# Exercise traversal beyond Python's recursion budget without a slow,
+# quadratic 1,050-component descriptor-reopening fixture in overlayfs CI.
+sys.setrecursionlimit(128)
 root=pathlib.Path(tempfile.mkdtemp(prefix='scan-depth-'));tree=root/'tree';tree.mkdir();nodes=[tree]
 old=resource.getrlimit(resource.RLIMIT_NOFILE)
 try:
@@ -688,7 +691,7 @@ finally:
   if path.exists():path.rmdir()
  (root/'outside').unlink(missing_ok=True);root.rmdir()
 """
-        for depth,limit in [(1050,0),(64,32)]:
+        for depth,limit in [(256,0),(64,32)]:
             with self.subTest(depth=depth,fd_limit=limit):
                 result=subprocess.run([sys.executable,'-B','-c',code,str(pathlib.Path(bench_flatten.__file__).parent),str(depth),operation,str(limit)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stdout[-3000:])
