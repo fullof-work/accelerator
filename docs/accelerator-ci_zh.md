@@ -129,7 +129,7 @@ Builder 测试入口，以精确 source/artifact set 验证。接收工件字节
 
 纯 Go 生成器使用 `--variant NAME,CLI`，省略原生工具。`--allow-layout-differences` 只允许不同生成器的制品身份不同；既有内容、元数据、硬链接和运行配置核验不变，各生成器重复构建仍须字节一致。`identity-comparison.json` 记录每个变体的轮数及重复身份核验结果。单轮资源测量仍可使用，但明确标为 `not_checked_single_trial`，不能作为确定性证据。比较重复输出至少需要两轮；性能验收仍保留三轮交替对照要求。
 
-`test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
+`test/scripts/bench_flatten.py` 使用预先构建的生产工具、真实 stdout pipe 和当前
 artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch
 实际分配块/inode、已删除但仍打开的文件，并等待自有生产会话中的全部进程组退出后清理 scratch。
 接收 artifact P 与可选 fsync 分开计量。`post_eof_teardown_seconds` 记录生产进程完成后，
@@ -142,7 +142,7 @@ stdout 首次可读数据标注时间，辅助阶段归因；准备完成后 wri
 
 历史字段 `scratch_blocks`、`deleted_open_blocks` 和 `artifact_blocks` 的数值是已分配的**字节数**（`st_blocks * 512`），不是块个数。为保持兼容，保留字段名和数值含义；新增 `metric_units` 将这些字段及进程 RSS 标为字节，将 `child_io_input_512blocks` 和 `child_io_output_512blocks` 标为 512 字节块的个数。单次采样和对应峰值采用相同单位。
 
-只有所有轮次成功且 artifact 身份一致后才写出汇总 `results.json`。被拒绝的对照保留各轮诊断，不生成成功汇总。
+只有所有轮次成功且通过所选身份政策后才写出汇总 `results.json`。各生成器重复构建的身份必须一致；只有显式启用语义对比选项时，才允许不同生成器的身份不同。被拒绝的对照保留各轮诊断，不生成成功汇总。
 
 接收成功或缓存已核验 artifact 身份之前，当前 consumer 的 `info --json` 配置必须与
 `--expected-config` 提供的固定投影 JSON 相同。仅当夹具明确不含追加配置时使用 JSON
@@ -165,11 +165,13 @@ CPU/I/O。所有写入活动结束后，包括失败或取消路径，仅在自�
 都应保留；计时轮次不能作为内存、块数、inode 或打开文件的上界证据。
 
 
-在相同 CPU、内存、存储和缓存条件下，对比原实现、正确 applier 加旧 mkfs，以及 Plan。
-中间对照仅在独立的所选 accelerator 源码副本上应用
-`test/fixtures/flatten-old-layout.patch`，使用相同的所选 guest CLI，以及包含 exact-read
-修复的旧维护版 mkfs 构建。构建记录须包含全部 source commit 和补丁摘要。该补丁只作
-测量夹具，正常产品构建使用 Plan 路径。
+历史 #161 对照在相同条件下比较原实现、正确 applier 加旧 mkfs，以及 native Plan。
+仅在该夹具记录的 native accelerator 基线独立副本上应用
+`test/fixtures/flatten-old-layout.patch`，使用匹配的 guest CLI 和包含 exact-read 修复的
+维护版 mkfs。保留源码提交和补丁摘要；该历史夹具不适用于当前 Go 规划器。
+
+比较 Go 生成器时，以层应用、读取及传输行为相同的维护版 native Plan 为对照。
+下例比较完整输出的语义，并检查每个生成器内部重复构建的身份。
 
 在既有 Workbench 中使用 Python 3.11 或更新版本。输入、scratch parent 与 output root
 须互不包含，output root 须不存在。Registry 输入必须固定 SHA-256 digest。提供按相对
@@ -183,17 +185,59 @@ CPU/I/O。所有写入活动结束后，包括失败或取消路径，仅在自�
 
 ```bash
 python3 test/scripts/bench_flatten.py \
-  --variant baseline,baseline/flatten-ctl,baseline/mkfs.erofs \
-  --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
-  --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
+  --variant native,native/flatten-ctl,native/mkfs.erofs \
+  --variant go,go/flatten-ctl --allow-layout-differences \
   --input fixtures/image.tar --expected fixtures/expected.json \
   --expected-config fixtures/runtime-config.json \
-  --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
+  --consumer go/flatten-ctl --fsck tools/fsck.erofs \
   --scratch-parent scratch --output-root results --trials 3 --fsync
 ```
 
-正常语义夹具在不同实现间必须具有相同 artifact 身份。低/高重复、多层覆盖、小文件、
+历史 native 对照要求正常语义夹具具有相同 artifact 身份；Go/native 对照在独立核验
+内容、元数据、链接和运行配置后，允许布局不同。低/高重复、多层覆盖、小文件、
 受限网络与显式缓存分别使用固定夹具。通过 `--config` 使用持久缓存时，其占用与
 生命周期另计，不视作临时 scratch。全链耗时包含并行重叠工作，不简单相加重叠阶段。
 这些宿主测量不能证明 Guest ext4 或 Host COW 峰值；后两项须在实际 Guest/Builder
 链路中计量，并覆盖接收端和自有资源清理。
+
+### Go 生成器测量与已接受的取舍
+
+链接进 CLI 的 Go 生成器移除了独立的运行时 mkfs 程序，但不承诺所有场景都更快。
+[#178 候选对照](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
+及[已接受的取舍](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177892609)
+同时记录了收益和代价。其余语义、失败、确定性、静态制品及 Guest/Builder 验收要求不变。
+
+对照使用 4 CPU、6 GiB 内存、固定输入、三轮交替运行、Go 1.26.8 和真实输出管道。
+x86 宿主支持 AVX2，不支持 SHA-NI 或 AVX-512。native 对照采用相同的正确 umoci
+层应用，以及维护中的 native Plan、读取和传输实现。计时与资源采样分开进行。
+这些是固定夹具的测量，不是任意镜像的上界。
+
+| 夹具 | Native EOF / 接收完成加 fsync（秒） | Go EOF / 接收完成加 fsync（秒） | 接收完成加 fsync 变化 | 生产进程及自有子进程 CPU 变化 |
+| --- | --- | --- | --- | --- |
+| 目录，4 GiB 低重复 | 57.198 / 61.353 | 61.919 / 62.821 | +2.4% | +22.1% |
+| 目录，1 GiB 低重复 | 16.814 / 18.470 | 15.463 / 18.980 | +2.8% | +37.4% |
+| 目录，4 GiB 高重复 | 11.028 / 11.072 | 1.225 / 1.257 | −88.6% | −86.8% |
+| 目录，20,000 个小文件 | 1.092 / 1.662 | 1.194 / 1.802 | +8.4% | +12.9% |
+| Registry，三层各 1 GiB 覆盖，初轮矩阵 | 45.460 / 48.926 | 53.600 / 55.011 | +12.4% | +24.5% |
+| 同一覆盖夹具，控制回写及缓存条件的定向复测 | 41.426 / 47.384 | 42.205 / 47.591 | +0.4% | +14.3% |
+| Registry，1 GiB，服务端限速 32 MiB/s | 47.988 / 50.995 | 45.092 / 51.339 | +0.7% | −2.8% |
+| Registry，1 GiB，显式层缓存已预热 | 21.549 / 25.795 | 20.884 / 27.599 | +7.0% | +10.0% |
+
+表中数值是完整逐轮测量的中位数。“接收完成加 fsync”包含接收方接受和接收端
+fsync，EOF 单项不包含两者。初轮覆盖对照在规划前存在波动，因此定向复测预热相同
+固定输入，并等待前轮回写结束；不增加资源，也不清除全局缓存。两组结果均保留。
+生产进程 rusage I/O 计数不可用不表示没有 I/O；复测补充的 cgroup 设备计数包含
+Registry、接收方、验证和清理。
+
+4 GiB 低重复输入的采样 RSS 约从 137 增至 210 MiB，规划及索引 scratch 约从
+64 增至 68 MiB；源目录和接收制品不计入该 scratch 数值。制品从 4,294,975,488
+增至 4,299,173,888 字节，约增加 0.098%。Registry 夹具包含私有的 1 GiB 最终
+rootfs，两版生产端 scratch 均约为 1.016 GiB，Go 约多 1 MiB。宿主测量不能证明
+固定 Guest ext4 和 Host COW 目标，后两者仍需要独立的真实 VM 证据。
+
+受测规划器使用两个哈希工作线程及外部 go-erofs 模块
+`v0.0.0-20261014160540-827da6f90114`。4 GiB 低重复计时使用关闭 VCS 标记的诊断
+构建；正常 Makefile 构建使用相同规划器，独立通过内容及资源检查，制品摘要一致。
+正常 CLI 增加 18,909 字节，同时 runtime 移除独立的约 3.9 MB mkfs 程序。这些候选
+记录不替代以真实合入源码和正式制品摘要标识的最终验收。ARM Guest/Builder 实机
+例外仍明确列为未验证；原生 ARM 测试和静态包属于不同证据。

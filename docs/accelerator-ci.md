@@ -150,7 +150,7 @@ tests or these mount fixtures do not replace real VM evidence.
 
 For a linked Go generator, use `--variant NAME,CLI` without a native tool. `--allow-layout-differences` permits different artifact identities across generators only after the existing content, metadata, hard-link and runtime-config checks; repeated builds of each generator must still be byte-identical. `identity-comparison.json` records the trial count and repeated-identity check for each variant. A one-trial resource pass remains valid for resource measurements but explicitly reports `not_checked_single_trial`; it is not determinism evidence. Use at least two trials to compare repeated output, and retain the three alternating trials required for performance acceptance.
 
-`test/scripts/bench_flatten.py` uses prebuilt native producers, a real stdout
+`test/scripts/bench_flatten.py` uses prebuilt producers, a real stdout
 pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated
 scratch blocks/inodes and deleted-open files, and waits for the owned producer
@@ -173,7 +173,7 @@ sampled RSS and block peaks have the recorded sampling resolution.
 
 Allocated storage values in the historical `scratch_blocks`, `deleted_open_blocks` and `artifact_blocks` fields are **bytes** (`st_blocks * 512`), not block counts. Their names and numeric meaning are retained for compatibility. `metric_units` now labels these fields and process RSS as bytes; it labels `child_io_input_512blocks` and `child_io_output_512blocks` as counts of 512-byte blocks. The same allocation units apply to individual samples and reported peaks.
 
-The aggregate `results.json` is published only after all rounds succeed and their artifact identities match. Rejected comparisons retain per-round diagnostics without a success aggregate.
+The aggregate `results.json` is published only after all rounds succeed and the selected identity policy passes. Repeated builds of each generator must match; cross-generator identities may differ only with the explicit semantic-comparison option. Rejected comparisons retain per-round diagnostics without a success aggregate.
 
 The current consumer's `info --json` config must equal the fixed projected JSON
 provided by `--expected-config` before acceptance or caching a verified artifact
@@ -197,13 +197,17 @@ identity/content checks, child CPU/I/O accounting and owned teardown, but record
 sampled peaks and the sampling interval as null. Retain both results; a timing
 pass cannot establish a memory, block, inode or open-file bound.
 
-Compare the previous implementation, the selected correct applier with old mkfs,
-and Plan on the same CPU/memory/storage/cache conditions. For the middle control,
-apply `test/fixtures/flatten-old-layout.patch` only to an isolated copy of the
-selected accelerator source, and build it with the same selected guest CLI and
-the old maintained mkfs including the exact-read fix. Record all source commits
-and the patch digest with the build receipts. This patch is a measurement fixture;
-normal product builds use the Plan path.
+For the historical #161 comparison, use the previous implementation, the
+correct applier with old mkfs, and native Plan under the same conditions. Apply
+`test/fixtures/flatten-old-layout.patch` only to an isolated copy of its recorded
+native accelerator baseline, with the matching guest CLI and maintained mkfs
+including the exact-read fix. Retain source commits and the patch digest. This
+historical fixture is not a patch for the current Go planner.
+
+For the Go generator comparison, use the maintained native Plan implementation
+with the same correct applier, reads and transport as the control. The example
+below compares complete outputs semantically and checks repeated identities
+within each generator.
 
 Run in the existing Workbench with Python 3.11 or newer. Input, scratch parent and
 output root must be disjoint; the output root must not exist. A Registry input
@@ -222,19 +226,71 @@ targets remain untouched. Scratch permission or I/O errors, including denied ins
 
 ```bash
 python3 test/scripts/bench_flatten.py \
-  --variant baseline,baseline/flatten-ctl,baseline/mkfs.erofs \
-  --variant correct-applier,control/flatten-ctl,control/mkfs.erofs \
-  --variant plan,plan/flatten-ctl,plan/mkfs.erofs \
+  --variant native,native/flatten-ctl,native/mkfs.erofs \
+  --variant go,go/flatten-ctl --allow-layout-differences \
   --input fixtures/image.tar --expected fixtures/expected.json \
   --expected-config fixtures/runtime-config.json \
-  --consumer plan/flatten-ctl --fsck tools/fsck.erofs \
+  --consumer go/flatten-ctl --fsck tools/fsck.erofs \
   --scratch-parent scratch --output-root results --trials 3 --fsync
 ```
 
-Normal-corpus artifact identities must match across variants. Cover low/high
-repetition, layer overwrites, small files, constrained network and explicit cache
+The historical native controls require matching normal-corpus identities.
+Go/native comparisons allow different layouts after independent content,
+metadata, link and runtime-config checks. Cover low/high repetition, layer
+overwrites, small files, constrained network and explicit cache
 as separate fixed fixtures. Record persistent cache occupancy/lifetime separately
 when supplying `--config`; it is never temporary scratch. End-to-end elapsed time
 includes overlapped work; do not add overlapping stage durations. These host
 measurements do not establish Guest ext4 or Host COW peaks. Measure those through
 the real Guest/Builder path, including the receiver and owned teardown.
+
+### Go generator measurements and accepted tradeoff
+
+The linked Go generator removes the separate runtime mkfs executable. It does
+not promise a universal speedup. The [#178 candidate comparison](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
+and [accepted tradeoff](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177892609)
+record the measured costs as well as the gains. All other semantic, failure,
+determinism, static-package and Guest/Builder acceptance requirements remain.
+
+The comparison used 4 CPUs, 6 GiB memory, fixed inputs, three alternating pairs,
+Go 1.26.8, and a real output pipe. The x86 host supports AVX2 but not SHA-NI or
+AVX-512. The native control uses the same correct umoci applier and maintained
+native Plan/read/transport behavior. Timing and sampled-resource passes are
+separate. These are fixture measurements, not bounds for arbitrary images.
+
+| Fixture | Native EOF / accepted + fsync (s) | Go EOF / accepted + fsync (s) | Accepted + fsync change | Producer/owned-child CPU change |
+| --- | --- | --- | --- | --- |
+| Directory, 4 GiB low repetition | 57.198 / 61.353 | 61.919 / 62.821 | +2.4% | +22.1% |
+| Directory, 1 GiB low repetition | 16.814 / 18.470 | 15.463 / 18.980 | +2.8% | +37.4% |
+| Directory, 4 GiB high repetition | 11.028 / 11.072 | 1.225 / 1.257 | −88.6% | −86.8% |
+| Directory, 20,000 small files | 1.092 / 1.662 | 1.194 / 1.802 | +8.4% | +12.9% |
+| Registry, three 1 GiB overwrite layers, initial matrix | 45.460 / 48.926 | 53.600 / 55.011 | +12.4% | +24.5% |
+| Same overwrite fixture, writeback/cache-controlled follow-up | 41.426 / 47.384 | 42.205 / 47.591 | +0.4% | +14.3% |
+| Registry, 1 GiB, 32 MiB/s server | 47.988 / 50.995 | 45.092 / 51.339 | +0.7% | −2.8% |
+| Registry, 1 GiB, warm explicit layer cache | 21.549 / 25.795 | 20.884 / 27.599 | +7.0% | +10.0% |
+
+Each cell is a median of complete per-round measurements. Accepted + fsync
+includes receiver acceptance and receiver fsync; EOF alone does not. The initial
+overwrite comparison showed variance before planning. The bounded follow-up
+warms the same fixed inputs and waits for prior writeback to settle without
+changing resources or flushing global caches. Both results are retained.
+Unavailable producer rusage I/O counters do not mean zero I/O; follow-up cgroup
+device counters include the Registry, receiver, verification and cleanup.
+
+For low-repetition 4 GiB input, sampled RSS increased from about 137 to 210 MiB,
+and planner/index scratch from about 64 to 68 MiB. The source directory and
+received artifact are outside that scratch figure. The artifact grew from
+4,294,975,488 to 4,299,173,888 bytes (about 0.098%). Registry fixtures include the
+private 1 GiB final rootfs: producer scratch is about 1.016 GiB for both versions,
+with about 1 MiB extra in Go. Host measurements do not establish the fixed Guest
+ext4 or Host COW limits, which require separate real VM evidence.
+
+The measured planner uses two hashing workers and external go-erofs module
+`v0.0.0-20261014160540-827da6f90114`. The 4 GiB low-repetition timing series uses
+a diagnostic build with VCS stamping disabled; the normal Makefile build has
+the same planner and independently passes content/resource checks with the same
+artifact digest. The normal CLI grows by 18,909 bytes while the runtime removes
+the separate approximately 3.9 MB mkfs payload. These candidate records do not
+substitute for final acceptance identified by actual merged sources and formal
+artifact hashes. The ARM Guest/Builder hardware exception remains explicitly
+unverified; native ARM tests and static packages are separate evidence.
