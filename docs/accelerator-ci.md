@@ -94,20 +94,13 @@ not evidence of a real RocksDB build, prepared product E2E or cloud qualificatio
 
 ## Streaming flatten regression coverage
 
-Production planning uses the fixed external `github.com/kuasar-sandbox/go-erofs`
-module and does not resolve or execute mkfs.erofs. The native comparison tests
-still use the selected guest-runtime recipe: set `MKFS_EROFS_PATH` to that exact
-`mkfs.erofs`, with its matching fsck beside it. Native baseline tests require v1
-Plan capability; a system mkfs without it is not a substitute. Go planner tests
-also check operation with an invalid native-tool path.
-The [flatten guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md)
-defines input, source lifetime, plan and artifact completion contracts.
+Production planning and Plan test fixtures use the fixed external `github.com/kuasar-sandbox/go-erofs` module without resolving or executing mkfs. Independent content validation uses host fsck/dump. Go planner tests cover an invalid native-tool path; Plan corruption, bounds and success-tail regressions remain active. The [flatten guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md) defines input, source lifetime, plan and artifact completion contracts.
 
 | Requirement | Implementation | Maintained checks and evidence scope |
 |---|---|---|
 | Fixed input identity and complete validation | `pkg/flatten/input.go`, `layer_stream.go`; `pkg/remote/stream.go` | Layer media/size/digest/DiffID/trailer/Close and cancellation cases; actual local Registry → umoci → Plan → pipe → current artifact reader. |
 | Layer filesystem semantics | `pkg/flatten/layer_apply_linux.go` | Actual umoci late whiteout/opaque, replacements, implicit parents, links, attributes and empty-layer cases; permission failures remain errors. |
-| Go layout and sequential emission | Fixed go-erofs module; `go_planner_linux.go`, `plan_linux.go` | Actual content/metadata, selected hard links, padded-block sharing, independent fsck extraction, deterministic repeated builds, controlled allocation/Plan budgets, cancellation and cleanup. Existing Plan corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail checks remain. Native Raw/Plan byte identity and exact-read tests are retained as baseline controls; Go/native output identity is not required. |
+| Go layout and sequential emission | Fixed go-erofs module; `go_planner_linux.go`, `plan_linux.go` | Actual content/metadata, selected hard links, padded-block sharing, independent fsck extraction, deterministic repeated builds, controlled allocation/Plan budgets, cancellation and cleanup. Existing Plan corruption, bounds, source mutation, metadata-only repeated RunAt and final-tail checks remain. Historical native Raw/Plan and exact-read controls remain in their original revisions; current tests exercise the Go generator. Go/native output identity is not required. |
 | Archive and entry-point equivalence | `pkg/flatten/archive_linux.go`, `raw_linux.go` | Seekable archive, pipe spool and directory comparisons; truncated/concatenated archive and index-budget rejection. Guest CLI tests cover file, stdout and upload/error paths. |
 | Persistent cache publication and ownership | `pkg/remote/prepare_linux.go`, `prefetch_linux.go`, cache/GC | Unverified EOF is not a hit; explicit byte budget, bypass, current-layer priority, duplicates, concurrent GC leases and joined cancellation. Conversion-policy tests retain explicit old-artifact reading while rejecting stale conversion hits. |
 | Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file/UID/GID/rwx/access-ACL preservation, inherited directory GID, privileged empty-root chmod, fail-fast sticky-directory replacement permissions, EMFILE cleanup, reserved-file and directory substitution rejection, read-only private-tree cleanup without following external symlinks, and open/deleted FD checks. |

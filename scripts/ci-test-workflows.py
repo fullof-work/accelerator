@@ -155,23 +155,13 @@ def check(platform):
     assert build["Check out trusted platform tooling"]["with"]["ref"] == "${{ needs.preflight.outputs.framework_sha }}"
     frozen = preflight['Freeze admitted source and selected dependency tags']
     assert 'producer-inputs.py freeze accelerator "$SOURCE_REF" "$SOURCE_SHA"' in frozen['run']
-    assert preflight['Upload Workbench selection']['with']['path'].splitlines() == ['workbench.json', 'producer-inputs.tar', 'erofs-test-inputs.tar', 'preview-evidence.json']
+    assert preflight['Upload Workbench selection']['with']['path'].splitlines() == ['workbench.json', 'producer-inputs.tar', 'preview-evidence.json']
     restored = build['Restore fixed producer inputs']
     assert 'producer-inputs.py restore workbench-selection/producer-inputs.tar accelerator "$SOURCE_SHA" src' in restored['run']
     assert restored['env']['SOURCE_SHA'] == '${{ needs.preflight.outputs.source_sha }}'
     assert not any(row.get('with', {}).get('ref') == '${{ needs.preflight.outputs.source_sha }}' for row in build.values())
-    native = preflight['Freeze native EROFS test source']
-    assert native['env'] == {'GH_TOKEN': '${{ github.token }}',
-                             'SOURCE_REF': '${{ steps.request.outputs.source_ref }}'}
-    assert 'guest-runtime/git/ref/heads/$SOURCE_REF' in native['run']
-    assert 'runtime "$SOURCE_REF" "$source_sha" erofs-test-inputs.tar' in native['run']
-    assert native['run'].index('producer-inputs.py freeze') < native['run'].index('>> "$GITHUB_OUTPUT"')
-    assert jobs['preflight']['outputs']['erofs_source_sha'] == '${{ steps.erofs.outputs.source_sha }}'
-    native_restore = build['Restore fixed native EROFS test source']
-    assert native_restore['env'] == {'SOURCE_SHA': '${{ needs.preflight.outputs.erofs_source_sha }}'}
-    assert 'workbench-selection/erofs-test-inputs.tar runtime "$SOURCE_SHA" native-test-inputs' in native_restore['run']
-    assert 'test ! -e src/guest-runtime' in native_restore['run']
-    assert names.index('Restore fixed native EROFS test source') < names.index('Build, test and package accelerator')
+    assert "Freeze native EROFS test source" not in preflight
+    assert "Restore fixed native EROFS test source" not in build
     assert "Bootstrap native or cross build" not in build
     assert "Attach native source cache" not in build
     assert build["Download Workbench selection"]["with"]["name"] == selection
@@ -183,8 +173,8 @@ def check(platform):
     assert step["with"]["arch"] == "${{ matrix.arch }}"
     assert "env" not in step and "GH_TOKEN" not in step["with"]["run"]
     assert "restore-or-build rocksdb" in step["with"]["run"]
-    assert "restore-or-build erofs" in step["with"]["run"]
-    assert step["with"]["run"].index('"$MKFS_EROFS_PATH" --plan-version') < step["with"]["run"].index('make test')
+    assert "restore-or-build erofs" not in step["with"]["run"]
+    assert "--plan-version" not in step["with"]["run"]
     assert step["with"]["cache-coverage"] == "release-accelerator-build"
     assert step["with"]["outputs"].splitlines() == ["accelerator/bin", "accelerator/release-bundle"]
     assert "NO_ROCKSDB" not in str(jobs["build"])
@@ -240,8 +230,6 @@ def check_build_shell(steps):
         make = tools / "make"
         make.write_text(f"#!{sys.executable}\nimport os, sys\n"
                         "from pathlib import Path\n"
-                        "assert Path(os.environ['MKFS_EROFS_PATH']).is_file()\n"
-                        "assert Path(os.environ['MKFS_EROFS_PATH']).parent == Path(os.environ['PATH'].split(':')[0])\n"
                         "with open(os.environ['MAKE_LOG'], 'a') as log:\n"
                         "    print(sys.argv[1:], os.getcwd(), file=log)\n"
                         "sys.exit(72 if sys.argv[1] == os.environ.get('FAIL_GOAL') else 0)\n")
@@ -262,18 +250,10 @@ def check_build_shell(steps):
         recipe = framework / "ci/native-cache/native-cache.sh"
         recipe.parent.mkdir(parents=True)
         recipe.write_text('set -eu\ncase "$*" in\n'
-                          '"restore-or-build rocksdb"|"restore-or-build erofs") ;;\n*) exit 90 ;;\nesac\n'
+                          '"restore-or-build rocksdb") ;;\n*) exit 90 ;;\nesac\n'
                           'printf "%s %s\\n" "$TARGET_ARCH" "$2" >> "$CACHE_LOG"\n'
                           '[ "${CACHE_EXIT:-0}" = 0 ] || exit "$CACHE_EXIT"\n'
-                          'if [ "$2" = erofs ]; then\n'
-                          '  [ "${EROFS_EXIT:-0}" = 0 ] || exit "$EROFS_EXIT"\n'
-                          '  mkdir -p "guest-runtime/native-deps/bin/$TARGET_ARCH"\n'
-                          '  cp "$PLAN_TOOL" "guest-runtime/native-deps/bin/$TARGET_ARCH/mkfs.erofs"\n'
-                          'fi\n'
                           'printf "%s\\n" "$TARGET_ARCH" > "$CACHE_LOG.state"\n')
-        plan_tool = tools / "plan-tool"
-        plan_tool.write_text('#!/bin/sh\n[ "$*" = --plan-version ] || exit 90\nexit "${PLAN_EXIT:-0}"\n')
-        plan_tool.chmod(0o755)
         stale_tool = root / "stale-mkfs.erofs"
         stale_tool.write_text('#!/bin/sh\nexit 91\n')
         stale_tool.chmod(0o755)
@@ -285,23 +265,19 @@ def check_build_shell(steps):
             cache_log = root / f"cache-{arch}.log"
             release_log = root / f"release-{arch}.log"
             env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40, PLAN_TOOL=str(plan_tool),
+                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40,
                        MKFS_EROFS_PATH=str(stale_tool))
             subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
                            cwd=source.parent, env=env, check=True)
             goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)
             assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
-            assert cache_log.read_text().splitlines() == [arch + " rocksdb", arch + " erofs"]
+            assert cache_log.read_text().splitlines() == [arch + " rocksdb"]
             assert release_log.read_text().splitlines() == ["package", "validate"]
             log.unlink()
             release_log.unlink()
             failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
                                     env=dict(env, CACHE_EXIT="71"))
             assert failed.returncode == 71 and not log.exists() and not release_log.exists()
-            for variable, code in (("EROFS_EXIT", 76), ("PLAN_EXIT", 77)):
-                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
-                                        env=dict(env, **{variable: str(code)}))
-                assert failed.returncode == code and not log.exists() and not release_log.exists()
             failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
                                     env=dict(env, FAIL_GOAL=goals[0]))
             assert failed.returncode == 72

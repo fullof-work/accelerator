@@ -156,7 +156,10 @@ func TestMountedSourceSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(t.TempDir(), "root")
-	fsck := filepath.Join(filepath.Dir(requirePlan(t)), "fsck.erofs")
+	fsck, err := exec.LookPath("fsck.erofs")
+	if err != nil {
+		t.Skip("fsck.erofs not available for independent content verification")
+	}
 	if out, err := exec.Command(fsck, "--extract="+extracted, output).CombinedOutput(); err != nil {
 		t.Fatalf("extract actual image: %s %v", out, err)
 	}

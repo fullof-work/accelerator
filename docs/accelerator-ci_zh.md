@@ -81,18 +81,13 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 
 ## 流式展平回归覆盖
 
-生产规划使用固定版本的外部 `github.com/kuasar-sandbox/go-erofs` 模块，
-不查找或执行 mkfs.erofs。原生对照测试仍使用所选 guest-runtime 配方：
-`MKFS_EROFS_PATH` 指向该精确 `mkfs.erofs`，同目录放置匹配的 fsck。原生基线测试
-要求 v1 Plan 能力，不支持此能力的系统 mkfs 不能代替。Go 规划器测试还验证
-原生工具路径无效时仍可工作。[展平指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md)
-定义输入、源生命周期、计划和工件完成合同。
+生产规划和 Plan 测试夹具均使用固定版本的外部 `github.com/kuasar-sandbox/go-erofs` 模块，不查找或执行 mkfs。独立内容校验使用宿主 fsck/dump。Go 规划器测试验证原生工具路径无效时仍可工作；Plan 损坏、越界和成功尾回归继续执行。[展平指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md) 定义输入、源生命周期、计划和工件完成合同。
 
 | 要求 | 实现 | 维护中的检查及证据范围 |
 |---|---|---|
 | 固定输入身份及完整校验 | `pkg/flatten/input.go`、`layer_stream.go`；`pkg/remote/stream.go` | 层 media/size/digest/DiffID/trailer/Close 与取消用例；实际本地 Registry → umoci → Plan → pipe → 当前工件 reader。 |
 | 层文件系统语义 | `pkg/flatten/layer_apply_linux.go` | 实际 umoci 的 late whiteout/opaque、类型替换、implicit parent、链接、属性及空层；权限不足仍报错。 |
-| Go 布局与顺序输出 | 固定 go-erofs 模块；`go_planner_linux.go`、`plan_linux.go` | 实际内容/元数据、选中硬链接、填充块共享、独立 fsck 提取、重复构建确定性、受控分配/Plan 预算、取消及清理。保留 Plan 损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾检查。原生 Raw/Plan 字节身份及 exact-read 测试作为基线对照保留；不要求 Go 与原生输出字节相同。 |
+| Go 布局与顺序输出 | 固定 go-erofs 模块；`go_planner_linux.go`、`plan_linux.go` | 实际内容/元数据、选中硬链接、填充块共享、独立 fsck 提取、重复构建确定性、受控分配/Plan 预算、取消及清理。保留 Plan 损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾检查。历史原生 Raw/Plan 及 exact-read 对照保留在其原始版本中；当前测试覆盖 Go 生成器。不要求 Go 与原生输出字节相同。 |
 | 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
 | 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
 | 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、粘滞目录替换权限的提前检查、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |

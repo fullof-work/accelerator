@@ -37,7 +37,6 @@ jobs:
       source_sha: ${{ steps.request.outputs.source_sha }}
       version: ${{ steps.request.outputs.version }}
       framework_sha: ${{ steps.framework.outputs.sha }}
-      erofs_source_sha: ${{ steps.erofs.outputs.source_sha }}
     steps:
       - name: Require trusted release controller
         run: |
@@ -104,22 +103,6 @@ jobs:
           set -euo pipefail
           dependencies=()
           python3 -B trusted/platform/release/producer-inputs.py freeze accelerator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar "${dependencies[@]}"
-      - name: Freeze native EROFS test source
-        id: erofs
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_REF: ${{ steps.request.outputs.source_ref }}
-        run: |
-          set -euo pipefail
-          # The native test recipe has no accelerator binary dependency. Admit
-          # its branch once, then transport the exact tree to both builders.
-          source_sha=$(gh api "repos/kuasar-sandbox/guest-runtime/git/ref/heads/$SOURCE_REF" \
-            --jq 'select(.object.type == "commit") | .object.sha')
-          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
-          python3 -B trusted/platform/release/producer-inputs.py freeze \
-            runtime "$SOURCE_REF" "$source_sha" erofs-test-inputs.tar
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "Native EROFS test source: kuasar-sandbox/guest-runtime $SOURCE_REF@$source_sha"
       - name: Upload Workbench selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -127,7 +110,6 @@ jobs:
           path: |
             workbench.json
             producer-inputs.tar
-            erofs-test-inputs.tar
             preview-evidence.json
           if-no-files-found: error
           retention-days: 1
@@ -155,15 +137,6 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
         run: python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar accelerator "$SOURCE_SHA" src
-      - name: Restore fixed native EROFS test source
-        env:
-          SOURCE_SHA: ${{ needs.preflight.outputs.erofs_source_sha }}
-        run: |
-          set -euo pipefail
-          python3 -B trusted/platform/release/producer-inputs.py restore \
-            workbench-selection/erofs-test-inputs.tar runtime "$SOURCE_SHA" native-test-inputs
-          test ! -e src/guest-runtime
-          mv native-test-inputs/guest-runtime src/guest-runtime
       - name: Check out trusted build checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -189,10 +162,6 @@ jobs:
             set -euo pipefail
             umask 022
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build rocksdb
-            bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build erofs
-            export MKFS_EROFS_PATH="$PWD/guest-runtime/native-deps/bin/$TARGET_ARCH/mkfs.erofs"
-            export PATH="$PWD/guest-runtime/native-deps/bin/$TARGET_ARCH:$PATH"
-            "$MKFS_EROFS_PATH" --plan-version
             cd accelerator
             if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
             make build

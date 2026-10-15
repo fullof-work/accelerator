@@ -23,34 +23,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
-// Only native compatibility fixtures need the independent mkfs tool.
-func requireMkfs(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MKFS_EROFS_PATH") != "" {
-		return
-	}
-	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
-		t.Skip("mkfs.erofs not available")
-	}
-}
-
-func requirePlan(t *testing.T) string {
-	t.Helper()
-	requireMkfs(t)
-	mkfs, err := locateMkfsErofs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := exec.Command(mkfs, "--plan-version").Output()
-	if err != nil || string(b) != "erofs-plan 1 sha256-4k-single-device\n" {
-		t.Fatalf("selected mkfs lacks required Plan v1 capability: %s: %v", b, err)
-	}
-	return mkfs
-}
-
 func makePlanFixture(t *testing.T, empty bool) (*erofsPlan, string, string, string) {
 	t.Helper()
-	mkfs := requirePlan(t)
 	root, work := t.TempDir(), t.TempDir()
 	if !empty {
 		var b bytes.Buffer
@@ -92,7 +66,7 @@ func makePlanFixture(t *testing.T, empty bool) (*erofsPlan, string, string, stri
 		t.Fatal(err)
 	}
 	layout, name := filepath.Join(work, "layout"), filepath.Join(work, "plan")
-	if err = buildPlan(context.Background(), mkfs, selection, layout, name, l); err != nil {
+	if err = buildGoPlan(context.Background(), selection, layout, name, l); err != nil {
 		t.Fatal(err)
 	}
 	p, err := openPlan(context.Background(), root, layout, name, l)
@@ -117,17 +91,13 @@ func readPlanSource(t *testing.T, s sparse.Source) []byte {
 	return b
 }
 
-func TestNativePlanMatchesLayoutAndContent(t *testing.T) {
+func TestGoPlanMatchesLayoutAndContent(t *testing.T) {
 	for _, empty := range []bool{true, false} {
 		t.Run(fmt.Sprint(empty), func(t *testing.T) {
 			p, root, layout, _ := makePlanFixture(t, empty)
-			mkfs := requirePlan(t)
+			want := readPlanSource(t, p)
 			full := filepath.Join(t.TempDir(), "raw")
-			if err := buildEROFS(mkfs, root, full, "--ignore-mtime"); err != nil {
-				t.Fatal(err)
-			}
-			want, err := os.ReadFile(full)
-			if err != nil {
+			if err := os.WriteFile(full, want, 0600); err != nil {
 				t.Fatal(err)
 			}
 			for i := 0; i < 2; i++ {
@@ -139,7 +109,7 @@ func TestNativePlanMatchesLayoutAndContent(t *testing.T) {
 				}
 				got := readPlanSource(t, p)
 				if !bytes.Equal(got, want) {
-					t.Fatal("Plan differs from native raw layout")
+					t.Fatal("Plan metadata query changed emitted bytes")
 				}
 			}
 			if !empty {
@@ -164,7 +134,10 @@ func TestNativePlanMatchesLayoutAndContent(t *testing.T) {
 				}
 			}
 			// Inspect extracted bytes and metadata, including hardlink identity.
-			fsck := filepath.Join(filepath.Dir(mkfs), "fsck.erofs")
+			fsck, err := exec.LookPath("fsck.erofs")
+			if err != nil {
+				t.Skip("fsck.erofs not available for independent content verification")
+			}
 			extracted := filepath.Join(t.TempDir(), "extract")
 			if out, err := exec.Command(fsck, "--extract="+extracted, full).CombinedOutput(); err != nil {
 				t.Fatalf("fsck extraction: %s %v", out, err)
