@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: []
 # store-ctl(obs backend) ↔ real S3-compatible OBS round-trip.
 #
 # This case is opt-in by selection. Once selected, missing credentials,
