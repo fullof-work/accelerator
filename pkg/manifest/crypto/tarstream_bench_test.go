@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -232,6 +233,38 @@ func BenchmarkPresenceTarStream(b *testing.B) {
 					}
 				}
 				b.ReportMetric(float64(wire.Len()), "carrier-B")
+			})
+			b.Run(label+"/retained-open", func(b *testing.B) {
+				var wire bytes.Buffer
+				if _, _, err := tarstream.WriteTo(context.Background(), &wire, "disk", src, writeOpts...); err != nil {
+					b.Fatal(err)
+				}
+				// Keep the wire bytes outside the measured heap delta. This measures
+				// live reader/index state, including codec state, rather than all
+				// transient parser allocations reported by the open benchmark.
+				const readers = 128
+				var retained int64
+				b.ResetTimer()
+				for range b.N {
+					var sources [readers]sparse.Source
+					var before, after runtime.MemStats
+					runtime.GC()
+					runtime.ReadMemStats(&before)
+					for i := range sources {
+						s, _, err := tarstream.SourceAt(bytes.NewReader(wire.Bytes()), int64(wire.Len()), "", readOpts...)
+						if err != nil {
+							b.Fatal(err)
+						}
+						sources[i] = s
+					}
+					runtime.GC()
+					runtime.ReadMemStats(&after)
+					retained += int64(after.HeapAlloc) - int64(before.HeapAlloc)
+					runtime.KeepAlive(sources)
+				}
+				b.StopTimer()
+				runtime.KeepAlive(wire)
+				b.ReportMetric(float64(retained)/float64(b.N*readers), "retained-reader-B")
 			})
 		}
 	}
