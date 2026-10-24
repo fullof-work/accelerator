@@ -103,7 +103,9 @@ and open allocations including indexes and authentication scratch; the prebuilt
 wire buffer is excluded from open allocations. Apply the same benchmark source
 to the previous implementation and run at least three paired rounds. Zero-free
 carriers pay the bitmap overhead; all-Zero carriers save almost all wire bytes but
-still pay linear hashing cost, including validation at a no-Data open. These
+still pay linear hashing cost, including validation when the sequential reader
+opens a stream with no Data. Random opening retains its partial verification
+boundary. These
 measurements do not imply constant-time identity or a disk-I/O throughput claim.
 
 ## 2. Multi-Manifest Bundle carrier
