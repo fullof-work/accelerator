@@ -92,18 +92,18 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 | 持久缓存发布与所有权 | `pkg/remote/prepare_linux.go`、`prefetch_linux.go`、cache/GC | 未验证 EOF 不能命中；显式字节预算、bypass、当前层优先、重复摘要、并发 GC lease 和等待完成的取消。转换政策测试拒绝旧转换命中，同时保留显式旧工件读取。 |
 | 稳定选集与自有资源清理 | `pkg/flatten/prepared_linux.go`、`selection_linux.go` | 容忍 atime/排除子树变化，检测纳入元数据变化；apply/output 真实 ENOSPC、bind/output 别名、保留原文件及 UID/GID/rwx/访问 ACL、继承目录 GID、特权空根 chmod、粘滞目录替换权限的提前检查、EMFILE 清理、拒绝预留文件与目录替换、只读私有目录树清理且不跟随外部符号链接，以及打开/已删除 FD 检查。 |
 
-`PlanLimits.NativeMemoryBytes` 保留公开字段名和 512 MiB 默认值，现在约束 Go
-规划的受控分配。两份等额预算分别容纳来源/去重表及 go-erofs 布局结构，并计入
-容量增长时新旧存储并存的开销。`PlanBytes` 仍默认为 512 MiB，计入全部实际写入的
-元数据、来源记录和块记录。`IndexMemoryBytes` 仍默认为 128 MiB，保留选集、reader
-和 writer 的预算份额。释放的引用由 Go 回收；这些限额不等于进程 RSS 上限。
+`LayerLimits.MetadataBytes` 和三个 `PlanLimits` 字段改为显式启用的准入配额。
+零值不再隐式施加原先 128 MiB 层估算或 512/512/128 MiB 规划/计划/索引默认值。
+内部将零值计划配额归一化为受检查的整数/分配表示上限，不会预先分配相应大小。
+原先的一百万来源上限改为可寻址来源切片边界；生产端和读取端继续检查字节数、
+整数溢出和格式。显式正值保留原有保守计费及阶段份额，包括选集累计计费和表扩容
+重叠。不新增 umoci 路径镜像表或选集生命周期计费模型。
 
-`LayerLimits.MetadataBytes` 改为显式启用：零值关闭额外的累计元数据准入限额，
-不再隐式施加 128 MiB 上限。显式正值保留现有保守计费；解码、输入完整性和路径
-检查不变。Builder 执行资源仍是内存边界；独立调用方须自行约束执行环境。
-选集在 frame 和目录索引生命周期结束时归还额度，仍保留活动祖先目录索引及
-已发现输出别名的计费。回归覆盖默认重复条目准入、显式超限拒绝、兄弟子树复用、
-宽/深结构超限及输出别名。
+回归跨越原先 6 GiB 唯一块及来源索引门槛，验证显式配额拒绝，并覆盖来源计数/
+费用溢出和计划损坏。源变化、路径、摘要、解码器、归档及工件完整性检查保持不变。
+Builder Guest/执行资源仍是外层内存边界；独立调用方必须自行约束执行环境。
+这些估算不是总 RSS 限额，零配额也不保证任意大输入都能完成。
+固定跨架构 golden 包含 tarstream 格式变更引入的 presence 载体。
 
 payload 记录按来源首次出现顺序写入既有 KERPLAN v1 文件，不创建完整数据 blob
 或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`；旧转换

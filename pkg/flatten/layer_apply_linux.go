@@ -43,7 +43,8 @@ func applyVerifiedLayer(ctx context.Context, in LayerInput, root string, limits 
 // filesystems without xattr support. All filesystem application semantics stay
 // in umoci; no CLI, CAS, bundle or rootless ownership mapping is used.
 func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) error {
-	// archive/tar bounds each extended-header body to 1 MiB. Reserve space
+	// archive/tar bounds each extended-header body to 1 MiB. When a quota is
+	// requested, reserve space
 	// for parsing that body, its strings/maps and the extractor itself before
 	// asking for a header, rather than accounting only after allocation.
 	limited := budget != 0

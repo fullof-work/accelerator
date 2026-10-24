@@ -434,7 +434,9 @@ func TestGoPlannerCrossArchitectureGolden(t *testing.T) {
 	if _, _, err := p.WriteArtifact(context.Background(), &artifact, "image"); err != nil {
 		t.Fatal(err)
 	}
-	const want = "53497f42d28f1697238d70a3bdd227b740875308831a108cad52bd5009927f16"
+	// The presence carrier introduced in #186 changes the envelope, not the
+	// EROFS payload. This exact digest also matches guest-runtime's native test.
+	const want = "6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca"
 	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
 		t.Fatalf("fixed Go EROFS artifact changed on %s: got %s, want %s", runtime.GOARCH, got, want)
 	}
