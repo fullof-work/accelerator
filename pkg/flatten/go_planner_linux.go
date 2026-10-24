@@ -471,7 +471,7 @@ func (g *goPlanner) hashRange(start, end int) {
 }
 
 func (g *goPlanner) addSource(rel string, id fileIdentity) error {
-	if !validPlanPath(rel) || len(rel) > 4096 || g.sourceCount >= 1000000 {
+	if !validPlanPath(rel) || len(rel) > 4096 || g.sourceCount >= maxPlanSources {
 		return fmt.Errorf("flatten: invalid planned source")
 	}
 	n := uint64(80 + len(rel))
@@ -480,7 +480,11 @@ func (g *goPlanner) addSource(rel string, id fileIdentity) error {
 	}
 	// Match the eventual reader's admission before growing the on-disk index.
 	count, bytes := g.sourceCount+1, g.sourceBytes+n
-	if 2*bytes+count*256+2*planReadBatch > g.limits.IndexMemoryBytes/2 {
+	indexLimit := g.limits.IndexMemoryBytes / 2
+	// Bound each term before multiplication now that source count has no
+	// arbitrary million-entry cap. These match openPlan's pre-allocation checks.
+	if bytes > indexLimit/2 || count > indexLimit/256 ||
+		2*bytes+count*256+2*planReadBatch > indexLimit {
 		return fmt.Errorf("flatten: plan index memory budget exceeded")
 	}
 	var b [80]byte

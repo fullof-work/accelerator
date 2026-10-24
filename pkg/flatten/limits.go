@@ -32,7 +32,9 @@ func (l ArchiveLimits) defaults() (ArchiveLimits, error) {
 // PlanLimits bounds controlled planning allocations, on-disk metadata, and
 // reader/writer indexes independently. Planning drops its indexes before emission;
 // Go GC and allocator overhead are process-wide and are not an RSS guarantee.
-// Zero fields select the documented defaults; exceeding a limit fails closed.
+// Zero fields impose no extra admission quota; normalization retains only safe
+// integer/allocation ceilings for the existing checked accounting. Positive
+// values remain opt-in quotas. Callers must bound the execution environment.
 type PlanLimits struct {
 	// NativeMemoryBytes retains its name for compatibility. Half admits Go
 	// source/dedup indexes and half admits go-erofs metadata/layout allocations.
@@ -43,13 +45,15 @@ type PlanLimits struct {
 
 func (l PlanLimits) defaults() (PlanLimits, error) {
 	if l.NativeMemoryBytes == 0 {
-		l.NativeMemoryBytes = 512 << 20
+		l.NativeMemoryBytes = uint64(math.MaxInt)
 	}
 	if l.PlanBytes == 0 {
-		l.PlanBytes = 512 << 20
+		l.PlanBytes = math.MaxInt64
 	}
 	if l.IndexMemoryBytes == 0 {
-		l.IndexMemoryBytes = 128 << 20
+		// Leave headroom for shares, source-count charges and growth arithmetic.
+		// This is a representation ceiling, not a workload-size policy.
+		l.IndexMemoryBytes = uint64(math.MaxInt) / 4
 	}
 	if l.NativeMemoryBytes < 16<<20 || l.NativeMemoryBytes > math.MaxInt64 || l.PlanBytes < 192 || l.PlanBytes > math.MaxInt64 || l.IndexMemoryBytes < 4<<20 || l.IndexMemoryBytes > math.MaxInt64/4 {
 		return l, fmt.Errorf("flatten: invalid plan budgets")

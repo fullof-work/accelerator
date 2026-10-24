@@ -170,7 +170,7 @@ func TestGoPlanMatchesLayoutAndContent(t *testing.T) {
 func TestPlanRejectsCorruptionAndBounds(t *testing.T) {
 	p, root, layout, name := makePlanFixture(t, false)
 	_ = p
-	for _, kind := range []string{"version", "features", "reserved", "overflow", "overlap", "source", "padding", "truncated-record", "truncated-layout", "source-path", "digest", "budget"} {
+	for _, kind := range []string{"version", "features", "reserved", "overflow", "overlap", "source", "padding", "truncated-record", "truncated-layout", "source-path", "source-count-overflow", "digest", "budget"} {
 		t.Run(kind, func(t *testing.T) {
 			work := t.TempDir()
 			dest := filepath.Join(work, "plan")
@@ -209,6 +209,8 @@ func TestPlanRejectsCorruptionAndBounds(t *testing.T) {
 				if err := os.Truncate(lay, 1); err != nil {
 					t.Fatal(err)
 				}
+			case "source-count-overflow":
+				binary.LittleEndian.PutUint64(h[56:], maxPlanSources+1)
 			case "source-path":
 				sources[80] = '/'
 			case "digest":

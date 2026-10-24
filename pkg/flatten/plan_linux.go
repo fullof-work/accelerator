@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
@@ -56,6 +57,11 @@ type planFile struct {
 	name string
 	id   fileIdentity
 }
+
+// The source table must fit an addressable Go slice. Do not add a separate
+// arbitrary file-count limit below the byte and representation checks.
+const maxPlanSources = uint64(math.MaxInt) / uint64(unsafe.Sizeof(planFile{}))
+
 type chunkRecord struct {
 	source, offset uint64
 	length         uint32
@@ -116,7 +122,7 @@ func openPlan(ctx context.Context, root, layout, name string, limits PlanLimits)
 	if p.size == 0 || p.size > math.MaxInt64 || p.size%planBlockSize != 0 ||
 		p.dataStart > p.size || p.dataStart%planBlockSize != 0 || p.dataLength > p.size-p.dataStart ||
 		p.count > math.MaxInt64/planBlockSize || p.dataLength != p.count*planBlockSize ||
-		recordBytes != p.count*planRecordSize || fileCount > 1000000 || fileCount > sourceBytes/81 ||
+		recordBytes != p.count*planRecordSize || fileCount > maxPlanSources || fileCount > sourceBytes/81 ||
 		sourceBytes > limits.PlanBytes || recordBytes > limits.PlanBytes-sourceBytes ||
 		planHeaderSize > limits.PlanBytes-sourceBytes-recordBytes ||
 		p.size-p.dataLength > limits.PlanBytes-sourceBytes-recordBytes-planHeaderSize {

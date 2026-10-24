@@ -38,11 +38,14 @@ type LayerCompletion interface {
 	CompleteLayer(verified bool) error
 }
 
-// LayerLimits bound decoding and the layer applier's in-memory path bookkeeping.
-// Zero fields select defaults. Limits are per layer; layers are applied serially.
+// LayerLimits bound decoding and optionally the layer applier's metadata work.
+// Limits are per layer; layers are applied serially.
 type LayerLimits struct {
-	DecodedBytes  int64
-	DecoderBytes  int64
+	DecodedBytes int64 // Zero selects the default decoded-byte limit.
+	DecoderBytes int64 // Zero selects the default decoder-memory limit.
+	// MetadataBytes is an opt-in cumulative metadata estimate, not a heap/RSS
+	// limit. Zero disables this extra admission limit; callers must bound the
+	// execution environment's memory. Positive values keep the legacy estimate.
 	MetadataBytes int64
 }
 
@@ -53,10 +56,7 @@ func (l LayerLimits) normalized() (LayerLimits, error) {
 	if l.DecoderBytes == 0 {
 		l.DecoderBytes = 64 << 20
 	}
-	if l.MetadataBytes == 0 {
-		l.MetadataBytes = 128 << 20
-	}
-	if l.DecodedBytes < 1 || l.DecoderBytes < 1<<20 || l.MetadataBytes < 1 {
+	if l.DecodedBytes < 1 || l.DecoderBytes < 1<<20 || l.MetadataBytes < 0 {
 		return l, errors.New("flatten: invalid layer limits")
 	}
 	return l, nil

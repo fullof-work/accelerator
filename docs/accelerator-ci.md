@@ -105,13 +105,25 @@ Production planning and Plan test fixtures use the fixed external `github.com/ku
 | Persistent cache publication and ownership | `pkg/remote/prepare_linux.go`, `prefetch_linux.go`, cache/GC | Unverified EOF is not a hit; explicit byte budget, bypass, current-layer priority, duplicates, concurrent GC leases and joined cancellation. Conversion-policy tests retain explicit old-artifact reading while rejecting stale conversion hits. |
 | Stable selection and owned cleanup | `pkg/flatten/prepared_linux.go`, `selection_linux.go` | Atime/excluded-child tolerance, included metadata changes, actual ENOSPC during apply/output, bind/output aliases, previous-file/UID/GID/rwx/access-ACL preservation, inherited directory GID, privileged empty-root chmod, fail-fast sticky-directory replacement permissions, EMFILE cleanup, reserved-file and directory substitution rejection, read-only private-tree cleanup without following external symlinks, and open/deleted FD checks. |
 
-`PlanLimits.NativeMemoryBytes` keeps its public name and 512 MiB default, but
-now bounds controlled Go planning allocations. Its two equal shares admit the
-source/dedup tables and go-erofs layout structures respectively, including
-capacity-growth overlap. `PlanBytes` still defaults to 512 MiB and accounts for
-all materialized metadata, source records and chunk records. `IndexMemoryBytes`
-still defaults to 128 MiB and retains the selection, reader and writer shares.
-Released references are reclaimed by Go; these limits do not bound total RSS.
+`LayerLimits.MetadataBytes` and the three `PlanLimits` fields are opt-in
+admission quotas. Zero no longer imposes the former 128 MiB layer estimate or
+512/512/128 MiB planning/plan/index defaults. Internally, zero-valued plan quotas
+normalize to checked integer/allocation ceilings, without allocating those
+amounts. The former one-million-source cap is replaced by the addressable source
+slice bound; both producer and reader still enforce byte, overflow and format
+checks. Explicit positive quotas retain the existing conservative accounting and
+phase shares, including cumulative selection charges and table-growth overlap.
+No duplicate umoci path table or new selection-lifetime model is introduced.
+
+Regressions cross the former 6 GiB unique-block and source-index thresholds,
+check opt-in rejection, and exercise source-count/charge overflow and corrupt
+plans. Source mutation, path, digest, decoder, archive and artifact-integrity
+checks remain unchanged. Builder guest/execution resources remain the outer
+memory boundary; standalone callers must bound their own execution environment.
+These estimates are not total RSS limits, and zero quotas do not guarantee that
+arbitrarily large input will complete. The fixed cross-architecture golden
+includes the presence carrier introduced by the tarstream format change.
+
 All payload records remain in first-seen source order and are streamed to the
 existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
 Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`; older conversion
