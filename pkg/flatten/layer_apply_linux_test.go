@@ -167,3 +167,61 @@ func TestUmociEmptyLayerAndMetadataBudget(t *testing.T) {
 		t.Fatal("body leaked on budget error")
 	}
 }
+
+// Repeated directory headers have bounded retained state, but their old
+// cumulative charge exceeded the implicit 128 MiB limit. Builders must not
+// require a private library knob to admit this otherwise valid input.
+func TestUmociDefaultMetadataBudgetDoesNotRejectRepeatedEntries(t *testing.T) {
+	name := strings.Repeat("d/", 64) + "leaf"
+	entries := make([]layerEntry, 6000, 6001)
+	for i := range entries {
+		entries[i] = layerEntry{name: name, kind: tar.TypeDir, mode: 0755}
+	}
+	entries = append(entries, layerEntry{name: "complete", body: "payload"})
+	b := testLayerTar(t, entries...)
+	for _, tc := range []struct {
+		name      string
+		budget    int64
+		wantError bool
+	}{
+		{"default", 0, false},
+		{"explicit", 128 << 20, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			body := &observedBody{Reader: bytes.NewReader(b)}
+			err := applyVerifiedLayer(context.Background(), streamInput(b, b, "application/vnd.oci.image.layer.v1.tar", body), root, LayerLimits{MetadataBytes: tc.budget})
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "metadata budget exceeded") {
+					t.Fatalf("explicit limit: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(root, "complete")); !os.IsNotExist(err) {
+					t.Fatalf("entry beyond explicit budget was applied: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertLayerFile(t, root, "complete", "payload")
+			}
+			if body.closed.Load() != 1 {
+				t.Fatal("body close count")
+			}
+		})
+	}
+}
+
+func TestLayerMetadataBudgetNormalization(t *testing.T) {
+	for _, n := range []int64{0, 128 << 20, 512 << 20} {
+		got, err := (LayerLimits{MetadataBytes: n}).normalized()
+		if err != nil || got.MetadataBytes != n {
+			t.Fatalf("metadata %d: got %d, %v", n, got.MetadataBytes, err)
+		}
+		if got.DecodedBytes != 128<<30 || got.DecoderBytes != 64<<20 {
+			t.Fatalf("unrelated layer limits changed: %+v", got)
+		}
+	}
+	if _, err := (LayerLimits{MetadataBytes: -1}).normalized(); err == nil {
+		t.Fatal("negative explicit metadata limit accepted")
+	}
+}

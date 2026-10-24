@@ -79,6 +79,9 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 		return fmt.Errorf("flatten: source selection budget exceeded")
 	}
 	*remaining -= charge
+	// Frames are temporary: completed siblings must not keep consuming the
+	// live traversal budget. A discovered output alias retains this charge.
+	defer func() { *remaining += charge }()
 	name := filepath.Join(s.root, rel)
 	var st unix.Stat_t
 	if err := unix.Lstat(name, &st); err != nil {
@@ -101,6 +104,7 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 			}
 			if match {
 				s.excludes = dedupeSorted(append(s.excludes, rel))
+				charge = 0 // The alias remains in excludes after this frame returns.
 				return nil
 			}
 		}
@@ -141,6 +145,9 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 		return err
 	}
 	var entries []string
+	var directoryCharge uint64
+	// Keep the entire directory index charged while recursing into children.
+	defer func() { *remaining += directoryCharge }()
 	for {
 		batch, e := d.ReadDir(256)
 		for _, entry := range batch {
@@ -155,6 +162,7 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 				return fmt.Errorf("flatten: directory index budget exceeded")
 			}
 			*remaining -= cost
+			directoryCharge += cost
 			entries = append(entries, entry.Name())
 		}
 		if e == io.EOF {

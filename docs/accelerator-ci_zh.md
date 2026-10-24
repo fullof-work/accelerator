@@ -97,6 +97,14 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 容量增长时新旧存储并存的开销。`PlanBytes` 仍默认为 512 MiB，计入全部实际写入的
 元数据、来源记录和块记录。`IndexMemoryBytes` 仍默认为 128 MiB，保留选集、reader
 和 writer 的预算份额。释放的引用由 Go 回收；这些限额不等于进程 RSS 上限。
+
+`LayerLimits.MetadataBytes` 改为显式启用：零值关闭额外的累计元数据准入限额，
+不再隐式施加 128 MiB 上限。显式正值保留现有保守计费；解码、输入完整性和路径
+检查不变。Builder 执行资源仍是内存边界；独立调用方须自行约束执行环境。
+选集在 frame 和目录索引生命周期结束时归还额度，仍保留活动祖先目录索引及
+已发现输出别名的计费。回归覆盖默认重复条目准入、显式超限拒绝、兄弟子树复用、
+宽/深结构超限及输出别名。
+
 payload 记录按来源首次出现顺序写入既有 KERPLAN v1 文件，不创建完整数据 blob
 或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`；旧转换
 结果视作 miss，显式指定的旧工件仍可读取。

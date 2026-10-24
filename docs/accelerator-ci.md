@@ -112,6 +112,16 @@ capacity-growth overlap. `PlanBytes` still defaults to 512 MiB and accounts for
 all materialized metadata, source records and chunk records. `IndexMemoryBytes`
 still defaults to 128 MiB and retains the selection, reader and writer shares.
 Released references are reclaimed by Go; these limits do not bound total RSS.
+
+`LayerLimits.MetadataBytes` is now opt-in: zero disables the extra cumulative
+metadata admission limit rather than imposing 128 MiB. Explicit positive limits
+retain the existing conservative accounting; decoder, input-integrity and path
+checks are unchanged. Builder execution resources remain the memory boundary;
+standalone callers must provide their own execution limits. Selection refunds
+completed frames and directory indexes, but retains active ancestor indexes and
+discovered output-alias charges. Regressions cover default repeated-entry
+admission, explicit rejection, sibling reuse, wide/deep exhaustion and aliases.
+
 All payload records remain in first-seen source order and are streamed to the
 existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
 Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`; older conversion

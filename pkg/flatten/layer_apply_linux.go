@@ -46,10 +46,13 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 	// archive/tar bounds each extended-header body to 1 MiB. Reserve space
 	// for parsing that body, its strings/maps and the extractor itself before
 	// asking for a header, rather than accounting only after allocation.
-	if budget < 8<<20 {
-		return errors.New("flatten: layer metadata budget must be at least 8 MiB")
+	limited := budget != 0
+	if limited {
+		if budget < 8<<20 {
+			return errors.New("flatten: layer metadata budget must be at least 8 MiB")
+		}
+		budget -= 8 << 20
 	}
-	budget -= 8 << 20
 	te := layer.NewTarExtractor(&layer.UnpackOptions{OnDiskFormat: layer.DirRootfs{}})
 	tr := tar.NewReader(r)
 	for {
@@ -71,20 +74,22 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 				return err
 			}
 		}
-		// Charge every entry and ancestor, including duplicates. This is a
-		// conservative bound on umoci's upperPaths and temporary path storage,
-		// without building another full path set in the adapter.
-		charge := int64(2048 + len(hdr.Name) + len(hdr.Linkname))
-		for p := path.Clean(hdr.Name); p != "."; p = path.Dir(p) {
-			charge += int64(256 + 2*len(p))
+		if limited {
+			// Charge every entry and ancestor, including duplicates. This is a
+			// conservative bound on umoci's upperPaths and temporary path storage,
+			// without building another full path set in the adapter.
+			charge := int64(2048 + len(hdr.Name) + len(hdr.Linkname))
+			for p := path.Clean(hdr.Name); p != "."; p = path.Dir(p) {
+				charge += int64(256 + 2*len(p))
+			}
+			for k, v := range hdr.PAXRecords {
+				charge += int64(256 + 2*len(k) + 2*len(v))
+			}
+			if charge > budget {
+				return errors.New("flatten: layer metadata budget exceeded")
+			}
+			budget -= charge
 		}
-		for k, v := range hdr.PAXRecords {
-			charge += int64(256 + 2*len(k) + 2*len(v))
-		}
-		if charge > budget {
-			return errors.New("flatten: layer metadata budget exceeded")
-		}
-		budget -= charge
 		if err := te.UnpackEntry(root, hdr, tr); err != nil {
 			return fmt.Errorf("flatten: umoci unpack %q: %w", hdr.Name, err)
 		}
