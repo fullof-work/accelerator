@@ -225,7 +225,7 @@ func TestProbeHoles(t *testing.T) {
 
 func TestSourceContractZeroNeverFromStatic(t *testing.T) {
 	// Static and dense sources must never classify anything as Zero —
-	// Zero is a manifest-domain hint only.
+	// Static sources know only byte-level holes and do not scan Data for zeros.
 	const size = 1 << 16
 	src, err := NewSource(bytes.NewReader(image(size)), size, []Extent{{0, 4096}})
 	if err != nil {

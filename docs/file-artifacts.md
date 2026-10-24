@@ -40,6 +40,74 @@ Random artifact salt makes two writes of the same plaintext/customer key produce
 If a caller stops early, no full-validation conclusion applies to unread data. Publishing, uploading and converting paths must consume all Data extents and propagate terminal validation errors.
 
 
+### 1.1 Page presence and Zero transport
+
+A positive, 4 KiB-aligned payload of at most 32 GiB whose Hole boundaries are
+page-aligned can use the presence profile. Its order is:
+
+```text
+regular .kuasar.presence.v1
+payload with KUASAR.presence=1 and GNU sparse metadata
+existing .kuasar.digest.<plainDigest> marker
+two zero TAR trailer blocks
+```
+
+The internal presence entry is not a tail ZIP member. Its 64-byte little-endian
+header contains magic `KUPRES1\n` at 0, version 1 at 8, page size 4096 at 12,
+payload length at 16 and bitmap length at 24. Bytes 32–59 are zero. CRC32 at 60
+covers header bytes 0–59 followed by the bitmap; exactly ceil(pages/8) bitmap bytes
+follow the header. Unused bits and TAR padding must be zero. The bitmap excludes
+the dense metadata tail and uses at most 1 MiB net memory.
+
+P=0 means Hole; P=1 with no GNU sparse payload extent means Zero; P=1 with an
+extent means Data. Only actual Data and the dense tail are transported. All-Zero
+payloads still use GNU sparse metadata, without allocating a literal-zero payload.
+Partial-page Zero remains Data. Generic byte-granularity Hole sources retain the
+legacy encoding and exact hole boundaries. Ordinary all-zero Data is not detected
+or compressed. GNU tar extraction produces the correct logical bytes.
+
+Presence and its payload mark must occur exactly once and agree. Wrong version,
+geometry, checksum, unused bits, placement, duplicates, missing mark/entry or Data
+under P=0 are errors, never a reason to retry legacy parsing. Empty-name source
+selection skips the internal member. Ordinal APIs retain physical TAR-entry
+ordinals; selecting the payload attaches the preceding presence entry. `Holes`
+reports only P=0, not Zero. Old portable carriers remain readable.
+
+The identity domain and algorithm are unchanged. Payload commitment enumerates
+logical P=1 intervals and hashes Data plus synthesized Zero bytes. The writer
+counts and streams those intervals without another extent index. A legacy
+literal-zero carrier and its equivalent omitted-Zero carrier have the same logical
+identity, so existing content-addressed objects may be reused. Hashing Zero still
+requires CPU linear in its logical length; omission saves transport/allocation,
+not the work required by the existing identity algorithm.
+
+Presence bytes are inside authenticated records when encryption is enabled.
+Readers authenticate them before classifying ranges. Full sequential consumption
+verifies identity, padding, TAR end and outer EOF even with no Data, or trailing
+Zero/Hole. Fast random/partial access retains its existing limited verification
+scope. A one-record metadata window avoids repeated decryption during open and
+is released before returning the source; it does not cache later payload reads.
+
+The existing shared reader/writer extent limit remains `1<<20`, including the
+GNU sparse end sentinel and the final tail merge. Writers reject excess final
+extents before emitting any bytes (including an encrypted header) or reading Data.
+Presence planning is charged to the existing index budget before allocation;
+it adds no payload bitmap or prefix index. Expanding Zero to literal Data cannot
+be used to evade the limit. Tests and benchmark results must report index budget,
+logical bytes, transported bytes and identity CPU separately.
+
+`go test ./pkg/manifest/crypto -run '^$' -bench '^BenchmarkPresenceTarStream$' -benchtime=3x`
+compares 64 MiB logical sources with 0%, 50% and 100% Zero, in plaintext and AES.
+The 50% case alternates 1 MiB Data/Zero runs. It reports encoded bytes, write time,
+and open allocations including indexes and authentication scratch; the prebuilt
+wire buffer is excluded from open allocations. Apply the same benchmark source
+to the previous implementation and run at least three paired rounds. Zero-free
+carriers pay the bitmap overhead; all-Zero carriers save almost all wire bytes but
+still pay linear hashing cost, including validation when the sequential reader
+opens a stream with no Data. Random opening retains its partial verification
+boundary. These
+measurements do not imply constant-time identity or a disk-I/O throughput claim.
+
 ## 2. Multi-Manifest Bundle carrier
 
 Local Manifest snapshots use a standard ZIP container with ZIP64 support and a **mandatory tail index**. The current profile requires `bundle/index` directly: no legacy-format probing, unindexed compatibility or Central Directory fallback.

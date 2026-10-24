@@ -169,6 +169,10 @@ func TestStdlibOracle(t *testing.T) {
 	archive := mustWrite(t, "disk/img.raw", logical, holes)
 
 	tr := stdtar.NewReader(bytes.NewReader(archive))
+	internal, err := tr.Next()
+	if err != nil || internal.Name != presenceName {
+		t.Fatal("missing presence member", internal, err)
+	}
 	hdr, err := tr.Next()
 	if err != nil {
 		t.Fatal(err)
@@ -519,9 +523,8 @@ func (zeroRunSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, err
 	return len(buf), nil
 }
 
-// TestWriteToZeroRuns: Zero runs cross the boundary as data (literal
-// zero bytes on the wire), never as holes; only Hole runs land in the
-// sparse map.
+// TestWriteToZeroRuns: full Zero pages are omitted physically while keeping
+// their logical distinction from holes.
 func TestWriteToZeroRuns(t *testing.T) {
 	var buf bytes.Buffer
 	if _, _, err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
@@ -547,11 +550,16 @@ func TestWriteToZeroRuns(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Error("logical content mismatch (zeros must read back as data)")
 	}
-	// The zero run is stored on the wire: the packed entry must be at
-	// least 1 MiB (4K data + ~1M zeros), proving zeros were not
-	// encoded as holes.
-	if len(buf.Bytes()) < 1<<20 {
-		t.Errorf("archive only %d bytes: zero run was dropped from the wire", buf.Len())
+	if buf.Len() >= 32<<10 {
+		t.Fatalf("Zero payload was expanded: %d bytes", buf.Len())
+	}
+	source, _, err := SourceAt(bytes.NewReader(buf.Bytes()), int64(buf.Len()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := source.RunAt(4096, 1<<20)
+	if err != nil || run.Kind() != sparse.Zero || run.End() != 1<<20 {
+		t.Fatal("lost Zero run", run, err)
 	}
 }
 
@@ -967,7 +975,7 @@ func TestSourceAtRejectsInvalidDigestMarker(t *testing.T) {
 func TestReadSeekFromIndex(t *testing.T) {
 	logical, holes := fixture()
 
-	// [0]=dense "first", [1]=dir, [2]=dense "second", [3]=sparse img.
+	// [0]=first, [1]=dir, [2]=second, [3]=presence, [4]=sparse img.
 	var buf bytes.Buffer
 	tw := stdtar.NewWriter(&buf)
 	tw.WriteHeader(&stdtar.Header{Name: "first", Mode: 0o644, Size: 3})
@@ -995,11 +1003,11 @@ func TestReadSeekFromIndex(t *testing.T) {
 		names = append(names, hdr.Name)
 		count++
 	}
-	if count != 5 {
-		t.Fatalf("stdlib sees %d entries (%v), want 5", count, names)
+	if count != 6 {
+		t.Fatalf("stdlib sees %d entries (%v), want 6", count, names)
 	}
 
-	ts, err := ReadSeekFromIndex(bytes.NewReader(archive), 3)
+	ts, err := ReadSeekFromIndex(bytes.NewReader(archive), 4)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -66,14 +66,15 @@ func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
 	return v, nil
 }
 
-// SourceFrom locates the entry called name (empty: first regular file
+// SourceFrom locates the entry called name (empty: first user regular file
 // entry) and opens it as a sparse.Source — the pipeline-facing twin
-// of ReadFrom: RunAt serves the envelope's hole map (Hole/Data only,
-// never Zero), ReadAt the logical bytes. Over a plain reader the
+// of ReadFrom: RunAt serves Hole/Zero/Data from validated presence metadata,
+// or the exact legacy Hole/Data map. ReadAt returns logical bytes. Over a plain reader the
 // source is one-pass (monotone ReadAt), even when r also implements Seek. This
 // preserves the full-consumption boundary: the final Data read drains and
-// validates the marker, trailer, expected digest, and outer EOF. The entry's
-// name is returned alongside.
+// validates the marker, trailer, expected digest, and outer EOF, including a
+// trailing Zero/Hole region. With no Data this validation completes at open.
+// The entry's name is returned alongside.
 func SourceFrom(r io.Reader, name string, options ...ReadOption) (sparse.Source, string, error) {
 	opts, err := parseReadOptions(options)
 	if err != nil {
@@ -213,7 +214,16 @@ func sourceAtPlain(ra io.ReaderAt, size int64, name string) (result plainAtResul
 			retErr = readerr.Mark(retErr, false)
 		}
 	}()
-	sr := io.NewSectionReader(ra, 0, size)
+	// TAR parsing makes small reads within the same authenticated metadata
+	// record. Keep one record only while opening; payload reads retain their
+	// existing uncached ReaderAt contract.
+	metadata := ra
+	if records, ok := ra.(*recordReaderAt); ok {
+		window := &recordMetadataReader{records: records, index: ^uint64(0)}
+		defer clear(window.buffer[:])
+		metadata = window
+	}
+	sr := io.NewSectionReader(metadata, 0, size)
 	m, err := locate(sr, name, seekSkip(sr))
 	if err != nil {
 		return plainAtResult{}, err
@@ -228,7 +238,7 @@ func sourceAtPlain(ra io.ReaderAt, size int64, name string) (result plainAtResul
 		dataStart:    dataStart,
 		packedPrefix: packedPrefix(m.extents),
 	})
-	identity, ok, err := discoverDigest(ra, size, m, dataStart)
+	identity, ok, err := discoverDigest(metadata, size, m, dataStart)
 	if err != nil {
 		return plainAtResult{}, err
 	}
@@ -311,14 +321,20 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	marker, err := locateAt(markerReader, 0, seekSkip(markerReader))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
+			if first.presence != nil {
+				return zero, false, ErrInvalidCanonicalTarstream
+			}
 			return zero, false, nil
 		}
 		return zero, false, err
 	}
 	if !strings.HasPrefix(marker.name, DigestMarkerPrefix) {
+		if first.presence != nil {
+			return zero, false, ErrInvalidCanonicalTarstream
+		}
 		return zero, false, nil
 	}
-	if first.ordinal != 0 {
+	if first.ordinal != 0 && !(first.ordinal == 1 && first.presence != nil) {
 		return zero, false, fmt.Errorf("%w: payload must be the first archive entry", ErrInvalidCanonicalTarstream)
 	}
 	if marker.logical != 40 || marker.stored != 40 || marker.mapLen != 0 {
@@ -444,6 +460,7 @@ type meta struct {
 	payloadSize      int64
 	hasPayloadSize   bool
 	canonicalPayload bool
+	presence         []byte
 }
 
 // locate scans entries until it finds the one named want (empty: the
@@ -452,7 +469,7 @@ type meta struct {
 // advances r across unselected content.
 func locate(r io.Reader, want string, skip func(n int64) error) (*meta, error) {
 	want = normalizeName(want)
-	return locateMatch(r, skip, func(name string, _ int, regular bool) bool {
+	return locateMatch(r, skip, false, func(name string, _ int, regular bool) bool {
 		return name == want || (want == "" && regular)
 	})
 }
@@ -460,7 +477,7 @@ func locate(r io.Reader, want string, skip func(n int64) error) (*meta, error) {
 // locateAt scans entries until the index-th real entry (0-based; meta
 // entries are not counted — the same sequence archive/tar yields).
 func locateAt(r io.Reader, index int, skip func(n int64) error) (*meta, error) {
-	return locateMatch(r, skip, func(_ string, ordinal int, _ bool) bool {
+	return locateMatch(r, skip, true, func(_ string, ordinal int, _ bool) bool {
 		return ordinal == index
 	})
 }
@@ -468,7 +485,7 @@ func locateAt(r io.Reader, index int, skip func(n int64) error) (*meta, error) {
 // locateMatch is the scanning core behind locate/locateAt: match is
 // consulted once per real entry with its effective name, ordinal and
 // regular-ness; the first match must be a regular file.
-func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, ordinal int, regular bool) bool) (*meta, error) {
+func locateMatch(r io.Reader, skip func(n int64) error, includeInternal bool, match func(name string, ordinal int, regular bool) bool) (*meta, error) {
 	var blk [512]byte
 	pax := map[string]string{}
 	longName := ""
@@ -477,6 +494,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 	canonicalMeta := true
 	var paxHeader [512]byte
 	paxHeaderSeen := false
+	var pendingPresence []byte
+	var presencePayload uint64
+	seenPresence := false
 	for {
 		if _, err := readFixed(r, blk[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -486,6 +506,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		}
 		if isZeroBlock(blk[:]) {
 			if sawZero {
+				if pendingPresence != nil {
+					return nil, fmt.Errorf("%w: presence without payload", ErrInvalidCanonicalTarstream)
+				}
 				return nil, ErrNotFound // end of archive
 			}
 			sawZero = true
@@ -591,7 +614,33 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		regular := typeflag == '0' || typeflag == 0
 		matched := match(effName, ordinal, regular)
 		ordinal++
-		if !matched {
+		if effName == presenceName {
+			h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: stored, typeflag: '0'})
+			if seenPresence || !regular || !entryCanonicalMeta || entryPAXHeaderSeen || !bytes.Equal(blk[:], h[:]) {
+				return nil, fmt.Errorf("%w: duplicate or invalid presence header", ErrInvalidCanonicalTarstream)
+			}
+			seenPresence = true
+			pendingPresence, presencePayload, err = readPresence(r, stored)
+			if err != nil {
+				return nil, err
+			}
+			if matched && includeInternal {
+				// Index APIs follow archive/tar's physical entry ordinal. The
+				// internal member remains addressable after validation.
+				if err := skip(-((stored + 511) &^ 511)); err != nil {
+					return nil, err
+				}
+				return &meta{name: effName, ordinal: ordinal - 1, logical: stored, stored: stored, extents: []extent{{Size: stored}}}, nil
+			}
+			continue
+		}
+		mark, marked := entryPAX[presencePAX]
+		if marked && (mark != "1" || pendingPresence == nil) || !marked && pendingPresence != nil {
+			return nil, fmt.Errorf("%w: presence marker mismatch", ErrInvalidCanonicalTarstream)
+		}
+		entryPresence := pendingPresence
+		pendingPresence = nil
+		if !matched && entryPresence == nil {
 			if err := skip((stored + 511) &^ 511); err != nil {
 				return nil, err
 			}
@@ -608,6 +657,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		}
 
 		payloadValue, hasPayloadSize := entryPAX[payloadSizePAX]
+		if entryPresence != nil && (!hasPayloadSize || entryPAX["GNU.sparse.major"] != "1" || entryPAX["GNU.sparse.minor"] != "0") {
+			return nil, ErrInvalidCanonicalTarstream
+		}
 		if entryPAX["GNU.sparse.major"] == "1" && entryPAX["GNU.sparse.minor"] == "0" {
 			realsize, err := strconv.ParseInt(entryPAX["GNU.sparse.realsize"], 10, 64)
 			if err != nil {
@@ -637,7 +689,24 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			if err != nil {
 				return nil, err
 			}
-			holes := extentsToHoles(realsize, extents)
+			if entryPresence != nil {
+				if uint64(payloadSize) != presencePayload || !entryCanonicalMeta || !entryPAXHeaderSeen || !canonicalPayloadHeaders(blk[:], entryPAXHeader[:], entryPAX, effName, realsize, stored, payloadSize, true) {
+					return nil, ErrInvalidCanonicalTarstream
+				}
+				if err := validatePresenceExtents(entryPresence, presencePayload, extents); err != nil {
+					return nil, err
+				}
+			}
+			var holes []sparse.Extent
+			if entryPresence == nil {
+				holes = extentsToHoles(realsize, extents)
+			}
+			if !matched {
+				if err := skip(((stored + 511) &^ 511) - mapLen); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			return &meta{
 				name:        effName,
 				ordinal:     ordinal - 1,
@@ -646,8 +715,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 				mapLen:      mapLen,
 				extents:     extents,
 				holes:       holes,
+				presence:    entryPresence,
 				payloadSize: payloadSize, hasPayloadSize: hasPayloadSize,
-				canonicalPayload: entryCanonicalMeta && entryPAXHeaderSeen && len(holes) > 0 &&
+				canonicalPayload: entryCanonicalMeta && entryPAXHeaderSeen && (entryPresence != nil || len(holes) > 0) &&
 					canonicalPayloadHeaders(blk[:], entryPAXHeader[:], entryPAX, effName, realsize, stored, payloadSize, true),
 			}, nil
 		}
@@ -674,7 +744,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 // size, extents, and bytes; this check prevents uncommitted tar ownership or
 // permission metadata from changing extraction semantics under that identity.
 func canonicalPayloadHeaders(block, paxBlock []byte, paxRecords map[string]string, name string, logical, stored, payloadSize int64, sparseEncoding bool) bool {
-	want := makePayloadHeaders(name, logical, stored, payloadSize, sparseEncoding)
+	want := makePayloadHeaders(name, logical, stored, payloadSize, sparseEncoding, paxRecords[presencePAX] == "1")
 	return maps.Equal(paxRecords, want.records) &&
 		bytes.Equal(paxBlock, want.paxHeader[:]) && bytes.Equal(block, want.payloadHeader[:])
 }
@@ -724,7 +794,7 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if count > 1<<20 {
+	if count > maxSparseExtents {
 		return nil, 0, readerr.Mark(fmt.Errorf("tarstream: absurd sparse extent count %d", count), false)
 	}
 	var extents []extent
@@ -849,7 +919,7 @@ type seqView struct {
 
 func (v *seqView) Name() string           { return v.meta.name }
 func (v *seqView) Size() int64            { return v.logical }
-func (v *seqView) Holes() []sparse.Extent { return append([]sparse.Extent(nil), v.holes...) }
+func (v *seqView) Holes() []sparse.Extent { return v.meta.logicalHoles() }
 
 func (v *seqView) Read(p []byte) (int, error) {
 	if v.finalErr != nil {
@@ -923,7 +993,7 @@ type seekView struct {
 
 func (v *seekView) Name() string           { return v.meta.name }
 func (v *seekView) Size() int64            { return v.logical }
-func (v *seekView) Holes() []sparse.Extent { return append([]sparse.Extent(nil), v.holes...) }
+func (v *seekView) Holes() []sparse.Extent { return v.meta.logicalHoles() }
 
 func (v *seekView) Seek(offset int64, whence int) (int64, error) {
 	var base int64
@@ -1039,22 +1109,28 @@ func (m *meta) runAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 		limEnd = size
 	}
 	idx := m.extentAt(offset)
-	if idx == len(m.extents) {
-		return sparse.Hole, limEnd, nil // trailing hole
-	}
-	e := m.extents[idx]
-	if offset < uint64(e.Offset) { // gap before the extent
-		end := uint64(e.Offset)
-		if end > limEnd {
-			end = limEnd
+	kind := sparse.Hole
+	end := limEnd
+	if idx < len(m.extents) {
+		e := m.extents[idx]
+		if offset < uint64(e.Offset) {
+			end = min(end, uint64(e.Offset))
+		} else {
+			kind = sparse.Data
+			end = min(end, uint64(e.Offset+e.Size))
 		}
-		return sparse.Hole, end, nil
 	}
-	end := uint64(e.Offset + e.Size)
-	if end > limEnd {
-		end = limEnd
+	if m.presence != nil && offset < uint64(m.payloadSize) {
+		pages := min(uint64(m.payloadSize)/presencePage, (end+presencePage-1)/presencePage)
+		page := offset / presencePage
+		end = min(end, presenceRunEnd(m.presence, page, pages)*presencePage)
+		if !presenceBit(m.presence, page) {
+			kind = sparse.Hole
+		} else if kind != sparse.Data {
+			kind = sparse.Zero
+		}
 	}
-	return sparse.Data, end, nil
+	return kind, end, nil
 }
 
 // extentAt returns the index of the first extent that ends past

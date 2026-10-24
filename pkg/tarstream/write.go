@@ -17,10 +17,10 @@ import (
 
 // WriteTo packages src as a complete Kuasar tarstream artifact on w. The
 // sparse map comes from src.RunAt — Hole runs become the entry's
-// holes (costing nothing on the wire); Zero and Data runs are the
-// data extents, with Zero runs written as synthesized zero bytes
-// without calling ReadAt (zeros are data; only holes are absent). A
-// source with no holes is written as a plain entry. The metadata
+// holes. Page-representable payloads include a full presence bitmap and a
+// GNU sparse map of actual payload; whole Zero pages need no stored bytes.
+// Other sources retain byte-exact holes and synthesize Zero bytes without
+// calling ReadAt. Logical Zero always masks lower content. The metadata
 // sweep precedes any data read (sparse law 1), so one-pass sources
 // work. The plaintext envelope metadata is fixed and deterministic (mode 0644,
 // uid/gid 0, epoch mtime): the entry is a transport vessel, not a
@@ -83,6 +83,7 @@ type writePlan struct {
 	payloadSize    int64
 	payloadPacked  int64
 	payloadExtents []extent
+	presence       []byte
 }
 
 func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
@@ -97,7 +98,7 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 	if name == "" {
 		return nil, fmt.Errorf("tarstream: empty entry name")
 	}
-	if strings.HasPrefix(name, DigestMarkerPrefix) {
+	if strings.HasPrefix(name, DigestMarkerPrefix) || name == presenceName {
 		return nil, fmt.Errorf("tarstream: entry name %q uses reserved digest marker prefix", name)
 	}
 	if src.Size() > 1<<62 {
@@ -118,34 +119,74 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		return nil, err
 	}
 
-	// Metadata sweep: data extents = Zero|Data runs, merged across
-	// kind changes; holes are everything else.
+	payloadSize := size
+	if provider, ok := src.(IdentityProvider); ok {
+		declared, _, _ := provider.PayloadCommitment()
+		if declared > uint64(size) {
+			return nil, fmt.Errorf("tarstream: payload exceeds logical size")
+		}
+		payloadSize = int64(declared)
+	}
+	presence, err := planPresence(ctx, src, uint64(payloadSize), charge)
+	if err != nil {
+		return nil, err
+	}
+	// Only actual payload is indexed in the new encoding. The presence bitmap
+	// carries logical Zero; the business metadata tail remains dense.
 	var extents []extent
-	hasHole := false
+	hasHole := presence != nil
+	appendExtent := func(start, end uint64) error {
+		if end <= start {
+			return nil
+		}
+		if n := len(extents); n > 0 && extents[n-1].Offset+extents[n-1].Size == int64(start) {
+			extents[n-1].Size += int64(end - start)
+			return nil
+		}
+		if len(extents)+2 > maxSparseExtents {
+			return fmt.Errorf("tarstream: sparse extent limit exceeded (including sentinel)")
+		}
+		if err := charge(512); err != nil {
+			return err
+		}
+		extents = append(extents, extent{Offset: int64(start), Size: int64(end - start)})
+		return nil
+	}
 	for off := uint64(0); off < uint64(size); {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		run, err := src.RunAt(off, uint64(size)-off)
 		if err != nil {
-			return nil, fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
+			return nil, err
 		}
 		kind, end := run.Kind(), run.End()
 		if end <= off || end > uint64(size) {
-			return nil, fmt.Errorf("tarstream: %s: invalid run [%d,%d)", name, off, end)
+			return nil, fmt.Errorf("tarstream: invalid source run")
 		}
-		if kind != sparse.Hole && kind != sparse.Zero && kind != sparse.Data {
-			return nil, fmt.Errorf("tarstream: %s: invalid run kind %d @ %d", name, kind, off)
-		}
-		if kind == sparse.Hole {
+		switch kind {
+		case sparse.Hole:
 			hasHole = true
-		} else if n := len(extents); n > 0 && uint64(extents[n-1].Offset+extents[n-1].Size) == off {
-			extents[n-1].Size += int64(end - off)
-		} else {
-			if err := charge(512); err != nil {
+		case sparse.Data:
+			if err := appendExtent(off, end); err != nil {
 				return nil, err
 			}
-			extents = append(extents, extent{Offset: int64(off), Size: int64(end - off)})
+		case sparse.Zero:
+			// Omit only complete Zero pages before the independent dense tail.
+			zeroStart := (off + presencePage - 1) / presencePage * presencePage
+			zeroEnd := min(end, uint64(payloadSize)) / presencePage * presencePage
+			if presence != nil && zeroStart < zeroEnd {
+				if err := appendExtent(off, zeroStart); err != nil {
+					return nil, err
+				}
+				if err := appendExtent(zeroEnd, end); err != nil {
+					return nil, err
+				}
+			} else if err := appendExtent(off, end); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("tarstream: invalid source kind")
 		}
 		off = end
 	}
@@ -156,14 +197,7 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		}
 		dataSize += e.Size
 	}
-	payloadSize := size
-	if provider, ok := src.(IdentityProvider); ok {
-		declared, _, _ := provider.PayloadCommitment()
-		if declared > uint64(size) {
-			return nil, fmt.Errorf("tarstream: %s: payload size %d exceeds logical size %d", name, declared, size)
-		}
-		payloadSize = int64(declared)
-	}
+
 	payloadExtents, payloadPacked, tailDense := prefixExtents(extents, payloadSize, size)
 	if !tailDense {
 		return nil, fmt.Errorf("tarstream: %s: metadata tail [%d,%d) contains a hole", name, payloadSize, size)
@@ -202,7 +236,20 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		stored = int64(len(sparseMap)) + dataSize
 	}
 
-	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize)
+	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize, presence != nil)
+	if presence != nil {
+		body := presenceBody(presence, uint64(payloadSize))
+		h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: int64(len(body)), typeflag: '0'})
+		var full bytes.Buffer
+		full.Grow(512 + (len(body)+511)/512*512 + len(prefix))
+		full.Write(h[:])
+		full.Write(body)
+		if pad := (512 - len(body)%512) % 512; pad > 0 {
+			full.Write(zeroBlock[:pad])
+		}
+		full.Write(prefix)
+		prefix = full.Bytes()
+	}
 	payloadPad := int((512 - stored%512) % 512)
 	plaintextSize := int64(len(prefix)) + dataSize + int64(payloadPad) + canonicalSuffixSize
 	if plaintextSize < 0 || plaintextSize > 1<<62 {
@@ -222,13 +269,14 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		payloadSize:    payloadSize,
 		payloadPacked:  payloadPacked,
 		payloadExtents: payloadExtents,
+		presence:       presence,
 	}, nil
 }
 
 // payloadPrefix renders all canonical bytes before the packed payload. The
 // sparse map, when present, is part of this prefix.
-func payloadPrefix(name string, logical, stored int64, sparseMap []byte, payloadSize int64) []byte {
-	headers := makePayloadHeaders(name, logical, stored, payloadSize, sparseMap != nil)
+func payloadPrefix(name string, logical, stored int64, sparseMap []byte, payloadSize int64, presence bool) []byte {
+	headers := makePayloadHeaders(name, logical, stored, payloadSize, sparseMap != nil, presence)
 	var prefix bytes.Buffer
 	prefix.Write(headers.paxHeader[:])
 	prefix.Write(headers.pax)
@@ -251,12 +299,15 @@ type payloadHeaders struct {
 
 // makePayloadHeaders is the single canonical transport-header definition used
 // by both the encoder and the identity validator.
-func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseEncoding bool) payloadHeaders {
+func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseEncoding, presence bool) payloadHeaders {
 	ustarName := name
 	records := map[string]string{
 		"path":         name,
 		"size":         strconv.FormatInt(stored, 10),
 		payloadSizePAX: strconv.FormatInt(payloadSize, 10),
+	}
+	if presence {
+		records[presencePAX] = "1"
 	}
 	if sparseEncoding {
 		// GNU mangles the ustar name of sparse entries; readers recover the
@@ -287,7 +338,7 @@ func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseE
 // writer. Data extents are read once; Zero extents are synthesized.
 func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source, beforeCommit func(context.Context) error) ([32]byte, error) {
 	identity := newIdentityAccumulator(
-		uint64(plan.payloadSize), plan.payloadExtents, plan.payloadPacked, plan.logical-plan.payloadSize,
+		uint64(plan.payloadSize), plan.payloadExtents, plan.payloadPacked, plan.logical-plan.payloadSize, plan.presence, plan.extents,
 	)
 	if err := writeFull(w, plan.prefix); err != nil {
 		return [32]byte{}, err

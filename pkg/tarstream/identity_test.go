@@ -234,7 +234,7 @@ func (r *sparseArtifactReaderAt) ReadAt(buffer []byte, offset int64) (int, error
 
 func oversizedTailArtifact() (*sparseArtifactReaderAt, io.Reader) {
 	tailSize := int64(maxMetadataTailSize + 1)
-	prefix := payloadPrefix("snapshot", tailSize, tailSize, nil, 0)
+	prefix := payloadPrefix("snapshot", tailSize, tailSize, nil, 0, false)
 	padding := (512 - tailSize%512) % 512
 	digest := [32]byte{1}
 	marker := ustarBlock(rawHeader{
