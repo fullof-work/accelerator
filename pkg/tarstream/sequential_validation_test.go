@@ -25,9 +25,12 @@ func TestSequentialPlaintextFullValidation(t *testing.T) {
 	artifact := mustWrite(t, "image", body, nil)
 
 	tampered := append([]byte(nil), artifact...)
-	// Dense canonical payload begins after PAX, its padding, and the data
-	// header: 3 * 512 bytes.
-	tampered[1536] ^= 1
+	cursor := bytes.NewReader(artifact)
+	if _, err := locate(cursor, "image", seekSkip(cursor)); err != nil {
+		t.Fatal(err)
+	}
+	start, _ := cursor.Seek(0, io.SeekCurrent)
+	tampered[start] ^= 1
 	for _, test := range []struct {
 		name string
 		open func() (sparse.Source, string, error)

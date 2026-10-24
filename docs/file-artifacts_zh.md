@@ -66,6 +66,57 @@ expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读�
 路径必须消费全部 Data extents并传播终点错误。
 
 
+### 1.1 页 presence 与 Zero 传输
+
+逻辑 payload 为正数、4 KiB 对齐、不超过 32 GiB，且 Hole 边界均按页对齐时，可使用
+presence profile。顺序为：
+
+```text
+普通文件 .kuasar.presence.v1
+带 KUASAR.presence=1 和 GNU sparse 元数据的 payload
+原有 .kuasar.digest.<plainDigest> marker
+两个全零 TAR 尾块
+```
+
+内部 presence entry 不属于尾部 ZIP。64 字节 little-endian header 在偏移 0 保存
+`KUPRES1\n`，偏移 8 为版本 1，12 为页大小 4096，16 为 payload 长度，24 为位图长度。
+32–59 必须为零；60 处 CRC32 覆盖 header 的 0–59 字节及随后位图。Header 后紧接
+ceil(pages/8) 字节位图。未使用位及 TAR padding 必须为零。位图不包含 dense metadata
+tail，净内存最多 1 MiB。
+
+P=0 表示 Hole；P=1 且无 GNU sparse payload extent 表示 Zero；P=1 且有 extent
+表示 Data。传输只包含实际 Data 和 dense tail。全 Zero payload 仍使用 GNU sparse
+元数据，不分配字面零 payload。部分页 Zero 按 Data 处理。通用字节级 Hole 来源沿用
+旧编码并保留精确孔洞边界；普通全零 Data 不做探测或压缩。GNU tar 提取后的逻辑字节正确。
+
+Presence entry 与 payload mark 必须唯一且匹配。版本、几何、校验和、未使用位、位置
+错误、重复、缺少 mark/entry 或 P=0 下存在 Data 均报错，不能回退旧格式。空名称选择
+跳过内部成员；ordinal API 保留物理 TAR entry 序号，选中 payload 时附带读取其前置
+presence。`Holes` 只报告 P=0，不包含 Zero。旧便携 carrier 继续可读。
+
+身份域及算法不变。Payload commitment 枚举逻辑 P=1 区间，散列 Data 和合成的 Zero
+字节；writer 计数后流式遍历区间，不建立另一份 extent 索引。旧字面零 carrier 与等价
+的省略 Zero carrier 具有相同逻辑身份，可复用已有内容寻址对象。Zero 散列的 CPU 仍随
+逻辑长度线性增长；省略优化减少传输及分配，不消除既有身份算法要求的工作。
+
+启用加密时，presence 位于认证记录之内，reader 先认证再分类。完整顺序消费即使没有
+Data，或尾部是 Zero/Hole，也会验证 identity、padding、TAR 结束及外层 EOF。
+快速随机/部分访问仍具有原有验证范围限制。打开期间临时缓存一个元数据记录，避免重复
+解密；返回 source 前释放，不缓存之后的 payload 读取。
+
+Reader/writer 共用的 extent 上限仍为 `1<<20`，包括 GNU sparse 尾哨兵及最终 tail
+合并结果。Writer 在输出任何字节（包括加密 header）或读取 Data 之前拒绝超限。
+Presence 规划在分配前计入原索引预算，不增加 payload 位图或前缀索引；不能通过展开
+Zero 为字面 Data 规避上限。测试及性能结果须区分索引预算、逻辑字节、传输字节和身份 CPU。
+
+`go test ./pkg/manifest/crypto -run '^$' -bench '^BenchmarkPresenceTarStream$' -benchtime=3x`
+比较 64 MiB 逻辑源中 Zero 占比为 0%、50% 和 100% 的明文及 AES 情形。50% 情形
+交替使用 1 MiB Data/Zero run。探针记录编码字节、写入耗时以及包含索引和认证暂存的
+打开分配量；预先构建的 wire buffer 不计入打开分配量。对旧实现使用相同基准源码，
+至少执行三轮成对对照。没有 Zero 的载体增加位图开销；全 Zero 载体可省去几乎全部
+传输字节，但仍有线性散列成本，包括无 Data 打开时的验证。不能据此声称身份计算为
+常数时间，也不能把该结果当作磁盘 I/O 吞吐。
+
 ## 2. 多 Manifest Bundle 载体
 
 本地 Manifest 快照使用支持 ZIP64 的标准 ZIP 容器,带强制尾部索引。当前 profile 直接要求

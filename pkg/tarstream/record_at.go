@@ -42,6 +42,38 @@ type recordReaderAt struct {
 	closed atomic.Bool
 }
 
+// recordMetadataReader is an opening-only scratch window, never retained by a
+// source. It authenticates each cached record before exposing any metadata and
+// does not read ahead across the authenticated packed-payload boundary.
+type recordMetadataReader struct {
+	records *recordReaderAt
+	buffer  [recordSize]byte
+	index   uint64
+}
+
+func (r *recordMetadataReader) ReadAt(dst []byte, off int64) (int, error) {
+	g := r.records.geometry
+	if off < 0 || len(dst) == 0 || uint64(off) >= g.plaintextSize {
+		return r.records.ReadAt(dst, off)
+	}
+	pos := uint64(off)
+	index := g.recordForOffset(pos)
+	start, size := g.recordPlainStart(index), g.recordPlainSize(index)
+	metadata := pos < g.packedStart || pos >= g.packedStart+g.packedSize
+	if !metadata || uint64(len(dst)) > start+size-pos {
+		return r.records.ReadAt(dst, off)
+	}
+	if r.index != index {
+		r.index = ^uint64(0)
+		clear(r.buffer[:])
+		if err := readAtFull(r.records, r.buffer[:size], int64(start)); err != nil {
+			return 0, err
+		}
+		r.index = index
+	}
+	return copy(dst, r.buffer[pos-start:pos-start+uint64(len(dst))]), nil
+}
+
 func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recordReaderAt, error) {
 	if codec == nil {
 		return nil, ErrCodecRequired

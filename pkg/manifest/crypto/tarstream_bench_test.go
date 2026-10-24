@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
@@ -182,6 +183,123 @@ func BenchmarkEncryptedTarStreamWrite(b *testing.B) {
 			}
 		}
 	})
+}
+
+// Compare the same 64 MiB logical source on old/new writers. Zero is metadata,
+// never discovered by scanning Data. B/op for open includes the actual parser
+// index and authentication scratch allocations, not the prebuilt wire buffer.
+func BenchmarkPresenceTarStream(b *testing.B) {
+	codec, err := NewTarStreamCodec([32]byte{0x33})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, encrypted := range []bool{false, true} {
+		for _, zeroPercent := range []int{0, 50, 100} {
+			src := presenceBenchmarkSource{zeroPercent: zeroPercent}
+			var writeOpts []tarstream.WriteOption
+			var readOpts []tarstream.ReadOption
+			if encrypted {
+				writeOpts = append(writeOpts, tarstream.WithCodec(codec, true))
+				readOpts = append(readOpts, tarstream.WithCodec(codec, true))
+			}
+			label := fmt.Sprintf("encrypted=%t/zero=%d", encrypted, zeroPercent)
+			b.Run(label+"/write", func(b *testing.B) {
+				b.SetBytes(int64(src.Size()))
+				b.ReportAllocs()
+				var out benchmarkWireCounter
+				for range b.N {
+					out = 0
+					if _, _, err := tarstream.WriteTo(context.Background(), &out, "disk", src, writeOpts...); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(out), "carrier-B")
+			})
+			b.Run(label+"/open", func(b *testing.B) {
+				var wire bytes.Buffer
+				if _, _, err := tarstream.WriteTo(context.Background(), &wire, "disk", src, writeOpts...); err != nil {
+					b.Fatal(err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					s, _, err := tarstream.SourceAt(bytes.NewReader(wire.Bytes()), int64(wire.Len()), "", readOpts...)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if s.Size() != src.Size() {
+						b.Fatal(s.Size())
+					}
+				}
+				b.ReportMetric(float64(wire.Len()), "carrier-B")
+			})
+		}
+	}
+}
+
+type benchmarkWireCounter uint64
+
+func (w *benchmarkWireCounter) Write(p []byte) (int, error) {
+	*w += benchmarkWireCounter(len(p))
+	return len(p), nil
+}
+
+type presenceBenchmarkSource struct{ zeroPercent int }
+
+func (s presenceBenchmarkSource) Size() uint64 { return 64 << 20 }
+func (s presenceBenchmarkSource) RunAt(off, limit uint64) (sparse.Run, error) {
+	if off >= s.Size() {
+		return nil, io.EOF
+	}
+	end := min(s.Size(), off+limit)
+	kind := sparse.Data
+	if s.zeroPercent == 100 || s.zeroPercent == 50 && (off/(1<<20))%2 == 1 {
+		kind = sparse.Zero
+	}
+	if s.zeroPercent == 50 {
+		end = min(end, (off/(1<<20)+1)*(1<<20))
+	}
+	return presenceBenchmarkRun{off: off, end: end, kind: kind}, nil
+}
+func (s presenceBenchmarkSource) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
+	done := 0
+	for done < len(p) {
+		r, err := s.RunAt(off+uint64(done), uint64(len(p)-done))
+		if err != nil {
+			return done, err
+		}
+		n, err := r.ReadAt(ctx, p[done:done+int(r.End()-r.Offset())], 0)
+		done += n
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+type presenceBenchmarkRun struct {
+	off, end uint64
+	kind     sparse.RunKind
+}
+
+func (r presenceBenchmarkRun) Offset() uint64       { return r.off }
+func (r presenceBenchmarkRun) End() uint64          { return r.end }
+func (r presenceBenchmarkRun) Kind() sparse.RunKind { return r.kind }
+func (r presenceBenchmarkRun) ReadAt(ctx context.Context, p []byte, inner uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if inner > r.end-r.off || uint64(len(p)) > r.end-r.off-inner {
+		return 0, io.EOF
+	}
+	v := byte(0x37)
+	if r.kind == sparse.Zero {
+		v = 0
+	}
+	for i := range p {
+		p[i] = v
+	}
+	return len(p), nil
 }
 
 type fillReaderAt byte

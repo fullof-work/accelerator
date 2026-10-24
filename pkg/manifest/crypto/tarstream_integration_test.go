@@ -125,6 +125,22 @@ func writeTarArtifact(t testing.TB, codec tarstream.Codec, name string, body []b
 	return output.Bytes(), scheme, digest
 }
 
+func firstPayloadRecord(t testing.TB, name string, body []byte, holes []sparse.Extent) int {
+	t.Helper()
+	plain, _, _ := writeTarArtifact(t, nil, name, body, holes)
+	r := bytes.NewReader(plain)
+	if _, err := tarstream.ReadSeekFrom(r, name); err != nil {
+		t.Fatal(err)
+	}
+	off, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Clear prefix + sealed envelope header + plaintext metadata and one
+	// authentication overhead per preceding metadata record.
+	return 48 + 81 + int(off) + int((off+4095)/4096)*17
+}
+
 func readSparseSource(ctx context.Context, source sparse.Source) ([]byte, error) {
 	result := make([]byte, source.Size())
 	for offset := uint64(0); offset < source.Size(); {
@@ -320,11 +336,10 @@ func TestEncryptedTarStreamTamperAndBounds(t *testing.T) {
 		t.Fatalf("append error = %v", err)
 	}
 
-	// For a dense canonical artifact, packed data begins at plaintext offset
-	// 1536. The fixed first record therefore has 1536 bytes and record 1 starts
-	// at physical offset 48+81+(1536+17) = 1682.
+	// Derive the payload boundary from the carrier, including its presence
+	// entry. Metadata-only open must not authenticate a damaged data record.
 	data := append([]byte(nil), artifact...)
-	const firstDataRecord = 1682
+	firstDataRecord := firstPayloadRecord(t, "image", body, nil)
 	data[firstDataRecord+1] ^= 0x01
 	source, err := open(data, codec)
 	if err != nil {
@@ -382,10 +397,8 @@ func TestEncryptedTarStreamSplicingBoundary(t *testing.T) {
 	a, scheme, digest := writeTarArtifact(t, codec, "image", aBody, nil)
 	b, _, _ := writeTarArtifact(t, codec, "image", bBody, nil)
 
-	const (
-		firstDataRecord = 1682
-		fullRecord      = 4096 + 17
-	)
+	firstDataRecord := firstPayloadRecord(t, "image", aBody, nil)
+	const fullRecord = 4096 + 17
 	spliced := append([]byte(nil), a...)
 	copy(spliced[firstDataRecord:firstDataRecord+fullRecord], b[firstDataRecord:firstDataRecord+fullRecord])
 	random, _, err := tarstream.SourceAt(bytes.NewReader(spliced), int64(len(spliced)), "", tarstream.WithCodec(codec, true), tarstream.WithExpectedDigest(scheme, digest))
@@ -532,10 +545,8 @@ func TestEncryptedTarStreamRecordSwapRejected(t *testing.T) {
 	codec, _ := NewTarStreamCodec([32]byte{11})
 	body := bytes.Repeat([]byte("0123456789abcdef"), 1024)
 	artifact, _, _ := writeTarArtifact(t, codec, "image", body, nil)
-	const (
-		firstDataRecord = 1682
-		fullRecord      = 4096 + 17
-	)
+	firstDataRecord := firstPayloadRecord(t, "image", body, nil)
+	const fullRecord = 4096 + 17
 	swapped := append([]byte(nil), artifact...)
 	first := append([]byte(nil), swapped[firstDataRecord:firstDataRecord+fullRecord]...)
 	second := append([]byte(nil), swapped[firstDataRecord+fullRecord:firstDataRecord+2*fullRecord]...)
@@ -554,10 +565,8 @@ func TestEncryptedSequentialAuthenticationFailureIsSticky(t *testing.T) {
 	codec, _ := NewTarStreamCodec([32]byte{16})
 	body := bytes.Repeat([]byte("0123456789abcdef"), 512)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "image", body, nil)
-	const (
-		firstDataRecord = 1682
-		fullRecord      = 4096 + 17
-	)
+	firstDataRecord := firstPayloadRecord(t, "image", body, nil)
+	const fullRecord = 4096 + 17
 	artifact[firstDataRecord+fullRecord+1] ^= 1
 	source, _, err := tarstream.SourceFrom(
 		streamReaderOnly{bytes.NewReader(artifact)},

@@ -239,7 +239,7 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 	if err != nil {
 		return nil, "", keyBoundCanonicalError(options, err)
 	}
-	if view.meta.ordinal != 0 {
+	if view.meta.ordinal != 0 && !(view.meta.ordinal == 1 && view.meta.presence != nil) {
 		return nil, "", keyBoundCanonicalError(options, fmt.Errorf("%w: payload must be the first archive entry", ErrInvalidCanonicalTarstream))
 	}
 	if geometry != nil {
@@ -256,7 +256,7 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 		return nil, "", fmt.Errorf("%w: metadata tail size %d exceeds %d", ErrInvalidCanonicalTarstream, tailSize, maxMetadataTailSize)
 	}
 	identity := newIdentityAccumulator(
-		uint64(view.meta.payloadSize), payloadExtents, payloadPacked, view.meta.logical-view.meta.payloadSize,
+		uint64(view.meta.payloadSize), payloadExtents, payloadPacked, view.meta.logical-view.meta.payloadSize, view.meta.presence, view.meta.extents,
 	)
 	view.src = io.TeeReader(view.src, identity)
 	verifier := &sequentialVerifier{reader: tracked, meta: &view.meta, options: options, identity: identity, encrypted: geometry != nil}

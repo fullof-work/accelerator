@@ -22,14 +22,14 @@
 //
 // Semantics of the three states:
 //
-//   - Hole: no data anywhere — authoritative absence metadata. In an
+//   - Hole: no content in this layer — authoritative absence metadata. In an
 //     overlay it falls through to lower layers; it is restored as a
 //     real hole and never conflated with zero-valued data.
-//   - Zero: data whose bytes are known to be all zero — a read-side
-//     optimization hint, not an on-wire state. Only manifest-backed
-//     sources produce it (IsZero chunks). Consumers may synthesize
-//     zeros instead of calling ReadAt, but every boundary crossing
-//     (tar envelope, chunker) treats it exactly like Data.
+//   - Zero: logically present content whose bytes are all zero. It masks
+//     lower layers like Data, but consumers can synthesize its bytes without
+//     payload I/O. Manifest chunks, DIFF presence metadata and page-profile
+//     tarstreams can represent it without storing whole zero pages. Other
+//     carriers may encode literal zero bytes while preserving presence.
 //   - Data: bytes that must be read.
 //
 // Holes only ever come from authoritative metadata. Deriving holes
@@ -56,8 +56,7 @@ type RunKind uint8
 const (
 	// Hole: no data — authoritative absence. Falls through in overlays.
 	Hole RunKind = iota
-	// Zero: data known to be all zero — fetch-free read hint; treated
-	// as Data at every boundary.
+	// Zero: present zero content; masks lower layers without payload I/O.
 	Zero
 	// Data: bytes that must be read.
 	Data

@@ -14,10 +14,11 @@
 // digest/trailer/outer-EOF validation when its Data extents are consumed. Only
 // data bytes flow on the inner tar wire — holes cost nothing.
 //
-// Zero-valued data is data: a source's Zero runs are written as
-// literal zero bytes (synthesized, never read), never as holes — the
-// envelope carries exactly two states, absent (hole) and present
-// (data), and reading it back never produces Zero runs.
+// Page-representable payloads up to 32 GiB include a preceding full presence
+// bitmap. Whole Zero pages remain logically present while their payload is
+// omitted from the GNU sparse map. Read-side Sources reconstruct Hole, Zero
+// and Data without scanning bytes. Legacy and byte-hole sources preserve
+// their exact hole boundaries and synthesize literal Zero bytes when needed.
 //
 // The tar envelope keeps the format inspectable and interoperable:
 // GNU tar extracts the stream back into a sparse file, Go's
