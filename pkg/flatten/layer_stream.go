@@ -1,7 +1,6 @@
 package flatten
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +10,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/kuasar-sandbox/accelerator/internal/layercompression"
 )
 
 // LayerInput identifies a complete layer before its body is opened. Open must
@@ -21,8 +20,8 @@ import (
 // A one-shot reader is not a LayerInput; spool non-reopenable archives once.
 type LayerInput struct {
 	MediaType string
-	Digest    string // complete compressed blob, sha256:<64 lowercase hex digits>
-	Size      int64  // complete compressed blob size
+	Digest    string // complete stored blob, sha256:<64 lowercase hex digits>
+	Size      int64  // complete stored blob size
 	DiffID    string // complete decoded stream, including tar padding
 	Open      func(context.Context) (io.ReadCloser, error)
 }
@@ -195,25 +194,19 @@ func openLayer(ctx context.Context, in LayerInput, limits LayerLimits) (_ *layer
 		}
 	}()
 	s.compressed = &checkedReader{ctx: ctx, r: body, h: sha256.New(), limit: in.Size, label: "compressed layer"}
-	var decoder io.Reader = s.compressed
-	switch in.MediaType {
-	case "application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
-		"application/vnd.docker.image.rootfs.diff.tar.gzip", "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip":
-		gz, e := gzip.NewReader(s.compressed)
-		if e != nil {
-			return nil, fmt.Errorf("flatten: gzip header: %w", e)
-		}
-		decoder, s.decoderClose = gz, gz.Close
-	case "application/vnd.oci.image.layer.v1.tar+zstd", "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd":
-		z, e := zstd.NewReader(s.compressed, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(limits.DecoderBytes)))
-		if e != nil {
-			return nil, fmt.Errorf("flatten: zstd header: %w", e)
-		}
-		decoder, s.decoderClose = z, func() error { z.Close(); return nil }
+	// Detect through the stored-byte checker so the sniffed prefix is counted
+	// and hashed exactly once. MediaType identifies a supported layer format;
+	// the bytes determine its actual compression, shared with Pull and archives.
+	decoder, kind, err := layercompression.Open(s.compressed, layercompression.Options{
+		DecoderMemory: uint64(limits.DecoderBytes), DecoderConcurrency: 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("flatten: %w", err)
 	}
+	s.decoderClose = decoder.Close
 	s.decoded = &checkedReader{ctx: ctx, r: decoder, h: sha256.New(), limit: limits.DecodedBytes, label: "decoded layer"}
-	if decoder == s.compressed {
-		// With an explicit plain-tar media type both identities cover exactly
+	if kind == layercompression.Plain {
+		// With plain-tar content both identities cover exactly
 		// the same bytes. Retain independent limits, counts and identity checks
 		// while computing their SHA-256 once. Encoded layers keep two hashes.
 		s.decoded.h, s.decoded.skipHash = s.compressed.h, true

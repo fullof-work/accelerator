@@ -3,16 +3,16 @@ package remote
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/partial"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/kuasar-sandbox/accelerator/internal/layercompression"
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 )
 
@@ -94,7 +94,7 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 // Pull ensures every blob of the resolved image (config + layers) is present
 // in cache — downloading missing ones concurrently (bounded by PullJobs),
 // each digest-verified and written atomically — then returns a flatten.Source
-// that streams the layers (decompressed via ggcr's content sniffing) from
+// that streams the layers (using the shared content-based decoder) from
 // cache. Downloads run in parallel; flatten then applies layers sequentially.
 func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten.Source, error) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -250,52 +250,28 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 			if err != nil {
 				return nil, fmt.Errorf("remote: open cached layer %s: %w", lr.digest, err)
 			}
-			// decompress (ggcr's Uncompressed path) closes f when the
-			// returned stream is closed.
+			// The returned stream owns the cached file and decoder.
 			return decompress(f, lr.digest)
 		})
 	}
 	return openers, nil
 }
 
-// cachedLayer adapts a cached layer blob to ggcr's minimal
-// partial.CompressedLayer interface, so the SDK's own sniff — the
-// PeekCompression machinery behind layer.Uncompressed() and crane export —
-// decides gzip / zstd / plain and performs the decompression. Detection
-// stays owned by ggcr: no magic table is maintained here, and upstream
-// sniff fixes are inherited on upgrade.
-type cachedLayer struct {
-	r io.ReadCloser
-	d v1.Hash
+// decompress uses the same content detection and decoder as streaming Prepare
+// and Docker-save input. It retains Pull's ownership of the cached layer body.
+func decompress(r io.ReadCloser, d v1.Hash) (io.ReadCloser, error) {
+	decoder, _, err := layercompression.Open(r, layercompression.Options{})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("remote: layer %s: %w", d, err), r.Close())
+	}
+	return &decodedLayer{ReadCloser: decoder, body: r}, nil
 }
 
-func (l *cachedLayer) Compressed() (io.ReadCloser, error) { return l.r, nil }
+type decodedLayer struct {
+	io.ReadCloser
+	body io.Closer
+}
 
-func (l *cachedLayer) Digest() (v1.Hash, error) { return l.d, nil }
-
-// Size and MediaType satisfy partial.CompressedLayer; the Uncompressed()
-// path consults neither.
-func (l *cachedLayer) Size() (int64, error) { return 0, nil }
-
-func (l *cachedLayer) MediaType() (types.MediaType, error) { return types.OCILayer, nil }
-
-// decompress returns the layer's uncompressed tar stream, delegating both
-// detection (by content sniffing, not the manifest mediaType) and
-// decompression to ggcr — the same machinery behind layer.Uncompressed().
-// Mislabeled layers (descriptor says gzip, blob is a plain tar) are
-// accepted, matching docker's archive.DecompressStream and the
-// docker-archive source's openMaybeGzip. Short and empty streams that match
-// no magic pass through as plain. The returned reader closes r.
-func decompress(r io.ReadCloser, d v1.Hash) (io.ReadCloser, error) {
-	layer, err := partial.CompressedToLayer(&cachedLayer{r: r, d: d})
-	if err != nil {
-		r.Close()
-		return nil, err
-	}
-	rc, err := layer.Uncompressed()
-	if err != nil {
-		r.Close()
-		return nil, fmt.Errorf("remote: layer %s: %w", d, err)
-	}
-	return rc, nil
+func (r *decodedLayer) Close() error {
+	return errors.Join(r.body.Close(), r.ReadCloser.Close())
 }
