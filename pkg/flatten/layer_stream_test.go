@@ -122,6 +122,13 @@ func TestLayerValidationFailures(t *testing.T) {
 		for _, fault := range []string{"size-small", "size-large", "digest", "diffid", "decoded-limit", "close", "truncated"} {
 			t.Run(codec+"/"+fault, func(t *testing.T) {
 				blob, media := encodedLayer(t, codec, plain)
+				// Content-based decoding must still enforce every identity and
+				// limit when the descriptor mislabels the stored encoding.
+				if codec == "plain" {
+					media = "application/vnd.oci.image.layer.v1.tar+gzip"
+				} else {
+					media = "application/vnd.oci.image.layer.v1.tar"
+				}
 				body := &observedBody{Reader: bytes.NewReader(blob)}
 				in := streamInput(blob, plain, media, body)
 				limits := LayerLimits{}
@@ -156,7 +163,42 @@ func TestLayerValidationFailures(t *testing.T) {
 	}
 }
 
-func TestLayerStrictMediaAndTrailer(t *testing.T) {
+func TestLayerContentOverridesMediaType(t *testing.T) {
+	plain := bytes.Repeat([]byte("layer payload"), 2000)
+	for _, codec := range []string{"plain", "gzip", "zstd"} {
+		blob, _ := encodedLayer(t, codec, plain)
+		for _, media := range []string{
+			"application/vnd.oci.image.layer.v1.tar",
+			"application/vnd.oci.image.layer.v1.tar+gzip",
+			"application/vnd.oci.image.layer.v1.tar+zstd",
+			"application/vnd.docker.image.rootfs.diff.tar.gzip",
+		} {
+			t.Run(codec+"/"+media, func(t *testing.T) {
+				body := &observedBody{Reader: bytes.NewReader(blob)}
+				s, err := openLayer(context.Background(), streamInput(blob, plain, media, body), LayerLimits{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { s.Close() })
+				got, err := io.ReadAll(s)
+				if err != nil || !bytes.Equal(got, plain) {
+					t.Fatalf("decoded content differs: %v", err)
+				}
+				if err := s.finish(); err != nil {
+					t.Fatal(err)
+				}
+				if s.compressed.n != int64(len(blob)) || s.decoded.n != int64(len(plain)) {
+					t.Fatal("incomplete stored or decoded byte coverage")
+				}
+				if body.closed.Load() != 1 {
+					t.Fatal("owned body was not closed exactly once")
+				}
+			})
+		}
+	}
+}
+
+func TestLayerCorruptTrailer(t *testing.T) {
 	plain := make([]byte, 2048)
 	for _, codec := range []string{"gzip", "zstd"} {
 		t.Run(codec, func(t *testing.T) {
@@ -170,16 +212,11 @@ func TestLayerStrictMediaAndTrailer(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted corrupt trailer")
 			}
-			body = &observedBody{Reader: bytes.NewReader(plain)}
-			s, err = openLayer(context.Background(), streamInput(plain, plain, media, body), LayerLimits{})
-			if err == nil {
-				err = s.finish()
-			}
-			if err == nil {
-				t.Fatal("sniffed plain bytes instead of enforcing media type")
-			}
 		})
 	}
+}
+
+func TestLayerUnsupportedMediaType(t *testing.T) {
 	opened := false
 	in := LayerInput{MediaType: "unknown", Size: 0, Digest: layerHash(nil), DiffID: layerHash(nil), Open: func(context.Context) (io.ReadCloser, error) {
 		opened = true
@@ -192,11 +229,17 @@ func TestLayerStrictMediaAndTrailer(t *testing.T) {
 
 type blockedLayerBody struct {
 	entered, closed chan struct{}
+	prefix          []byte
 	once            sync.Once
 	closes          atomic.Int32
 }
 
-func (b *blockedLayerBody) Read([]byte) (int, error) {
+func (b *blockedLayerBody) Read(p []byte) (int, error) {
+	if len(b.prefix) != 0 {
+		n := copy(p, b.prefix)
+		b.prefix = b.prefix[n:]
+		return n, nil
+	}
 	b.once.Do(func() { close(b.entered) })
 	<-b.closed
 	return 0, io.ErrClosedPipe
@@ -209,27 +252,40 @@ func (b *blockedLayerBody) Close() error {
 }
 
 func TestLayerCancellationClosesOwnedBody(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	body := &blockedLayerBody{entered: make(chan struct{}), closed: make(chan struct{})}
-	in := LayerInput{MediaType: "application/vnd.oci.image.layer.v1.tar", Size: 1024, Digest: layerHash(nil), DiffID: layerHash(nil), Open: func(context.Context) (io.ReadCloser, error) { return body, nil }}
-	s, err := openLayer(ctx, in, LayerLimits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- s.finish() }()
-	<-body.entered
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("cancel left a reader running")
-	}
-	if body.closes.Load() != 1 {
-		t.Fatal("owned body closed more than once")
+	for _, phase := range []string{"sniff", "content"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			body := &blockedLayerBody{entered: make(chan struct{}), closed: make(chan struct{})}
+			if phase == "content" {
+				body.prefix = []byte("plain layer prefix")
+			}
+			in := LayerInput{MediaType: "application/vnd.oci.image.layer.v1.tar", Size: 1024, Digest: layerHash(nil), DiffID: layerHash(nil), Open: func(context.Context) (io.ReadCloser, error) { return body, nil }}
+			done := make(chan error, 1)
+			go func() {
+				s, err := openLayer(ctx, in, LayerLimits{})
+				if err == nil {
+					err = s.finish()
+				}
+				done <- err
+			}()
+			select {
+			case <-body.entered:
+			case err := <-done:
+				t.Fatalf("layer did not wait for cancellation: %v", err)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("cancel left a reader running")
+			}
+			if body.closes.Load() != 1 {
+				t.Fatal("owned body was not closed exactly once")
+			}
+		})
 	}
 }

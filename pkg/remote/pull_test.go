@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -197,10 +198,8 @@ func TestDecompress(t *testing.T) {
 	}
 }
 
-// TestDecompressShortInputPassthrough — streams shorter than the smallest
-// magic (4 bytes: zstd data frame) cannot match any compression header, so
-// 0- to 3-byte inputs must pass through as plain rather than enter a
-// decompressor.
+// TestDecompressShortInputPassthrough — short streams without a complete
+// compression magic pass through as plain rather than enter a decompressor.
 func TestDecompressShortInputPassthrough(t *testing.T) {
 	for _, in := range [][]byte{nil, {'a'}, {'a', 'b'}, {'a', 'b', 'c'}} {
 		rc, err := decompress(io.NopCloser(bytes.NewReader(in)), v1.Hash{})
@@ -265,7 +264,7 @@ func plainTarLayer(t *testing.T) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	hdr := &tar.Header{Name: "hello.txt", Mode: 0o644, Size: 5}
+	hdr := &tar.Header{Name: "hello.txt", Mode: 0o644, Size: 5, Uid: os.Getuid(), Gid: os.Getgid()}
 	if err := tw.WriteHeader(hdr); err != nil {
 		t.Fatal(err)
 	}

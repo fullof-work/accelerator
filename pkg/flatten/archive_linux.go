@@ -4,7 +4,6 @@ package flatten
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -15,6 +14,8 @@ import (
 	"path"
 	"strings"
 	"sync"
+
+	"github.com/kuasar-sandbox/accelerator/internal/layercompression"
 )
 
 type archiveMember struct {
@@ -352,20 +353,21 @@ func (a *archiveInput) image(ctx context.Context) (*ImageInput, error) {
 		}
 		selected[name] = true
 		media := "application/vnd.oci.image.layer.v1.tar"
-		// Docker-save has no layer media-type field. Retain its established
-		// gzip archive compatibility (including ggcr's .tar.gz dialect), and
-		// assign an explicit decoder type once, before opening any layer.
-		var magic [4]byte
-		if _, err = io.ReadFull(io.NewSectionReader(a.reader, m.offset, m.size), magic[:]); err != nil {
+		// Docker-save has no layer media type or stored digest. Use the same
+		// content detection as layer opening to decide whether DiffID already
+		// identifies the stored bytes or a separate stored hash is needed.
+		kind, _, err := layercompression.Detect(contextReader{ctx, io.NewSectionReader(a.reader, m.offset, m.size)})
+		if err != nil {
 			return nil, err
 		}
-		if bytes.Equal(magic[:2], []byte{0x1f, 0x8b}) {
+		switch kind {
+		case layercompression.Gzip:
 			media += "+gzip"
-		} else if bytes.Equal(magic[:], []byte{0x28, 0xb5, 0x2f, 0xfd}) {
+		case layercompression.Zstd:
 			media += "+zstd"
 		}
 		digest := cfg.RootFS.DiffIDs[i]
-		if media != "application/vnd.oci.image.layer.v1.tar" {
+		if kind != layercompression.Plain {
 			// Unlike a Registry descriptor, legacy save manifests do not name
 			// the compressed identity. Compute it from the stable indexed member
 			// without extracting/staging it; application checks it again.

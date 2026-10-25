@@ -86,6 +86,7 @@ Workflow 检查解析组件的实际 YAML，验证其分配、workspace 和 ABI 
 | 要求 | 实现 | 维护中的检查及证据范围 |
 |---|---|---|
 | 固定输入身份及完整校验 | `pkg/flatten/input.go`、`layer_stream.go`；`pkg/remote/stream.go` | 层 media/size/digest/DiffID/trailer/Close 与取消用例；实际本地 Registry → umoci → Plan → pipe → 当前工件 reader。 |
+| 按内容识别层压缩格式 | `internal/layercompression`；流式层、Docker-save 适配器及旧 `remote.Pull` | 格式识别与解码器创建使用同一实现，支持的 media type 错标不影响 plain/gzip/zstd 内容识别，包含前导 zstd skippable 帧。覆盖错标、完整身份与尾部校验、嗅探阶段取消，以及实际 Registry `Prepare` 的无缓存、缓存未命中/命中和归档输出对照。 |
 | 层文件系统语义 | `pkg/flatten/layer_apply_linux.go` | 实际 umoci 的 late whiteout/opaque、类型替换、implicit parent、链接、属性及空层；权限不足仍报错。 |
 | Go 布局与顺序输出 | 固定 go-erofs 模块；`go_planner_linux.go`、`plan_linux.go` | 实际内容/元数据、选中硬链接、填充块共享、独立 fsck 提取、重复构建确定性、受控分配/Plan 预算、取消及清理。保留 Plan 损坏、越界、源变化、纯元数据可重复 RunAt 和成功尾检查。历史原生 Raw/Plan 及 exact-read 对照保留在其原始版本中；当前测试覆盖 Go 生成器。不要求 Go 与原生输出字节相同。 |
 | 归档与入口等价性 | `pkg/flatten/archive_linux.go`、`raw_linux.go` | 可 seek 归档、pipe spool 与目录对比；截断/拼接归档及索引预算拒绝。Guest CLI 测试覆盖 file、stdout 和上传/失败分支。 |
