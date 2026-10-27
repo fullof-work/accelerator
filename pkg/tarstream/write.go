@@ -16,11 +16,13 @@ import (
 )
 
 // WriteTo packages src as a complete Kuasar tarstream artifact on w. The
-// sparse map comes from src.RunAt — Hole runs become the entry's
-// holes. Page-representable payloads include a full presence bitmap and a
-// GNU sparse map of actual payload; whole Zero pages need no stored bytes.
-// Other sources retain byte-exact holes and synthesize Zero bytes without
-// calling ReadAt. Logical Zero always masks lower content. The metadata
+// sparse map comes from src.RunAt. Every new artifact includes a full presence
+// bitmap and a GNU sparse map of actual payload; whole Zero pages need no stored
+// bytes. The payload is at most 1 TiB; empty and partial final pages retain their
+// exact logical length. Hole boundaries must be page-aligned except at payload
+// end. Invalid inputs fail before output rather than changing their logical
+// size or holes. Partial Zero pages are synthesized
+// without calling ReadAt. Logical Zero always masks lower content. The metadata
 // sweep precedes any data read (sparse law 1), so one-pass sources
 // work. The plaintext envelope metadata is fixed and deterministic (mode 0644,
 // uid/gid 0, epoch mtime): the entry is a transport vessel, not a
@@ -134,7 +136,6 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 	// Only actual payload is indexed in the new encoding. The presence bitmap
 	// carries logical Zero; the business metadata tail remains dense.
 	var extents []extent
-	hasHole := presence != nil
 	appendExtent := func(start, end uint64) error {
 		if end <= start {
 			return nil
@@ -166,7 +167,7 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		}
 		switch kind {
 		case sparse.Hole:
-			hasHole = true
+			// Absent pages are recorded by the presence bitmap.
 		case sparse.Data:
 			if err := appendExtent(off, end); err != nil {
 				return nil, err
@@ -175,7 +176,7 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 			// Omit only complete Zero pages before the independent dense tail.
 			zeroStart := (off + presencePage - 1) / presencePage * presencePage
 			zeroEnd := min(end, uint64(payloadSize)) / presencePage * presencePage
-			if presence != nil && zeroStart < zeroEnd {
+			if zeroStart < zeroEnd {
 				if err := appendExtent(off, zeroStart); err != nil {
 					return nil, err
 				}
@@ -209,47 +210,40 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		return nil, err
 	}
 
-	var sparseMap []byte
-	stored := size
-	if hasHole {
-		// Sparse map: decimal extent count, then offset/size per line —
-		// the data extents plus GNU's trailing (size, 0) sentinel —
-		// NUL-padded to a 512 boundary and prepended to the stored data.
-		var mapBuf bytes.Buffer
-		mapBuf.WriteString(strconv.Itoa(len(extents) + 1))
+	// Every new artifact uses GNU sparse 1.0 alongside the presence bitmap.
+	// Include GNU's trailing (size, 0) sentinel even for dense or all-Hole data.
+	var mapBuf bytes.Buffer
+	mapBuf.WriteString(strconv.Itoa(len(extents) + 1))
+	mapBuf.WriteByte('\n')
+	for _, e := range extents {
+		mapBuf.WriteString(strconv.FormatInt(e.Offset, 10))
 		mapBuf.WriteByte('\n')
-		for _, e := range extents {
-			mapBuf.WriteString(strconv.FormatInt(e.Offset, 10))
-			mapBuf.WriteByte('\n')
-			mapBuf.WriteString(strconv.FormatInt(e.Size, 10))
-			mapBuf.WriteByte('\n')
-		}
-		mapBuf.WriteString(strconv.FormatInt(size, 10))
-		mapBuf.WriteString("\n0\n")
-		if pad := (512 - mapBuf.Len()%512) % 512; pad > 0 {
-			mapBuf.Write(zeroBlock[:pad])
-		}
-		sparseMap = mapBuf.Bytes()
-		if dataSize > 1<<62-int64(len(sparseMap)) {
-			return nil, fmt.Errorf("tarstream: %s: stored size overflows", name)
-		}
-		stored = int64(len(sparseMap)) + dataSize
+		mapBuf.WriteString(strconv.FormatInt(e.Size, 10))
+		mapBuf.WriteByte('\n')
 	}
+	mapBuf.WriteString(strconv.FormatInt(size, 10))
+	mapBuf.WriteString("\n0\n")
+	if pad := (512 - mapBuf.Len()%512) % 512; pad > 0 {
+		mapBuf.Write(zeroBlock[:pad])
+	}
+	sparseMap := mapBuf.Bytes()
+	if dataSize > 1<<62-int64(len(sparseMap)) {
+		return nil, fmt.Errorf("tarstream: %s: stored size overflows", name)
+	}
+	stored := int64(len(sparseMap)) + dataSize
 
-	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize, presence != nil)
-	if presence != nil {
-		body := presenceBody(presence, uint64(payloadSize))
-		h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: int64(len(body)), typeflag: '0'})
-		var full bytes.Buffer
-		full.Grow(512 + (len(body)+511)/512*512 + len(prefix))
-		full.Write(h[:])
-		full.Write(body)
-		if pad := (512 - len(body)%512) % 512; pad > 0 {
-			full.Write(zeroBlock[:pad])
-		}
-		full.Write(prefix)
-		prefix = full.Bytes()
+	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize, true)
+	body := presenceBody(presence, uint64(payloadSize))
+	h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: int64(len(body)), typeflag: '0'})
+	var full bytes.Buffer
+	full.Grow(512 + (len(body)+511)/512*512 + len(prefix))
+	full.Write(h[:])
+	full.Write(body)
+	if pad := (512 - len(body)%512) % 512; pad > 0 {
+		full.Write(zeroBlock[:pad])
 	}
+	full.Write(prefix)
+	prefix = full.Bytes()
 	payloadPad := int((512 - stored%512) % 512)
 	plaintextSize := int64(len(prefix)) + dataSize + int64(payloadPad) + canonicalSuffixSize
 	if plaintextSize < 0 || plaintextSize > 1<<62 {

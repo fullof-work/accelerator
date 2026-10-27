@@ -1121,7 +1121,7 @@ func (m *meta) runAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 		}
 	}
 	if m.presence != nil && offset < uint64(m.payloadSize) {
-		pages := min(uint64(m.payloadSize)/presencePage, (end+presencePage-1)/presencePage)
+		pages := min(presencePages(uint64(m.payloadSize)), presencePages(end))
 		page := offset / presencePage
 		end = min(end, presenceRunEnd(m.presence, page, pages)*presencePage)
 		if !presenceBit(m.presence, page) {

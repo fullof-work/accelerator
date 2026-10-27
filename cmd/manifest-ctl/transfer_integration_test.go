@@ -197,26 +197,27 @@ func TestTransferLocalPathsTailModesAndExpectedIdentity(t *testing.T) {
 }
 func TestTransferMultiLayerPreservesHoleAndWrittenZero(t *testing.T) {
 	_, config, _ := transferConfig(t, false)
-	top := append(bytes.Repeat([]byte{'A'}, 4), make([]byte, 16)...)
-	a, _, _ := artifactFixture(t, top, []sparse.Extent{{Offset: 4, Size: 4}, {Offset: 12, Size: 8}}, nil)
-	lower := append(bytes.Repeat([]byte{'B'}, 16), make([]byte, 4)...)
-	b, _, _ := artifactFixture(t, lower, []sparse.Extent{{Offset: 16, Size: 4}}, nil)
+	top := append(bytes.Repeat([]byte{'A'}, 4096), make([]byte, 4*4096)...)
+	a, _, _ := artifactFixture(t, top, []sparse.Extent{{Offset: 4096, Size: 4096}, {Offset: 3 * 4096, Size: 2 * 4096}}, nil)
+	lower := append(bytes.Repeat([]byte{'B'}, 4*4096), make([]byte, 4096)...)
+	b, _, _ := artifactFixture(t, lower, []sparse.Extent{{Offset: 4 * 4096, Size: 4096}}, nil)
 	out, _, err := invokeTransfer(t, config, false, nil, a, b)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, src := readArtifact(t, out)
-	want := append([]byte("AAAABBBB"), make([]byte, 4)...)
-	want = append(want, []byte("BBBB")...)
-	want = append(want, make([]byte, 4)...)
+	want := append(bytes.Repeat([]byte{'A'}, 4096), bytes.Repeat([]byte{'B'}, 4096)...)
+	want = append(want, make([]byte, 4096)...)
+	want = append(want, bytes.Repeat([]byte{'B'}, 4096)...)
+	want = append(want, make([]byte, 4096)...)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("layer result %x want %x", got, want)
 	}
-	hole, err := src.RunAt(16, 4)
+	hole, err := src.RunAt(4*4096, 4096)
 	if err != nil || hole.Kind() != sparse.Hole {
 		t.Fatalf("lost hole: %v %v", hole, err)
 	}
-	present, err := src.RunAt(8, 4)
+	present, err := src.RunAt(2*4096, 4096)
 	if err != nil || present.Kind() == sparse.Hole {
 		t.Fatalf("written zero became hole: %v %v", present, err)
 	}

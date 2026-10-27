@@ -16,13 +16,21 @@ const (
 	presenceName       = ".kuasar.presence.v1"
 	presencePAX        = "KUASAR.presence"
 	presencePage       = uint64(4096)
-	maxPresencePayload = uint64(32 << 30)
-	maxPresenceBytes   = 1 << 20
+	maxPresencePayload = uint64(1 << 40)
+	maxPresenceBytes   = 32 << 20
 	presenceHeaderSize = 64
 	maxSparseExtents   = 1 << 20 // shared reader/writer wire limit, including sentinel
 )
 
 var presenceMagic = [8]byte{'K', 'U', 'P', 'R', 'E', 'S', '1', '\n'}
+
+func presencePages(payload uint64) uint64 {
+	pages := payload / presencePage
+	if payload%presencePage != 0 {
+		pages++
+	}
+	return pages
+}
 
 func presenceBit(p []byte, page uint64) bool { return p[page/8]&(1<<(page%8)) != 0 }
 func presenceRunEnd(p []byte, page, pages uint64) uint64 {
@@ -61,19 +69,19 @@ func setPresenceRange(p []byte, start, end uint64) {
 	}
 }
 
-// planPresence performs metadata-only eligibility checking. Arbitrary byte Hole
-// boundaries keep the legacy encoding; partial Zero runs stay ordinary Data.
-// No payload bytes are read and no replacement format is used to evade budgets.
+// planPresence validates and plans the required presence profile using only
+// metadata. Inputs that cannot preserve their exact length and Hole boundaries
+// in this profile fail before output; partial Zero runs stay ordinary Data.
 func planPresence(ctx context.Context, src sparse.Source, payload uint64, charge func(uint64) error) ([]byte, error) {
-	if payload == 0 || payload%presencePage != 0 || payload > maxPresencePayload {
-		return nil, nil
+	if payload > maxPresencePayload {
+		return nil, fmt.Errorf("tarstream: payload size %d exceeds presence limit %d", payload, maxPresencePayload)
 	}
-	// Eligibility precedes allocation: byte-granular legacy holes do not pay
-	// for a bitmap they cannot use. Charge all peak bitmap copies before make.
+	// Validate all Hole boundaries before allocating the bitmap. Charge all
+	// peak bitmap copies before make.
 	var p []byte
 	for pass := 0; pass < 2; pass++ {
 		if pass == 1 {
-			length := (payload/presencePage + 7) / 8
+			length := (presencePages(payload) + 7) / 8
 			if err := charge(length*4 + 4096); err != nil {
 				return nil, err
 			}
@@ -93,15 +101,15 @@ func planPresence(ctx context.Context, src sparse.Source, payload uint64, charge
 			}
 			switch r.Kind() {
 			case sparse.Hole:
-				if off%presencePage != 0 || end%presencePage != 0 {
+				if off%presencePage != 0 || (end != payload && end%presencePage != 0) {
 					if pass == 0 {
-						return nil, nil
+						return nil, fmt.Errorf("tarstream: presence hole [%d,%d) must have %d-byte aligned boundaries except at payload end", off, end, presencePage)
 					}
 					return nil, fmt.Errorf("tarstream: source presence changed during planning")
 				}
 			case sparse.Data, sparse.Zero:
 				if p != nil {
-					setPresenceRange(p, off/presencePage, (end+presencePage-1)/presencePage)
+					setPresenceRange(p, off/presencePage, presencePages(end))
 				}
 			default:
 				return nil, fmt.Errorf("tarstream: invalid presence kind")
@@ -141,7 +149,7 @@ func readPresence(r io.Reader, stored int64) ([]byte, uint64, error) {
 	payload := binary.LittleEndian.Uint64(b[16:])
 	length := binary.LittleEndian.Uint64(b[24:])
 	if !bytes.Equal(b[:8], presenceMagic[:]) || binary.LittleEndian.Uint32(b[8:]) != 1 || binary.LittleEndian.Uint32(b[12:]) != uint32(presencePage) ||
-		payload == 0 || payload > maxPresencePayload || payload%presencePage != 0 || length != (payload/presencePage+7)/8 || length != uint64(len(b)-presenceHeaderSize) || !isZeroBlock(b[32:60]) {
+		payload > maxPresencePayload || length != (presencePages(payload)+7)/8 || length != uint64(len(b)-presenceHeaderSize) || !isZeroBlock(b[32:60]) {
 		return bad()
 	}
 	p := b[presenceHeaderSize:]
@@ -151,7 +159,7 @@ func readPresence(r io.Reader, stored int64) ([]byte, uint64, error) {
 	if h.Sum32() != binary.LittleEndian.Uint32(b[60:]) {
 		return bad()
 	}
-	if tail := payload / presencePage % 8; tail != 0 && p[len(p)-1]>>tail != 0 {
+	if tail := presencePages(payload) % 8; tail != 0 && p[len(p)-1]>>tail != 0 {
 		return bad()
 	}
 	var padding [512]byte
@@ -167,10 +175,11 @@ func readPresence(r io.Reader, stored int64) ([]byte, uint64, error) {
 
 // Walk logical present intervals without allocating an interval/prefix index.
 func walkPresence(p []byte, payload uint64, visit func(uint64, uint64)) {
-	for page := uint64(0); page < payload/presencePage; {
-		end := presenceRunEnd(p, page, payload/presencePage)
+	pages := presencePages(payload)
+	for page := uint64(0); page < pages; {
+		end := presenceRunEnd(p, page, pages)
 		if presenceBit(p, page) {
-			visit(page*presencePage, end*presencePage)
+			visit(page*presencePage, min(end*presencePage, payload))
 		}
 		page = end
 	}
@@ -193,7 +202,7 @@ func validatePresenceExtents(p []byte, payload uint64, extents []extent) error {
 			if !presenceBit(p, page) {
 				return fmt.Errorf("%w: stored payload in absent page", ErrInvalidCanonicalTarstream)
 			}
-			pos = min(end, presenceRunEnd(p, page, (end+presencePage-1)/presencePage)*presencePage)
+			pos = min(end, presenceRunEnd(p, page, presencePages(end))*presencePage)
 		}
 	}
 	return nil
@@ -204,10 +213,13 @@ func (m *meta) logicalHoles() []sparse.Extent {
 		return append([]sparse.Extent(nil), m.holes...)
 	}
 	var holes []sparse.Extent
-	for page := uint64(0); page < uint64(m.payloadSize)/presencePage; {
-		end := presenceRunEnd(m.presence, page, uint64(m.payloadSize)/presencePage)
+	payload := uint64(m.payloadSize)
+	pages := presencePages(payload)
+	for page := uint64(0); page < pages; {
+		end := presenceRunEnd(m.presence, page, pages)
 		if !presenceBit(m.presence, page) {
-			holes = append(holes, sparse.Extent{Offset: page * presencePage, Size: (end - page) * presencePage})
+			start := page * presencePage
+			holes = append(holes, sparse.Extent{Offset: start, Size: min(end*presencePage, payload) - start})
 		}
 		page = end
 	}

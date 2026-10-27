@@ -6,8 +6,9 @@
 
 ## 1. 不可变本地 tarstream 与加密
 
-canonical tarstream 的plaintext结构为payload、
-`.kuasar.digest.<plainDigest>` marker body和两个trailer block。Payload PAX记录
+新写出的 canonical tarstream 的 plaintext 结构为 presence entry、payload、
+`.kuasar.digest.<plainDigest>` marker body 和两个 trailer block。Reader 也接受不含
+presence 的既有便携 carrier。Payload PAX记录
 payload boundary;marker body记录boundary和payload commitment,完整读取时再用payload
 bytes复验。完整carrier或只替换dense metadata tail的派生source可通过
 `CarrierDigest`直接给出identity,不需要先把payload编码到`io.Discard`。未传codec时
@@ -68,8 +69,12 @@ expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读�
 
 ### 1.1 页 presence 与 Zero 传输
 
-逻辑 payload 为正数、4 KiB 对齐、不超过 32 GiB，且 Hole 边界均按页对齐时，可使用
-presence profile。顺序为：
+所有新写出的 tarstream 均使用 presence v1 profile。逻辑 payload 可以为空，也可以
+以不足 4 KiB 的部分页结尾，上限为 **1 TiB**。Hole run 必须从页边界开始，在页边界
+或精确的 payload 末端结束。Writer 在元数据规划阶段拒绝超限或该格式无法表达的
+布局，此时尚未输出任何字节（包括加密 header）或读取 Data。Writer 不写旧格式，
+也不通过填充 payload 或改变 Hole 边界来满足约束。容量上限作用于可选且已声明的
+dense metadata tail 之前的 payload；tail 沿用独立的 64 MiB 上限。格式顺序为：
 
 ```text
 普通文件 .kuasar.presence.v1
@@ -80,21 +85,29 @@ presence profile。顺序为：
 
 内部 presence entry 不属于尾部 ZIP。64 字节 little-endian header 在偏移 0 保存
 `KUPRES1\n`，偏移 8 为版本 1，12 为页大小 4096，16 为 payload 长度，24 为位图长度。
-32–59 必须为零；60 处 CRC32 覆盖 header 的 0–59 字节及随后位图。Header 后紧接
-ceil(pages/8) 字节位图。未使用位及 TAR padding 必须为零。位图不包含 dense metadata
-tail，净内存最多 1 MiB。
+32–59 必须为零；60 处 CRC32 覆盖 header 的 0–59 字节及随后位图。
+pages = ceil(payload/4096)，header 后紧接 ceil(pages/8) 字节位图。空 payload 的
+位图长度为零，但仍包含 presence header 和 payload mark。最后一页止于精确的
+payload 长度；未使用位及 TAR padding 必须为零。位图不包含已声明的 dense metadata
+tail，位图原始字节数最多 **32 MiB**。
 
 P=0 表示 Hole；P=1 且无 GNU sparse payload extent 表示 Zero；P=1 且有 extent
 表示 Data。传输只包含实际 Data 和 dense tail。全 Zero payload 仍使用 GNU sparse
-元数据，不分配字面零 payload。部分页 Zero 按 Data 处理。通用字节级 Hole 来源沿用
-旧编码并保留精确孔洞边界；普通全零 Data 不做探测或压缩。GNU tar 提取后的逻辑字节正确。
+元数据，不分配字面零 payload。部分页 Zero 在同一 profile 内按字面 Data 处理。
+在页内开始，或在 payload 末端之前的页内结束的 Hole 无法用该 profile 写出，因此
+会被拒绝。任意字节长度的 dense 来源，包括 ZIP-only checkpoint 元数据，都保留
+精确长度。普通全零 Data 不做探测或压缩。GNU tar 提取后的逻辑字节正确。
 
 Presence entry 与 payload mark 必须唯一且匹配。版本、几何、校验和、未使用位、位置
 错误、重复、缺少 mark/entry 或 P=0 下存在 Data 均报错，不能回退旧格式。空名称选择
 跳过内部成员；ordinal API 保留物理 TAR entry 序号，选中 payload 时附带读取其前置
-presence。`Holes` 只报告 P=0，不包含 Zero。旧便携 carrier 继续可读。
+presence。`Holes` 只报告 P=0，不包含 Zero。旧便携 carrier 继续可读，包括空 payload
+及精确的字节级 Hole 边界。重写可读的旧 carrier 时，逻辑 source 满足新 writer
+约束就统一写 presence v1；不满足则重写失败，不会输出旧格式 carrier。Writer 生成
+空 payload、以部分页结尾或超过原有 32 GiB 限制的 payload 前，reader 必须已支持
+这些 presence 扩展。
 
-身份域及算法不变。Payload commitment 枚举逻辑 P=1 区间，散列 Data 和合成的 Zero
+身份域及算法不变。Payload commitment 枚举裁剪到 payload 长度的逻辑 P=1 区间，散列 Data 和合成的 Zero
 字节；writer 计数后流式遍历区间，不建立另一份 extent 索引。旧字面零 carrier 与等价
 的省略 Zero carrier 具有相同逻辑身份，可复用已有内容寻址对象。Zero 散列的 CPU 仍随
 逻辑长度线性增长；省略优化减少传输及分配，不消除既有身份算法要求的工作。

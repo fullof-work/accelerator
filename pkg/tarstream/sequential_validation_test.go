@@ -84,9 +84,10 @@ func TestSequentialPlaintextFullValidation(t *testing.T) {
 }
 
 func TestSequentialEmptyArtifactFinalizesAtOpen(t *testing.T) {
-	artifact := mustWrite(t, "empty", nil, nil)
-	artifact[len(artifact)-1] = 1
-	if _, _, err := SourceFrom(readerOnly{bytes.NewReader(artifact)}, ""); !errors.Is(err, ErrInvalidCanonicalTarstream) {
-		t.Fatalf("empty artifact trailer error = %v", err)
+	for _, artifact := range [][]byte{mustWrite(t, "empty", nil, nil), legacyPlaintextArtifact(t, "empty")} {
+		artifact[len(artifact)-1] = 1
+		if _, _, err := SourceFrom(readerOnly{bytes.NewReader(artifact)}, ""); !errors.Is(err, ErrInvalidCanonicalTarstream) {
+			t.Fatalf("empty artifact trailer error = %v", err)
+		}
 	}
 }

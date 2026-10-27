@@ -110,8 +110,8 @@ func TestCarrierDigestRejectsSparseMetadataTail(t *testing.T) {
 	}
 	var artifact bytes.Buffer
 	_, _, err = WriteTo(context.Background(), &artifact, "snapshot", segmentedDenseSource{Source: source, payloadSize: 8})
-	if err == nil {
-		t.Fatal("WriteTo accepted a sparse metadata tail")
+	if err == nil || !strings.Contains(err.Error(), "metadata tail") {
+		t.Fatalf("WriteTo sparse metadata tail error = %v", err)
 	}
 }
 
@@ -283,8 +283,8 @@ func TestCanonicalCarrierRejectsModifiedPayloadHeaderMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	headerOffset := len(plan.prefix) - 512
-	modified := ustarBlock(rawHeader{name: "snapshot", mode: 0o4755, size: int64(len(body)), typeflag: '0'})
+	headerOffset := len(plan.prefix) - len(plan.sparseMap) - 512
+	modified := ustarBlock(rawHeader{name: "GNUSparseFile.0/snapshot", mode: 0o4755, size: plan.stored, typeflag: '0'})
 	copy(artifact[headerOffset:headerOffset+512], modified[:])
 
 	if _, _, err := SourceAt(bytes.NewReader(artifact), int64(len(artifact)), "snapshot"); !errors.Is(err, ErrInvalidCanonicalTarstream) {

@@ -81,8 +81,8 @@ func TestEncryptedTarStreamWireStructureAndRandomization(t *testing.T) {
 	codec, _ := NewTarStreamCodec(key)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
 	again, againScheme, againDigest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
-	if len(artifact) != 4259 {
-		t.Fatalf("artifact length = %d, want 4259", len(artifact))
+	if len(artifact) != 5795 {
+		t.Fatalf("artifact length = %d, want 5795", len(artifact))
 	}
 	if !bytes.Equal(artifact[:8], []byte{0x89, 'K', 'T', 'S', 'E', 'N', 'C', '\n'}) ||
 		binary.BigEndian.Uint16(artifact[8:10]) != 1 || binary.BigEndian.Uint16(artifact[10:12]) != 48 ||
@@ -448,10 +448,10 @@ func TestEncryptedTarStreamAllHoleFinalizesAtOpen(t *testing.T) {
 
 func TestEncryptedTarStreamMarkerCrossesRecords(t *testing.T) {
 	codec, _ := NewTarStreamCodec([32]byte{5})
-	// Dense prefix 1536 + padded payload 2048 puts the marker at plaintext
-	// offset 3584, so the fixed 1536-byte marker/trailer suffix crosses a 4 KiB
-	// record boundary.
-	body := bytes.Repeat([]byte{0x5a}, 2048)
+	// The packed payload begins at a record boundary after the presence
+	// metadata. Its 3584 bytes put the marker header in the final 512 bytes of
+	// one record, with the marker body in the following record.
+	body := bytes.Repeat([]byte{0x5a}, 3584)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "image", body, nil)
 	source, _, err := tarstream.SourceAt(bytes.NewReader(artifact), int64(len(artifact)), "", tarstream.WithCodec(codec, true), tarstream.WithExpectedDigest(scheme, digest))
 	if err != nil {
