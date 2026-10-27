@@ -56,38 +56,45 @@ func writeHashUint64(h hash.Hash, value uint64) {
 	_, _ = h.Write(encoded[:])
 }
 
+// payloadExtentStats counts stored payload bytes and checks that the metadata
+// tail is dense without copying the already validated, ordered extents.
+func payloadExtentStats(extents []extent, boundary, total int64) (packed int64, tailDense bool) {
+	coveredTail := boundary
+	for _, current := range extents {
+		end := current.Offset + current.Size
+		if current.Offset < boundary {
+			packed += min(end, boundary) - current.Offset
+		}
+		if end <= boundary {
+			continue
+		}
+		start := max(current.Offset, boundary)
+		if start != coveredTail {
+			return 0, false
+		}
+		coveredTail = end
+	}
+	return packed, coveredTail == total
+}
+
+// Only legacy identity hashing needs the clipped extent array. Presence
+// carriers derive their identity layout from the bitmap instead.
 func prefixExtents(extents []extent, boundary, total int64) ([]extent, int64, bool) {
+	packed, tailDense := payloadExtentStats(extents, boundary, total)
+	if !tailDense {
+		return nil, 0, false
+	}
 	result := make([]extent, 0, len(extents))
-	var packed int64
 	for _, current := range extents {
 		if current.Offset >= boundary {
 			break
 		}
-		end := current.Offset + current.Size
-		if end > boundary {
-			end = boundary
-		}
+		end := min(current.Offset+current.Size, boundary)
 		if end > current.Offset {
 			result = append(result, extent{Offset: current.Offset, Size: end - current.Offset})
-			packed += end - current.Offset
 		}
 	}
-	coveredTail := boundary
-	for _, current := range extents {
-		start := current.Offset
-		end := current.Offset + current.Size
-		if end <= boundary {
-			continue
-		}
-		if start < boundary {
-			start = boundary
-		}
-		if start != coveredTail {
-			return nil, 0, false
-		}
-		coveredTail = end
-	}
-	return result, packed, coveredTail == total
+	return result, packed, true
 }
 
 type identityAccumulator struct {
@@ -103,13 +110,14 @@ type identityAccumulator struct {
 
 func newIdentityAccumulator(payloadSize uint64, payloadExtents []extent, payloadPacked, tailSize int64, presence []byte, storedExtents []extent) *identityAccumulator {
 	a := &identityAccumulator{
-		payload:          newPayloadHasher(payloadSize, payloadExtents),
 		tail:             newTailHasher(uint64(tailSize)),
 		payloadRemaining: payloadPacked,
 		presence:         presence, payloadSize: payloadSize, extents: storedExtents,
 	}
 	if presence != nil {
 		a.payload, a.payloadRemaining = presencePayloadHasher(payloadSize, presence)
+	} else {
+		a.payload = newPayloadHasher(payloadSize, payloadExtents)
 	}
 	return a
 }

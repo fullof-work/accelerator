@@ -248,7 +248,14 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 			return nil, "", fmt.Errorf("%w: inner tar layout does not match authenticated header", ErrMalformedEnvelope)
 		}
 	}
-	payloadExtents, payloadPacked, tailDense := prefixExtents(view.meta.extents, view.meta.payloadSize, view.meta.logical)
+	var payloadExtents []extent
+	var payloadPacked int64
+	var tailDense bool
+	if view.meta.presence == nil {
+		payloadExtents, payloadPacked, tailDense = prefixExtents(view.meta.extents, view.meta.payloadSize, view.meta.logical)
+	} else {
+		payloadPacked, tailDense = payloadExtentStats(view.meta.extents, view.meta.payloadSize, view.meta.logical)
+	}
 	if !view.meta.hasPayloadSize || !tailDense {
 		return nil, "", fmt.Errorf("%w: invalid payload boundary", ErrInvalidCanonicalTarstream)
 	}

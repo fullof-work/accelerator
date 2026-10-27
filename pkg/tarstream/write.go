@@ -72,20 +72,28 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 }
 
 type writePlan struct {
-	name           string
-	logical        int64
-	stored         int64
-	sparseMap      []byte
-	extents        []extent
-	prefix         []byte
-	packedStart    int64
-	packedSize     int64
-	payloadPad     int
-	plaintextSize  int64
-	payloadSize    int64
-	payloadPacked  int64
-	payloadExtents []extent
-	presence       []byte
+	name          string
+	logical       int64
+	stored        int64
+	sparseMap     []byte
+	extents       []extent
+	prefixParts   [5][]byte
+	packedStart   int64
+	packedSize    int64
+	payloadPad    int
+	plaintextSize int64
+	payloadSize   int64
+	payloadPacked int64
+	presence      []byte
+}
+
+func (p *writePlan) writePrefix(w io.Writer) error {
+	for _, part := range p.prefixParts {
+		if err := writeFull(w, part); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
@@ -107,8 +115,8 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		return nil, fmt.Errorf("tarstream: %s: size %d overflows", name, src.Size())
 	}
 	size := int64(src.Size())
-	// Conservative charge covers slice growth/copies, prefixExtents, decimal
-	// map construction and its copied carrier prefix, plus payload buffers.
+	// Conservative charge covers slice growth/copies, decimal map construction
+	// and its copied payload prefix, plus payload and layout-hash buffers.
 	indexMemory := uint64(2 << 20)
 	charge := func(n uint64) error {
 		if memoryLimit != 0 && (indexMemory > memoryLimit || n > memoryLimit-indexMemory) {
@@ -165,6 +173,16 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		if end <= off || end > uint64(size) {
 			return nil, fmt.Errorf("tarstream: invalid source run")
 		}
+		if off < uint64(payloadSize) {
+			presenceEnd := min(end, uint64(payloadSize))
+			if kind == sparse.Hole {
+				if off%presencePage != 0 || (presenceEnd != uint64(payloadSize) && presenceEnd%presencePage != 0) {
+					return nil, fmt.Errorf("tarstream: source presence changed during planning")
+				}
+			} else if kind == sparse.Data || kind == sparse.Zero {
+				setPresenceRange(presence, off/presencePage, presencePages(presenceEnd))
+			}
+		}
 		switch kind {
 		case sparse.Hole:
 			// Absent pages are recorded by the presence bitmap.
@@ -199,7 +217,7 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 		dataSize += e.Size
 	}
 
-	payloadExtents, payloadPacked, tailDense := prefixExtents(extents, payloadSize, size)
+	payloadPacked, tailDense := payloadExtentStats(extents, payloadSize, size)
 	if !tailDense {
 		return nil, fmt.Errorf("tarstream: %s: metadata tail [%d,%d) contains a hole", name, payloadSize, size)
 	}
@@ -233,37 +251,34 @@ func makeWritePlanLimited(ctx context.Context, name string, src sparse.Source, m
 	stored := int64(len(sparseMap)) + dataSize
 
 	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize, true)
-	body := presenceBody(presence, uint64(payloadSize))
-	h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: int64(len(body)), typeflag: '0'})
-	var full bytes.Buffer
-	full.Grow(512 + (len(body)+511)/512*512 + len(prefix))
-	full.Write(h[:])
-	full.Write(body)
-	if pad := (512 - len(body)%512) % 512; pad > 0 {
-		full.Write(zeroBlock[:pad])
+	presenceHeader := makePresenceHeader(presence, uint64(payloadSize))
+	bodySize := presenceHeaderSize + len(presence)
+	h := ustarBlock(rawHeader{name: presenceName, mode: 0o444, size: int64(bodySize), typeflag: '0'})
+	presencePad := (512 - bodySize%512) % 512
+	prefixParts := [5][]byte{h[:], presenceHeader[:], presence, zeroBlock[:presencePad], prefix}
+	var packedStart int64
+	for _, part := range prefixParts {
+		packedStart += int64(len(part))
 	}
-	full.Write(prefix)
-	prefix = full.Bytes()
 	payloadPad := int((512 - stored%512) % 512)
-	plaintextSize := int64(len(prefix)) + dataSize + int64(payloadPad) + canonicalSuffixSize
+	plaintextSize := packedStart + dataSize + int64(payloadPad) + canonicalSuffixSize
 	if plaintextSize < 0 || plaintextSize > 1<<62 {
 		return nil, fmt.Errorf("tarstream: %s: artifact size overflows", name)
 	}
 	return &writePlan{
-		name:           name,
-		logical:        size,
-		stored:         stored,
-		sparseMap:      sparseMap,
-		extents:        extents,
-		prefix:         prefix,
-		packedStart:    int64(len(prefix)),
-		packedSize:     dataSize,
-		payloadPad:     payloadPad,
-		plaintextSize:  plaintextSize,
-		payloadSize:    payloadSize,
-		payloadPacked:  payloadPacked,
-		payloadExtents: payloadExtents,
-		presence:       presence,
+		name:          name,
+		logical:       size,
+		stored:        stored,
+		sparseMap:     sparseMap,
+		extents:       extents,
+		prefixParts:   prefixParts,
+		packedStart:   packedStart,
+		packedSize:    dataSize,
+		payloadPad:    payloadPad,
+		plaintextSize: plaintextSize,
+		payloadSize:   payloadSize,
+		payloadPacked: payloadPacked,
+		presence:      presence,
 	}, nil
 }
 
@@ -332,9 +347,9 @@ func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseE
 // writer. Data extents are read once; Zero extents are synthesized.
 func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source, beforeCommit func(context.Context) error) ([32]byte, error) {
 	identity := newIdentityAccumulator(
-		uint64(plan.payloadSize), plan.payloadExtents, plan.payloadPacked, plan.logical-plan.payloadSize, plan.presence, plan.extents,
+		uint64(plan.payloadSize), nil, plan.payloadPacked, plan.logical-plan.payloadSize, plan.presence, plan.extents,
 	)
-	if err := writeFull(w, plan.prefix); err != nil {
+	if err := plan.writePrefix(w); err != nil {
 		return [32]byte{}, err
 	}
 	payloadWriter := io.MultiWriter(w, identity)

@@ -283,7 +283,7 @@ func TestCanonicalCarrierRejectsModifiedPayloadHeaderMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	headerOffset := len(plan.prefix) - len(plan.sparseMap) - 512
+	headerOffset := int(plan.packedStart) - len(plan.sparseMap) - 512
 	modified := ustarBlock(rawHeader{name: "GNUSparseFile.0/snapshot", mode: 0o4755, size: plan.stored, typeflag: '0'})
 	copy(artifact[headerOffset:headerOffset+512], modified[:])
 
@@ -311,7 +311,7 @@ func TestCanonicalCarrierRejectsNonzeroPayloadPadding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paddingOffset := len(plan.prefix) + len(body)
+	paddingOffset := int(plan.packedStart) + len(body)
 	artifact[paddingOffset] = 1
 
 	if _, _, err := SourceAt(bytes.NewReader(artifact), int64(len(artifact)), "snapshot", WithExpectedDigest(DigestScheme, digest)); !errors.Is(err, ErrInvalidCanonicalTarstream) {

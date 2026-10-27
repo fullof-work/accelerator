@@ -366,7 +366,7 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	if !first.canonicalPayload {
 		return zero, false, fmt.Errorf("%w: non-canonical payload header metadata", ErrInvalidCanonicalTarstream)
 	}
-	_, payloadPacked, dense := prefixExtents(first.extents, first.payloadSize, first.logical)
+	payloadPacked, dense := payloadExtentStats(first.extents, first.payloadSize, first.logical)
 	if !dense {
 		return zero, false, fmt.Errorf("%w: metadata tail contains a hole", ErrInvalidCanonicalTarstream)
 	}
@@ -921,6 +921,38 @@ func (v *seqView) Name() string           { return v.meta.name }
 func (v *seqView) Size() int64            { return v.logical }
 func (v *seqView) Holes() []sparse.Extent { return v.meta.logicalHoles() }
 
+// advanceTo skips omitted logical bytes without synthesizing zeros. Stored
+// bytes still pass through Read to preserve hashing and final verification.
+func (v *seqView) advanceTo(ctx context.Context, target int64) error {
+	for v.pos < target {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if v.finalErr != nil {
+			return v.finalErr
+		}
+		for v.extIdx < len(v.extents) && v.pos >= v.extents[v.extIdx].Offset+v.extents[v.extIdx].Size {
+			v.extIdx++
+		}
+		if v.extIdx == len(v.extents) {
+			v.pos = target
+			break
+		}
+		e := v.extents[v.extIdx]
+		if v.pos < e.Offset {
+			v.pos = min(target, e.Offset)
+			continue
+		}
+		end := min(target, e.Offset+e.Size)
+		if _, err := io.CopyN(io.Discard, v, end-v.pos); err != nil {
+			return err
+		}
+	}
+	// CopyN can satisfy its byte count even when the last Read also reports a
+	// verification failure. Preserve that failure before exposing later bytes.
+	return v.finalErr
+}
+
 func (v *seqView) Read(p []byte) (int, error) {
 	if v.finalErr != nil {
 		return 0, v.finalErr
@@ -1283,19 +1315,14 @@ func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int
 		n = int(size - offset)
 		eof = io.EOF
 	}
-	// One-pass: discard forward, then fill. The view synthesizes
-	// zeros across holes, so skipping a hole region never touches the
-	// underlying source.
+	// One-pass: consume stored bytes on the way forward, then fill.
 	pos := uint64(s.seq.pos)
 	if offset < pos {
 		return 0, readerr.Mark(fmt.Errorf("tarstream: backward ReadAt @ %d (position %d) on one-pass source", offset, pos), false)
 	}
 	if offset > pos {
-		if _, err := io.CopyN(io.Discard, s.seq, int64(offset-pos)); err != nil {
+		if err := s.seq.advanceTo(ctx, int64(offset)); err != nil {
 			return 0, err
-		}
-		if s.seq.finalErr != nil {
-			return 0, s.seq.finalErr
 		}
 	}
 	read, err := readFixed(s.seq, buf[:n])

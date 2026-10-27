@@ -130,7 +130,7 @@ func TestPresenceOneTiBLimitExcludesDenseMetadataTail(t *testing.T) {
 	}
 	// Parse the actual planned presence member. This verifies the full 32 MiB
 	// bitmap boundary without materializing the 1 TiB logical hole.
-	bitmap, declared, err := readPresence(bytes.NewReader(plan.prefix[512:]), int64(presenceHeaderSize+len(plan.presence)))
+	bitmap, declared, err := readPlannedPresence(plan)
 	if err != nil || declared != payload || !bytes.Equal(bitmap, plan.presence) {
 		t.Fatalf("1 TiB reader boundary: payload=%d bitmap=%d error=%v", declared, len(bitmap), err)
 	}
@@ -190,7 +190,7 @@ func TestPresencePartialPageBitmapBoundaries(t *testing.T) {
 			if plan.presence == nil || len(plan.presence) != tc.bytes || plan.logical != int64(tc.payload) || source.reads != 0 {
 				t.Fatalf("partial-page plan: bitmap=%v logical=%d reads=%d", plan.presence, plan.logical, source.reads)
 			}
-			bitmap, payload, err := readPresence(bytes.NewReader(plan.prefix[512:]), int64(presenceHeaderSize+tc.bytes))
+			bitmap, payload, err := readPlannedPresence(plan)
 			if err != nil || bitmap == nil || len(bitmap) != tc.bytes || payload != tc.payload {
 				t.Fatalf("partial-page presence: payload=%d bitmap=%v error=%v", payload, bitmap, err)
 			}
