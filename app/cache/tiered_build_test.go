@@ -499,7 +499,7 @@ func TestBuildTieredChain_PartialFailureRollsBack(t *testing.T) {
 		t.Fatalf("read LOCK: %v", err)
 	}
 	// LOCK file exists, but a closed rocks.Store leaves it as an empty
-	// file (grocksdb recreates and unlocks). The real proof of release
+	// file (RocksDB recreates and unlocks). The real proof of release
 	// is that a fresh Open() succeeds on the same path.
 	if len(data) > 0 {
 		t.Logf("LOCK exists with %d bytes, verifying rocks is reopenable", len(data))

@@ -5,13 +5,13 @@ package rocks
 import (
 	"strings"
 
-	grocksdb "github.com/linxGnu/grocksdb"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks/internal/native"
 )
 
 // getCFStats reads RocksDB property strings for the given column family.
-func getCFStats(db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, name string) CFStats {
+func getCFStats(db *native.DB, cf int, name string) CFStats {
 	get := func(prop string) string {
-		v := db.GetPropertyCF(prop, cf)
+		v := db.Property(cf, prop)
 		return strings.TrimSpace(v)
 	}
 	return CFStats{
@@ -26,6 +26,11 @@ func getCFStats(db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, name string) C
 
 // AllStats returns stats for all column families in the store.
 func (s *impl) AllStats() []CFStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil
+	}
 	var result []CFStats
 	for name, cf := range s.cfh {
 		if name == cfDefault {

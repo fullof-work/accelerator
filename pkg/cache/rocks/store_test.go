@@ -16,7 +16,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/freq"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
-	grocksdb "github.com/linxGnu/grocksdb"
 )
 
 // tempRocksConfigT is the testing.T flavour of tempRocksConfig (which
@@ -40,6 +39,7 @@ func TestBlobCF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	defer s.Close()
 	ctx := context.Background()
 	k := store.ContentKey(sha256.Sum256([]byte("blob-cf-test")))
 	data := []byte("blob value in its own CF")
@@ -103,18 +103,15 @@ func TestPersistFnRoundtrip(t *testing.T) {
 	var size int
 	var firstByte byte
 	for time.Now().Before(deadline) {
-		ro := grocksdb.NewDefaultReadOptions()
-		slice, err := s1.db.GetCF(ro, s1.cfh[cfDefault], []byte(freq.ReservedSketchKey))
-		ro.Destroy()
+		slice, err := rawRead(s1, cfDefault, []byte(freq.ReservedSketchKey))
 		if err != nil {
 			t.Fatalf("GetCF(ReservedSketchKey): %v", err)
 		}
 		if slice != nil {
-			size = slice.Size()
+			size = len(slice)
 			if size > 0 {
-				firstByte = slice.Data()[0]
+				firstByte = slice[0]
 			}
-			slice.Free()
 		}
 		if size > 0 {
 			break
@@ -228,32 +225,27 @@ func TestCompactionFilterEvictsColdKeys(t *testing.T) {
 
 	// Force memtable → L0 SST for both CFs so compaction actually runs
 	// over the data (CompactionFilter does not see memtable entries).
-	flushOpts := grocksdb.NewDefaultFlushOptions()
-	defer flushOpts.Destroy()
 	for _, cfName := range []string{cfChunk, cfManifest} {
-		if err := s.db.FlushCF(s.cfh[cfName], flushOpts); err != nil {
+		if err := s.db.Flush(s.cfh[cfName]); err != nil {
 			t.Fatalf("FlushCF %s: %v", cfName, err)
 		}
 	}
 
 	// Synchronous manual compaction on both data CFs. This invokes
 	// sketchCompactionFilter.Filter() on every key.
-	s.compactAll()
+	if err := s.compactAll(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify: cold keys gone, hot keys preserved. Don't use s.Get here
 	// because Get itself Touches the sketch; read through db.GetCF so
 	// the post-compaction state is observed untouched.
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
 	for _, e := range entries {
-		slice, err := s.db.GetCF(ro, s.cfh[e.kv.ns], e.kv.key)
+		slice, err := rawRead(s, e.kv.ns, e.kv.key)
 		if err != nil {
 			t.Fatalf("%s post-compact GetCF: %v", e.name, err)
 		}
-		present := slice != nil && slice.Size() > 0
-		if slice != nil {
-			slice.Free()
-		}
+		present := slice != nil && len(slice) > 0
 		if e.hot && !present {
 			t.Errorf("%s: hot key was evicted by CompactionFilter (expected preserved)", e.name)
 		}
@@ -273,7 +265,7 @@ func TestCompactionFilterUnarmedPreserves(t *testing.T) {
 	f := newSketchCompactionFilter()
 
 	// State 1: sketch=nil, armed=false. Every key is preserved.
-	if remove, _ := f.Filter(0, []byte("any-key"), nil); remove {
+	if remove := f.Evict([]byte("any-key")); remove {
 		t.Fatal("filter with sketch=nil, armed=false removed a key (recovery-window invariant broken)")
 	}
 
@@ -283,14 +275,14 @@ func TestCompactionFilterUnarmedPreserves(t *testing.T) {
 	s := freq.New(freq.Config{EvictThreshold: 15})
 	f.SetSketch(s)
 	defer s.Close()
-	if remove, _ := f.Filter(0, []byte("any-key"), nil); remove {
+	if remove := f.Evict([]byte("any-key")); remove {
 		t.Fatal("filter with sketch=set, armed=false removed a key (Arm gate bypassed)")
 	}
 
 	// State 3: armed. Now the sketch decides. A never-Touch-ed key has
 	// Estimate = 0, threshold = 15, so ShouldEvict = true.
 	f.Arm()
-	if remove, _ := f.Filter(0, []byte("any-key"), nil); !remove {
+	if remove := f.Evict([]byte("any-key")); !remove {
 		t.Fatal("filter with armed=true and cold key failed to remove (armed gate not effective)")
 	}
 }
@@ -328,10 +320,8 @@ func TestBlobDBEnabled(t *testing.T) {
 	// Force memtable → L0 SST so BlobDB's SST-builder path runs.
 	// Without this, values stay in memtable and no .blob file is
 	// ever written.
-	flushOpts := grocksdb.NewDefaultFlushOptions()
-	defer flushOpts.Destroy()
 	for _, cf := range []string{cfChunk, cfManifest} {
-		if err := s.db.FlushCF(s.cfh[cf], flushOpts); err != nil {
+		if err := s.db.Flush(s.cfh[cf]); err != nil {
 			t.Fatalf("FlushCF %s: %v", cf, err)
 		}
 	}
@@ -356,4 +346,14 @@ func TestBlobDBEnabled(t *testing.T) {
 		t.Fatalf("expected at least one .blob file after Flush; rocks dir contents: %v", allNames)
 	}
 	t.Logf("BlobDB produced %d .blob file(s) in %s", len(blobFiles), filepath.Base(cfg.Path))
+}
+
+// rawRead bypasses frequency accounting while still releasing pinned memory.
+func rawRead(s *impl, ns string, key []byte) ([]byte, error) {
+	var data []byte
+	_, err := s.db.Read(s.cfh[ns], key, func(n int) []byte {
+		data = make([]byte, n)
+		return data
+	})
+	return data, err
 }

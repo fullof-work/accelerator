@@ -13,257 +13,144 @@ import (
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/freq"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks/internal/native"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
-	grocksdb "github.com/linxGnu/grocksdb"
 )
 
-// ErrReadOnly is returned by Put on a impl opened via OpenReadOnly.
+// ErrReadOnly is returned by writes to a store opened with OpenReadOnly.
 var ErrReadOnly = errors.New("rocks: store is read-only")
 
-// roPool is a sync.Pool for reusing grocksdb.ReadOptions. Shared across
-// all Get calls to avoid the CGO allocation cost of a fresh options
-// object on every read.
-var roPool = sync.Pool{
-	New: func() any { return grocksdb.NewDefaultReadOptions() },
-}
+// errClosed distinguishes use after shutdown from an ordinary cache miss.
+var errClosed = errors.New("rocks: store is closed")
 
-// impl wraps a RocksDB instance with column-family separation.
-//
-// Sketch ownership is internal: Open constructs a freq.Sketch from the
-// provided FreqConfig, restores persisted state from CF_DEFAULT, and
-// cascades sketch.Close during impl.Close. Callers never construct or
-// close the sketch directly.
+// impl owns a private native DB and the existing Go frequency sketch.
+// mu gates the full request, including pin-to-BlobPool copying and Touch.
+// The sketch persister is joined separately before native shutdown.
 type impl struct {
-	db       *grocksdb.DB
-	cfh      map[string]*grocksdb.ColumnFamilyHandle
-	sketch   *freq.Sketch
-	filter   *sketchCompactionFilter // nil for OpenReadOnly stores
-	ro       *grocksdb.ReadOptions
-	wo       *grocksdb.WriteOptions
-	readOnly bool
+	mu        sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
+	db        *native.DB
+	cfh       map[string]int
+	sketch    *freq.Sketch
+	readOnly  bool
 }
 
-// Compile-time assertion that impl satisfies Interface.
 var _ Interface = (*impl)(nil)
 
-// Open creates or opens a RocksDB store at the given path in read-write
-// mode. The sketch is constructed internally from freqCfg and persisted
-// state is restored from CF_DEFAULT if present. Legacy sketch formats are
-// discarded with a log message — the sketch starts empty in that case.
-//
-// Construction order (resolves two chicken-and-egg problems):
-//  1. Build the CompactionFilter before opening the DB — grocksdb's
-//     COWList captures it, so any startup/recovery compaction triggered
-//     inside OpenDbColumnFamilies sees armed=false and unconditionally
-//     preserves every key.
-//  2. Populate the impl struct (db/cfh/ro/wo fields) before building
-//     the sketch. The sketch's persistLoop closure captures the impl
-//     pointer, and Go's memory model guarantees that writes preceding
-//     the `go` statement inside freq.New are visible to the new
-//     goroutine — so the first persist tick observes a fully-populated
-//     impl.
-//  3. Install the sketch on the filter and Arm it only after the sketch
-//     has been restored from CF_DEFAULT. From that moment compaction
-//     threads consult real frequency data.
+// Open opens the fixed cache CFs and restores their frequency sketch before
+// enabling eviction. Unsupported legacy sketch encodings still start empty.
 func Open(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (Interface, error) {
 	return openImpl(cfg, freqCfg)
 }
 
-// openImpl is the internal constructor that returns the concrete
-// *impl type. Used by tests that need access to unexported fields
-// (db / cfh / sketch / compactAll / put / get). External callers go
-// through Open which returns Interface.
 func openImpl(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (*impl, error) {
-	opts := BuildOptions(cfg)
-
-	// (1) Attach the (unarmed, sketch-less) compaction filter to the
-	// chunk and manifest CFs. grocksdb retains the Go object via its
-	// COWList. CF_DEFAULT holds ReservedSketchKey and other control
-	// metadata — it must NOT run through this filter.
 	filter := newSketchCompactionFilter()
-	opts.ChunkCF.SetCompactionFilter(filter)
-	opts.ManifestCF.SetCompactionFilter(filter)
-	opts.BlobCF.SetCompactionFilter(filter)
-
-	cfNames := []string{cfDefault, cfChunk, cfManifest, cfBlob}
-	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF, opts.BlobCF}
-
-	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(opts.DBOpts, cfg.Path, cfNames, cfOpts)
+	// The callback remains unarmed through DB recovery and sketch restoration.
+	db, err := native.Open(cfg.Path, buildConfig(cfg), false, filter.Evict)
 	if err != nil {
 		return nil, fmt.Errorf("rocks: open %s: %w", cfg.Path, err)
 	}
-
-	cfh := make(map[string]*grocksdb.ColumnFamilyHandle, len(cfNames))
-	for i, name := range cfNames {
-		cfh[name] = cfHandles[i]
+	var data []byte
+	_, getErr := db.Read(native.Default, []byte(freq.ReservedSketchKey), func(n int) []byte {
+		data = make([]byte, n)
+		return data
+	})
+	if getErr != nil {
+		// A storage error is not missing/legacy metadata. Leave the filter
+		// unarmed and tear down all resources rather than evicting blindly.
+		_ = db.Close()
+		return nil, fmt.Errorf("rocks: restore sketch: %w", getErr)
 	}
-
-	// (2) Populate impl fields BEFORE the sketch is built. The closure
-	// below captures `store`, and freq.New's persistLoop goroutine only
-	// runs after this point — Go's memory model guarantees the captured
-	// pointer sees initialised fields.
-	inst := &impl{
-		db:       db,
-		cfh:      cfh,
-		filter:   filter,
-		ro:       grocksdb.NewDefaultReadOptions(),
-		wo:       grocksdb.NewDefaultWriteOptions(),
-		readOnly: false,
-	}
-
+	inst := &impl{db: db, cfh: cfIndexes()}
 	sketch := buildSketch(freqCfg, func(data []byte) {
-		// Tick-path background persister. Mirrors the sync path in
-		// persistSketch but is driven by freq.Sketch's persistLoop.
-		if inst.readOnly || inst.wo == nil {
-			return
-		}
-		if err := inst.db.PutCF(inst.wo, inst.cfh[cfDefault], []byte(freq.ReservedSketchKey), data); err != nil {
+		// No lifecycle lock: Close joins this goroutine before closing db.
+		if err := db.Put(native.Default, []byte(freq.ReservedSketchKey), data); err != nil {
 			log.Printf("rocks: background sketch persist failed: %v", err)
 		}
 	})
 	inst.sketch = sketch
 	filter.SetSketch(sketch)
 
-	// (3) Restore persisted sketch from CF_DEFAULT. No concurrent users
-	// exist yet — the filter is still unarmed and Get/Put aren't exposed.
-	ro := grocksdb.NewDefaultReadOptions()
-	data, getErr := db.GetCF(ro, cfh[cfDefault], []byte(freq.ReservedSketchKey))
-	ro.Destroy()
-	if getErr == nil && data != nil && data.Size() > 0 {
-		if err := sketch.Unmarshal(data.Data()); err != nil {
+	if len(data) > 0 {
+		if err := sketch.Unmarshal(data); err != nil {
 			log.Printf("rocks: discarding persisted sketch: %v", err)
 		}
 	}
-	if data != nil {
-		data.Free()
-	}
-
-	// (4) Open the gate — unless the caller has asked to disable
-	// eviction entirely (freq.disable_eviction in the YAML config).
-	// When the local daemon plays the "origin" role for a downstream
-	// tiered instance, writes land once and must stay put: arming the
-	// filter in that context would silently drop once-touched keys on
-	// the first compaction pass.
 	if !freqCfg.DisableEviction {
 		filter.Arm()
 	}
-
 	return inst, nil
 }
 
-// OpenReadOnly opens a RocksDB store in read-only mode using RocksDB's
-// secondary-instance semantics. Intended for inspection tools (e.g.
-// `cache-ctl info`) that must not perturb a live database: no WAL is
-// written, no MANIFEST update occurs, no recovery replay runs, and no
-// sketch is constructed or persisted. Put on such a store returns
-// ErrReadOnly unconditionally.
+// OpenReadOnly uses RocksDB OpenForReadOnly with error_if_wal_file_exists=false,
+// matching the existing API. It may replay WAL into memory; it is not a
+// secondary instance. No sketch is constructed and writes are rejected.
 func OpenReadOnly(cfg runtime.RocksConfig) (Interface, error) {
 	return openReadOnlyImpl(cfg)
 }
 
-// openReadOnlyImpl is the internal read-only constructor exposing the
-// concrete *impl type. See openImpl for rationale.
 func openReadOnlyImpl(cfg runtime.RocksConfig) (*impl, error) {
-	opts := BuildOptions(cfg)
-
-	cfNames := []string{cfDefault, cfChunk, cfManifest, cfBlob}
-	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF, opts.BlobCF}
-
-	// errorIfWalFileExists=false tolerates a crashed-but-not-recovered WAL.
-	db, cfHandles, err := grocksdb.OpenDbForReadOnlyColumnFamilies(
-		opts.DBOpts, cfg.Path, cfNames, cfOpts, false,
-	)
+	db, err := native.Open(cfg.Path, buildConfig(cfg), true, nil)
 	if err != nil {
 		return nil, fmt.Errorf("rocks: open read-only %s: %w", cfg.Path, err)
 	}
-
-	cfh := make(map[string]*grocksdb.ColumnFamilyHandle, len(cfNames))
-	for i, name := range cfNames {
-		cfh[name] = cfHandles[i]
-	}
-
-	return &impl{
-		db:       db,
-		cfh:      cfh,
-		sketch:   nil, // intentional: inspect tooling never touches frequency state
-		ro:       grocksdb.NewDefaultReadOptions(),
-		wo:       nil, // intentional: any Put is rejected at the Go layer
-		readOnly: true,
-	}, nil
+	return &impl{db: db, cfh: cfIndexes(), readOnly: true}, nil
 }
 
-// sketch returns the store's frequency sketch. nil if the store was opened
-// via OpenReadOnly. Intended for CompactionFilter integration — callers
-// should NOT invoke Touch on it; Touch is handled internally by get/put.
+func cfIndexes() map[string]int {
+	return map[string]int{cfDefault: native.Default, cfChunk: native.Chunk,
+		cfManifest: native.Manifest, cfBlob: native.Blob}
+}
+
 func (s *impl) Sketch() *freq.Sketch { return s.sketch }
 
-// get retrieves a value by namespace and key and wraps it in a
-// refcounted cache.Blob. The blob is backed by a buffer borrowed from
-// the chunk or manifest value pool (selected by ns); the buffer
-// returns to the pool when the last Clone of the returned blob is
-// Released.
-//
-// The ctx parameter is accepted for interface parity with other
-// cache layers but is NOT honoured: grocksdb's CGO GetCF is a
-// synchronous blocking call and cannot be cancelled mid-operation.
-// Callers that need a hard wall-clock bound should wrap the get in
-// a goroutine + select on ctx.Done.
+// get is synchronous; ctx cannot cancel an in-progress native Get.
 func (s *impl) get(ctx context.Context, ns string, key []byte) (cache.Blob, bool, error) {
-	// Touch before the actual read so that a Get call — regardless of
-	// hit/miss — registers frequency. This matches the pre-refactor
-	// "Touch before backend.Get" ordering in wire_handler.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, false, errClosed
+	}
 	if s.sketch != nil {
 		s.sketch.Touch(key)
 	}
-
 	cf, ok := s.cfh[ns]
 	if !ok {
-		cf = s.cfh[cfChunk]
+		cf = native.Chunk
 	}
-
-	// Use per-call ReadOptions to avoid CGO contention on shared s.ro.
-	ro := roPool.Get().(*grocksdb.ReadOptions)
-	slice, err := s.db.GetCF(ro, cf, key)
-	roPool.Put(ro)
+	var blob cache.Blob
+	found, err := s.db.Read(cf, key, func(n int) []byte {
+		// Preserve the former store's empty-value-as-miss behavior.
+		if n == 0 {
+			return nil
+		}
+		var buf []byte
+		buf, blob = poolForNS(ns).Alloc(n)
+		return buf
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("rocks: get: %w", err)
 	}
-	defer slice.Free()
-
-	if slice.Size() == 0 {
-		return nil, false, nil
-	}
-
-	// Pick the right-sized pool (chunk vs manifest) and borrow a
-	// buffer, copying the grocksdb slice contents into it before
-	// the slice.Free() (deferred above) runs.
-	pool := poolForNS(ns)
-	buf, blob := pool.Alloc(slice.Size())
-	copy(buf, slice.Data())
-	return blob, true, nil
+	return blob, found && blob != nil, nil
 }
 
-// put writes a value by namespace and key.
-//
-// Read-only stores return ErrReadOnly without touching the DB. On success,
-// the key is registered in the frequency sketch — failed puts do not
-// occupy frequency budget (deliberate correction over the pre-refactor
-// handler-level Touch, which counted failed writes).
-//
-// The ctx parameter is accepted for interface parity but not honoured;
-// see the note on get.
 func (s *impl) put(ctx context.Context, ns string, key, value []byte) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return errClosed
+	}
 	if s.readOnly {
 		return ErrReadOnly
 	}
-
 	cf, ok := s.cfh[ns]
 	if !ok {
-		cf = s.cfh[cfChunk]
+		cf = native.Chunk
 	}
-
-	if err := s.db.PutCF(s.wo, cf, key, value); err != nil {
+	if err := s.db.Put(cf, key, value); err != nil {
 		return fmt.Errorf("rocks: put: %w", err)
 	}
 	if s.sketch != nil {
@@ -272,54 +159,55 @@ func (s *impl) put(ctx context.Context, ns string, key, value []byte) error {
 	return nil
 }
 
-// PersistSketch saves the current sketch state to the reserved key.
-// Noop for read-only stores and for stores without a sketch.
 func (s *impl) PersistSketch() {
-	if s.readOnly || s.sketch == nil || s.wo == nil {
-		return
-	}
-	data := s.sketch.Marshal()
-	if len(data) > 0 {
-		_ = s.db.PutCF(s.wo, s.cfh[cfDefault], []byte(freq.ReservedSketchKey), data)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.closed {
+		_ = s.persistSketch()
 	}
 }
 
-// Close closes the store and all column family handles. Order:
-//  1. PersistSketch (read-write only) — flush external state first.
-//  2. sketch.Close — stop background goroutines.
-//  3. grocksdb resource release — last, so nothing above touches a freed DB.
+func (s *impl) persistSketch() error {
+	if s.sketch == nil {
+		return nil
+	}
+	return s.db.Put(native.Default, []byte(freq.ReservedSketchKey), s.sketch.Marshal())
+}
+
+// Close first drains requests, then joins sketch workers, persists their final
+// state and destroys the native owner. DB destruction joins compactions before
+// the bridge releases the filter and its cgo.Handle. Concurrent Close is safe.
 func (s *impl) Close() error {
-	if !s.readOnly {
-		s.PersistSketch()
-	}
-	if s.sketch != nil {
-		_ = s.sketch.Close()
-	}
-
-	if s.ro != nil {
-		s.ro.Destroy()
-	}
-	if s.wo != nil {
-		s.wo.Destroy()
-	}
-	for _, h := range s.cfh {
-		h.Destroy()
-	}
-	s.db.Close()
-	return nil
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		if s.sketch != nil {
+			_ = s.sketch.Close()
+		}
+		s.closeErr = errors.Join(s.persistSketch(), s.db.Close())
+	})
+	return s.closeErr
 }
 
-// compactAll triggers manual compaction on all column families.
-// Internal — exposed only to package-internal tests.
-func (s *impl) compactAll() {
-	for _, cf := range s.cfh {
-		s.db.CompactRangeCF(cf, grocksdb.Range{Start: nil, Limit: nil})
+// compactAll is used by tests; it shares the request lifecycle gate.
+func (s *impl) compactAll() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return errClosed
 	}
+	for _, cf := range s.cfh {
+		if err := s.db.Compact(cf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------
 // Interface methods: cache.Tier (object-level) and cache.ShardTier
-// (shard-level with hash||idx key encoding).
+// (shard-level with fixed-suffix key encoding).
 // ---------------------------------------------------------------------
 
 // Get implements cache.Getter. Object-level read routed to the CF
