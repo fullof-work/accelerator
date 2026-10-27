@@ -163,6 +163,8 @@ REF 按参数顺序通过 `fetch.NewLayered` 组合，第一个为顶层。Data 
 
 Tarstream 输出保留稀疏元数据。`crypto.local=off` 输出 plaintext；`auto|required` 输出 encrypted v1。不可寻址 stdin 使用 tarstream，Bundle 随机读取通过文件/ref 提供。上述 transfer 路径不生成完整镜像缓存或 staging 文件。
 
+新 tarstream 输出统一使用 [presence v1](file-artifacts_zh.md#11-页-presence-与-zero-传输)：可选且已声明的 metadata tail 之前的最终 payload 上限为 1 TiB；支持空 payload 和任意字节长度的 dense 窗口，不填充数据。每个 Hole 必须从页边界开始，在页边界或精确的 payload 末端结束。`--offset`/`--length` 窗口或旧输入 carrier 含有无法表达的 Hole 边界时，在写出 tarstream 字节前拒绝，不改变边界，也不改写成旧格式。既有旧 tarstream 仍可读取。这些 tarstream 输出约束不会限制仅写 Store 或 Bundle 的字节粒度输出。
+
 ```bash
 # 按 top → bottom 读取、合并层
 manifest-ctl load --output merged.tar A B C

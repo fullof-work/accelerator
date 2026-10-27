@@ -6,7 +6,7 @@ This specification owns the generic immutable-file encryption, tarstream and mul
 
 ## 1. Immutable local tarstreams and encryption
 
-A canonical plaintext tarstream contains the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Full reads recompute the commitment from payload bytes.
+New canonical plaintext tarstreams contain a presence entry, the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Readers also accept existing portable carriers without presence. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Full reads recompute the commitment from payload bytes.
 
 A complete carrier, or a derived source replacing only its dense metadata tail, can report identity through `CarrierDigest` without first encoding the payload into `io.Discard`. Without a codec, the public identity is `digest:<plainDigest>`. A derived dense metadata tail is limited to **64 MiB**; readers and writers share this limit and reject oversized declarations before hashing. Payload PAX/ustar transport metadata, including mode, ownership and timestamps, uses fixed canonical encoding and cannot change while retaining the same identity.
 
@@ -42,8 +42,14 @@ If a caller stops early, no full-validation conclusion applies to unread data. P
 
 ### 1.1 Page presence and Zero transport
 
-A positive, 4 KiB-aligned payload of at most 32 GiB whose Hole boundaries are
-page-aligned can use the presence profile. Its order is:
+Every new tarstream uses the presence v1 profile. Its logical payload may be
+empty or end in a partial 4 KiB page, and is limited to **1 TiB**. Hole runs must
+start on a page boundary and end either on a page boundary or at the exact
+payload end. Writers reject oversized or unrepresentable layouts during metadata
+planning, before emitting any bytes (including an encrypted header) or reading
+Data. They do not write the old format, pad the payload or alter Hole boundaries.
+The size limit applies to the payload before its optional declared dense metadata
+tail; that tail retains its separate 64 MiB limit. The profile's order is:
 
 ```text
 regular .kuasar.presence.v1
@@ -55,26 +61,37 @@ two zero TAR trailer blocks
 The internal presence entry is not a tail ZIP member. Its 64-byte little-endian
 header contains magic `KUPRES1\n` at 0, version 1 at 8, page size 4096 at 12,
 payload length at 16 and bitmap length at 24. Bytes 32–59 are zero. CRC32 at 60
-covers header bytes 0–59 followed by the bitmap; exactly ceil(pages/8) bitmap bytes
-follow the header. Unused bits and TAR padding must be zero. The bitmap excludes
-the dense metadata tail and uses at most 1 MiB net memory.
+covers header bytes 0–59 followed by the bitmap. With pages = ceil(payload/4096),
+exactly ceil(pages/8) bitmap bytes follow the header. An empty payload has zero
+bitmap bytes but still includes the presence header and payload mark. The last
+page ends at the exact payload length; unused bits and TAR padding must be zero.
+The bitmap excludes the declared dense metadata tail and contains at most
+**32 MiB** of bitmap bytes.
 
 P=0 means Hole; P=1 with no GNU sparse payload extent means Zero; P=1 with an
 extent means Data. Only actual Data and the dense tail are transported. All-Zero
 payloads still use GNU sparse metadata, without allocating a literal-zero payload.
-Partial-page Zero remains Data. Generic byte-granularity Hole sources retain the
-legacy encoding and exact hole boundaries. Ordinary all-zero Data is not detected
-or compressed. GNU tar extraction produces the correct logical bytes.
+Partial-page Zero remains literal Data within this same profile. A Hole starting
+inside a page or ending inside a page before the payload end cannot be written
+in the profile and is rejected. Dense byte-sized sources, including ZIP-only
+checkpoint metadata, preserve their exact lengths. Ordinary all-zero Data is not
+detected or compressed. GNU tar extraction produces the correct logical bytes.
 
 Presence and its payload mark must occur exactly once and agree. Wrong version,
 geometry, checksum, unused bits, placement, duplicates, missing mark/entry or Data
 under P=0 are errors, never a reason to retry legacy parsing. Empty-name source
 selection skips the internal member. Ordinal APIs retain physical TAR-entry
 ordinals; selecting the payload attaches the preceding presence entry. `Holes`
-reports only P=0, not Zero. Old portable carriers remain readable.
+reports only P=0, not Zero. Old portable carriers remain readable, including their
+empty payloads and exact byte-granularity Hole boundaries. Rewriting a readable
+old carrier always uses presence v1 when its logical source meets the new writer
+constraints; otherwise rewriting fails without emitting an old-format carrier.
+Readers must support these presence extensions before writers emit empty,
+partial-page or larger-than-32-GiB payloads.
 
 The identity domain and algorithm are unchanged. Payload commitment enumerates
-logical P=1 intervals and hashes Data plus synthesized Zero bytes. The writer
+logical P=1 intervals clipped to the payload length and hashes Data plus
+synthesized Zero bytes. The writer
 counts and streams those intervals without another extent index. A legacy
 literal-zero carrier and its equivalent omitted-Zero carrier have the same logical
 identity, so existing content-addressed objects may be reused. Hashing Zero still

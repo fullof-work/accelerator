@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -229,13 +230,46 @@ func TestLegacySubpageHolesStayByteExact(t *testing.T) {
 	if holes := v.Holes(); len(holes) != 1 || holes[0] != (sparse.Extent{Offset: 13, Size: 4111}) {
 		t.Fatal(holes)
 	}
-	s, _, err := SourceAt(bytes.NewReader(p), int64(len(p)), "")
+	body, err := io.ReadAll(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
-	_, digest, err := WriteTo(context.Background(), &output, "bytes", s)
-	if err != nil || digest != "16543ec6631327ae59db96633d6a961f04ae6b90e01a5eb93399128b394bdfca" || !bytes.Equal(p, output.Bytes()) {
-		t.Fatal("legacy subpage fallback changed bytes/identity", digest, err)
+	const digest = "16543ec6631327ae59db96633d6a961f04ae6b90e01a5eb93399128b394bdfca"
+	for _, sequential := range []bool{false, true} {
+		var s sparse.Source
+		if sequential {
+			s, _, err = SourceFrom(readerOnly{bytes.NewReader(p)}, "", WithExpectedDigest(DigestScheme, digest))
+		} else {
+			s, _, err = SourceAt(bytes.NewReader(p), int64(len(p)), "", WithExpectedDigest(DigestScheme, digest))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		hole, err := s.RunAt(13, s.Size()-13)
+		if err != nil || hole.Kind() != sparse.Hole || hole.End() != 4124 {
+			t.Fatal("legacy subpage hole changed", sequential, hole, err)
+		}
+		got := make([]byte, len(body))
+		if n, err := s.ReadAt(context.Background(), got, 0); n != len(got) || err != nil || !bytes.Equal(got, body) {
+			t.Fatal("legacy bytes changed", sequential, n, err)
+		}
+	}
+	for _, encrypted := range []bool{false, true} {
+		reader := &countingReaderAt{ReaderAt: bytes.NewReader(p)}
+		s, _, err := SourceAt(reader, int64(len(p)), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeRead := reader.read
+		var output bytes.Buffer
+		calls := 0
+		options := []WriteOption{WithBeforeCommit(func(context.Context) error { calls++; return nil })}
+		if encrypted {
+			options = append(options, WithCodec(&optionTestCodec{}, true))
+		}
+		_, _, err = WriteTo(context.Background(), &output, "bytes", s, options...)
+		if err == nil || !strings.Contains(err.Error(), "presence hole") || output.Len() != 0 || reader.read != beforeRead || calls != 0 {
+			t.Fatal("unrepresentable legacy source was not rejected before I/O", encrypted, output.Len(), reader.read-beforeRead, calls, err)
+		}
 	}
 }

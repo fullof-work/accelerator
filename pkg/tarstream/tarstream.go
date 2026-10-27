@@ -1,7 +1,7 @@
 // Package tarstream packages one sparse-capable byte source as a tar artifact
-// and reads it back without materializing anything. WriteTo emits a
-// sparse.Source's logical view with its hole map as a GNU PAX sparse 1.0 entry
-// (including its trailing (size,0) sentinel extent), then appends a
+// and reads it back without materializing anything. WriteTo emits a full
+// presence bitmap followed by a sparse.Source's logical view as a GNU PAX
+// sparse 1.0 entry (including its trailing (size,0) sentinel extent), then appends a
 // .kuasar.digest.<hex> marker naming the carrier-provided logical identity.
 // The marker also retains the payload commitment needed to derive a new
 // identity after replacing an E/S metadata tail. ReadFrom / ReadSeekFrom return
@@ -14,11 +14,17 @@
 // digest/trailer/outer-EOF validation when its Data extents are consumed. Only
 // data bytes flow on the inner tar wire — holes cost nothing.
 //
-// Page-representable payloads up to 32 GiB include a preceding full presence
-// bitmap. Whole Zero pages remain logically present while their payload is
-// omitted from the GNU sparse map. Read-side Sources reconstruct Hole, Zero
-// and Data without scanning bytes. Legacy and byte-hole sources preserve
-// their exact hole boundaries and synthesize literal Zero bytes when needed.
+// All new writes use presence v1. The logical payload may be empty or end in a
+// partial 4 KiB page, and is limited to 1 TiB. Hole runs must start on a page
+// boundary and end on a page boundary or at the exact payload end. An optional
+// declared dense metadata tail has its own limit. Invalid layouts fail before
+// output or Data reads; the writer never falls back to the old encoding or
+// changes logical boundaries. Whole Zero pages remain logically present while
+// their bytes are omitted from the GNU sparse map; partial-page Zero is stored
+// as literal Data. Read-side Sources reconstruct Hole, Zero and Data without
+// scanning bytes. Old portable carriers remain readable, including empty
+// payloads and exact byte-hole boundaries. Rewriting them requires a logical
+// source that meets the new writer constraints.
 //
 // The tar envelope keeps the format inspectable and interoperable:
 // GNU tar extracts the stream back into a sparse file, Go's

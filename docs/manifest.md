@@ -147,6 +147,8 @@ With a named output file, the Store key is printed on stdout. With binary stdout
 
 Tarstream output preserves sparse metadata. `crypto.local=off` emits plaintext; `auto|required` emit encrypted v1. Non-seekable stdin uses tarstream; random-access Bundle input is supplied by a file/ref. No complete image buffer or staging file is created by these transfer paths.
 
+New tarstream output always uses [presence v1](file-artifacts.md#11-page-presence-and-zero-transport): the final payload before an optional declared metadata tail is limited to 1 TiB; empty and byte-sized dense windows are supported without padding. Each Hole must start on a page boundary and end on a page boundary or at the exact payload end. An `--offset`/`--length` window or old input carrier with unrepresentable Hole boundaries is rejected before tarstream bytes are written, without changing the boundaries or re-encoding in the old format. Existing old tarstreams remain readable. These tarstream output constraints do not restrict byte-granularity Store-only or Bundle output.
+
 ```bash
 # Read and merge explicit top-to-bottom layers
 manifest-ctl load --output merged.tar A B C
