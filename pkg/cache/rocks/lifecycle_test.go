@@ -165,7 +165,8 @@ func TestConcurrentRequestsAndClose(t *testing.T) {
 func TestCloseWaitsForCompactionCallback(t *testing.T) {
 	cfg := tempRocksConfigT(t)
 	entered, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
+	var once, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	db, err := native.Open(cfg.Path, buildConfig(cfg), false, func([]byte) bool {
 		once.Do(func() { close(entered) })
 		<-release
@@ -176,6 +177,7 @@ func TestCloseWaitsForCompactionCallback(t *testing.T) {
 	}
 	s := &impl{db: db, cfh: cfIndexes()}
 	defer s.Close()
+	defer unblock() // Release a blocked callback even if fixture setup fails.
 	// Four overlapping L0 files trigger automatic background compaction.
 	// No store request holds the lifecycle lock once Flush returns, so Close
 	// must rely on the native DB's background join while keeping the handle alive.
@@ -194,7 +196,7 @@ func TestCloseWaitsForCompactionCallback(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
-		close(release)
+		unblock()
 		t.Log(db.Property(native.Chunk, "rocksdb.cfstats"))
 		t.Fatal("no callback")
 	}
@@ -202,11 +204,11 @@ func TestCloseWaitsForCompactionCallback(t *testing.T) {
 	go func() { closed <- s.Close() }()
 	select {
 	case err := <-closed:
-		close(release)
+		unblock()
 		t.Fatalf("Close returned during callback: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(release)
+	unblock()
 	if err := <-closed; err != nil {
 		t.Fatal(err)
 	}
