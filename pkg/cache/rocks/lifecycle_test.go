@@ -541,3 +541,33 @@ func (p blockingPool) Alloc(n int) ([]byte, cache.Blob) {
 	<-p.release
 	return p.pool.Alloc(n)
 }
+
+// The former binding passed the Go integer as a double. Let RocksDB apply its
+// existing 100-bit clamp instead of truncating a large setting to a C int.
+func TestBloomBitsPreserveEngineClamping(t *testing.T) {
+	cfg := tempRocksConfigT(t)
+	large := uint64(1)<<32 | 15
+	cfg.BloomBits = int(large)
+	if uint64(cfg.BloomBits) != large {
+		t.Skip("requires a 64-bit config integer")
+	}
+	s, err := openImpl(cfg, runtime.FreqConfig{Counters: "1K", DisableEviction: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	paths, err := filepath.Glob(filepath.Join(cfg.Path, "OPTIONS-*"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("options files: %v %v", paths, err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("filter_policy=bloomfilter:100:false")) {
+			return
+		}
+	}
+	t.Fatal("Bloom setting was truncated before the engine applied its clamp")
+}

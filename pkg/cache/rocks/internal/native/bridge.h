@@ -9,7 +9,8 @@ typedef struct cache_rocks cache_rocks;
 typedef struct cache_pin cache_pin;
 typedef struct {
   uint64_t cache_bytes, block_bytes, write_buffer_bytes;
-  int bloom_bits, background_compactions, direct_reads, track_blob_io;
+  double bloom_bits;
+  int background_compactions, direct_reads, track_blob_io;
 } cache_rocks_config;
 
 // Errors and property strings are malloc-owned; the caller frees them.

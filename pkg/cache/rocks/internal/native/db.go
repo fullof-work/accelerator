@@ -55,7 +55,7 @@ func Open(path string, cfg Config, readOnly bool, evict func([]byte) bool) (*DB,
 		cache_bytes:            C.uint64_t(cfg.CacheBytes),
 		block_bytes:            C.uint64_t(cfg.BlockBytes),
 		write_buffer_bytes:     C.uint64_t(cfg.WriteBufferBytes),
-		bloom_bits:             C.int(cfg.BloomBits),
+		bloom_bits:             C.double(cfg.BloomBits),
 		background_compactions: C.int(cfg.BackgroundCompactions),
 		direct_reads:           flag(cfg.DirectReads),
 	}
