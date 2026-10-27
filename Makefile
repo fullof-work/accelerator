@@ -53,7 +53,7 @@ TARGET_CXX := $(if $(CROSS_PREFIX),$(CROSS_PREFIX)g++,$(if $(filter default,$(or
 
 # CGO flags for cache-ctl: static link librocksdb.a + libstdc++; glibc stays
 # dynamic. RocksDB is built without compression so the link line stays minimal.
-CGO_CFLAGS         := -I$(ROCKS_PREFIX)/include
+CGO_CPPFLAGS       := -I$(ROCKS_PREFIX)/include
 CGO_LDFLAGS_STATIC := -L$(ROCKS_PREFIX)/lib -Wl,-Bstatic -lrocksdb -lstdc++ -Wl,-Bdynamic -lm -lpthread -ldl
 GOLDFLAGS_STATIC   := -linkmode=external -extldflags "-static-libstdc++ -static-libgcc -Wl,-Map,$(abspath $(BUILD_DIR)/cache-ctl.map)"
 
@@ -72,13 +72,10 @@ CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
 else
 CACHE_CTL_DEPS  := deps-rocksdb
 CACHE_CTL_CGO   := 1
-# Let our target-specific CGO_LDFLAGS own the complete RocksDB link. The
-# binding's default flags otherwise append host/shared compression and C++ libs.
-CACHE_CTL_TAGS  := grocksdb_no_link
 CACHE_CTL_BUILD = TMPDIR="$(abspath $(BUILD_DIR))" GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
-    CC="$(TARGET_CC)" \
-    CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
-    $(GO) build $(GO_BUILD_FLAGS) -tags $(CACHE_CTL_TAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+    CC="$(TARGET_CC)" CXX="$(TARGET_CXX)" \
+    CGO_CPPFLAGS="$(CGO_CPPFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
+    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
 endif
 
 # Native-only symlink: bin/<name> -> $(TARGET_ARCH)/<name>. $(1) = basename.
@@ -132,7 +129,7 @@ test-no-rocksdb:
 test: deps-rocksdb test-e2e-scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-native-build-budget.py
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_CPPFLAGS="$(CGO_CPPFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...
 	$(MAKE) test-no-rocksdb
@@ -153,7 +150,7 @@ clean:
 E2E_BIN ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
 bench: deps-rocksdb
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_CPPFLAGS="$(CGO_CPPFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
