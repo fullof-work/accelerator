@@ -3,8 +3,10 @@ package tarstream
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"strings"
@@ -12,6 +14,39 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
+
+// Retain the contiguous reference encoding for malformed carrier fixtures and
+// byte comparisons with the segmented production writer.
+func presenceBody(p []byte, payload uint64) []byte {
+	b := make([]byte, presenceHeaderSize+len(p))
+	copy(b, presenceMagic[:])
+	binary.LittleEndian.PutUint32(b[8:], 1)
+	binary.LittleEndian.PutUint32(b[12:], uint32(presencePage))
+	binary.LittleEndian.PutUint64(b[16:], payload)
+	binary.LittleEndian.PutUint64(b[24:], uint64(len(p)))
+	copy(b[presenceHeaderSize:], p)
+	h := crc32.NewIEEE()
+	h.Write(b[:60])
+	h.Write(p)
+	binary.LittleEndian.PutUint32(b[60:], h.Sum32())
+	return b
+}
+
+func plannedPrefixReader(plan *writePlan) io.Reader {
+	readers := make([]io.Reader, 0, len(plan.prefixParts))
+	for _, part := range plan.prefixParts {
+		readers = append(readers, bytes.NewReader(part))
+	}
+	return io.MultiReader(readers...)
+}
+
+func readPlannedPresence(plan *writePlan) ([]byte, uint64, error) {
+	r := plannedPrefixReader(plan)
+	if _, err := io.CopyN(io.Discard, r, 512); err != nil {
+		return nil, 0, err
+	}
+	return readPresence(r, int64(presenceHeaderSize+len(plan.presence)))
+}
 
 type triCarrierSource struct {
 	sparse.Source

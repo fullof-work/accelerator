@@ -75,6 +75,20 @@ func TestPresenceBudgetBeforeBitmapAndOutput(t *testing.T) {
 	}
 }
 
+func TestPresenceOneTiBPlanFitsSingleBitmapBudget(t *testing.T) {
+	// Enough for one 32 MiB bitmap and fixed writer state, not another bitmap
+	// copy. Planning must not read or hash the 1 TiB logical payload.
+	const budget = uint64(36 << 20)
+	source := &presencePlanSource{size: maxPresencePayload, payload: maxPresencePayload, kind: sparse.Hole}
+	plan, err := makeWritePlanLimited(context.Background(), "disk", source, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.presence) != 32<<20 || plan.packedSize != 0 || source.reads != 0 {
+		t.Fatalf("unexpected bounded plan: bitmap=%d packed=%d reads=%d", len(plan.presence), plan.packedSize, source.reads)
+	}
+}
+
 func TestWriterReaderSharedExtentLimit(t *testing.T) {
 	// The sentinel counts even when the last real extent ends before EOF.
 	s := &extentLimitSource{size: uint64(maxSparseExtents-1) * 8192}
