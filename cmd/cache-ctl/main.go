@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	appcache "github.com/kuasar-sandbox/accelerator/app/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/activation"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
@@ -147,6 +149,10 @@ func cmdServe(args []string) {
 		fatal("%v", err)
 	}
 
+	files, err := activation.FilesFromEnv()
+	if err != nil {
+		fatal("activation: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	termCh := make(chan os.Signal, 2)
 	hupCh := make(chan os.Signal, 1)
@@ -154,7 +160,7 @@ func cmdServe(args []string) {
 	signal.Notify(hupCh, syscall.SIGHUP)
 
 	drain := make(chan struct{})
-	opts := appcache.Options{Drain: drain, DrainTimeout: *drainTimeout}
+	opts := appcache.Options{Drain: drain, DrainTimeout: *drainTimeout, ListenerFDs: files}
 	hasEC := false
 	for _, tier := range cfg.Tiers {
 		if tier.Type == "ec" {
@@ -208,6 +214,9 @@ func cmdServe(args []string) {
 	}()
 
 	err = appcache.Run(ctx, *cfg, opts)
+	for _, file := range files {
+		err = errors.Join(err, file.Close())
+	}
 	close(done)
 	signal.Stop(termCh)
 	signal.Stop(hupCh)

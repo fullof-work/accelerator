@@ -1,0 +1,8 @@
+listen: fd=store
+cache_listen: fd=store-cache
+backend: fs
+fs:
+  root: /var/lib/kuasar-accelerator-store
+  verify_content_key: true
+generations:
+  config: [G1]

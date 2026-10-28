@@ -45,7 +45,7 @@ func (c *Config) StatsIntervalDur() time.Duration {
 // mutate only writable file/S3 sources; serve loads and refreshes the selected
 // source independently of the object data backend.
 type Config struct {
-	// Listen is the gRPC server address (host:port). Required by
+	// Listen is the gRPC server address (TCP, UDS, or fd=<name>). Required by
 	// `serve`; ignored by other subcommands.
 	Listen string `yaml:"listen"`
 
@@ -58,7 +58,7 @@ type Config struct {
 	StatsInterval string `yaml:"stats_interval"`
 
 	// CacheListen, when non-empty, starts an embedded read-only cache wire
-	// server on this address (host:port or unix:/path) alongside the store
+	// server on this address (TCP, UDS, or fd=<name>) alongside the store
 	// gRPC. It serves cache-protocol object reads (chunk/manifest/blob)
 	// straight from the backend, so cache clients can read store content
 	// without a separate cache-ctl. Writes are rejected (use the store

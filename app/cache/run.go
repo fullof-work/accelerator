@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/internal/appshutdown"
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/pkg/activation"
 	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
@@ -42,7 +44,10 @@ type Options struct {
 	Drain <-chan struct{}
 	// DrainTimeout bounds graceful waiting, never the lifetime of resource users.
 	// Zero is unlimited; negative values are rejected before acquiring resources.
-	DrainTimeout   time.Duration
+	DrainTimeout time.Duration
+	// ListenerFDs binds fd=<name> entrances to borrowed original Files. Run owns
+	// listener duplicates; the caller closes original Files after Run returns.
+	ListenerFDs    map[string]*os.File
 	Logger         *slog.Logger
 	Reload         <-chan struct{}
 	LoadMembership func(context.Context) ([]MembershipUpdate, error)
@@ -74,6 +79,15 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 	life := appshutdown.New(ctx, opts.Drain, opts.DrainTimeout)
 	defer func() { retErr = errors.Join(retErr, life.Err()); life.Close() }()
 	ctx = life.Context
+	inherited, err := activation.Import(opts.ListenerFDs, cfg.Listen, cfg.HealthListen, cfg.PprofListen)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, listener := range inherited {
+			_ = listener.Close()
+		}
+	}()
 	if !life.Active(nil) {
 		return nil
 	}
@@ -186,20 +200,25 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 
 	handler := server.NewCacheHandler(tierBackend, shardBackend)
 	ws := server.NewWireServer(handler, 120*time.Second, cfg.ParseRPCTimeout())
-	dataLis, err := util.Listen(cfg.Listen)
+	dataLis, err := util.ListenActivated(cfg.Listen, inherited)
 	if err != nil {
 		return startupError(ctx, errors.Join(fmt.Errorf("cache: listen %s: %w", cfg.Listen, err), closeOwned()))
 	}
 	var healthLis net.Listener
 	if cfg.HealthListen != "" {
-		healthLis, err = util.Listen(cfg.HealthListen)
+		healthLis, err = util.ListenActivated(cfg.HealthListen, inherited)
 		if err != nil {
 			return startupError(ctx, errors.Join(fmt.Errorf("cache: listen health %s: %w", cfg.HealthListen, err), dataLis.Close(), closeOwned()))
 		}
 	}
 	var pprofLis net.Listener
 	if cfg.PprofListen != "" {
-		pprofLis, err = net.Listen("tcp", cfg.PprofListen)
+		if strings.HasPrefix(cfg.PprofListen, "fd=") {
+			// Import above already rejected any explicit FD error before resources.
+			pprofLis = inherited[strings.TrimPrefix(cfg.PprofListen, "fd=")]
+		} else {
+			pprofLis, err = net.Listen("tcp", cfg.PprofListen)
+		}
 		if err != nil {
 			log.Warn("cache pprof disabled", "listen", cfg.PprofListen, "error", err)
 		}

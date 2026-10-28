@@ -19,6 +19,7 @@ Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行
 | `storage.cache-membership.sh` | EC cache 成员滚动变化及利用存活节点完成重建。 |
 | `storage.cache-probe.sh` | RocksDB/Redis 的真实 TCP/UDS Ping 与 single-attempt shard 往返; SIGHUP 排除仅监听的 peer. |
 | `storage.service-drain.sh` | 真实 Store/Cache CLI 的 TCP/UDS 慢 reader、首信号排空、第二信号取消、预算到期和普通 bind 重启;分别验证 RocksDB、Redis 与 Store FS。 |
+| `storage.socket-activation.sh` | 真实 systemd,Store/Cache 二进制与 TCP/UDS:命名 FD 拒绝,监听保留,排空/SIGKILL/重复重启,首次初始化失败恢复和普通 bind 回滚;RocksDB,Redis,Store FS. |
 | `storage.store-cache.sh` | Store 内嵌只读 cache 协议、generation 切换、旧 manifest 读取、blob 命名空间及拒绝写入。 |
 | `image.manifest.sh` | 真实 flatten/EROFS，以及 Manifest store/load、去重、校验、稀疏/零块与镜像差异契约。 |
 | `storage.obs.sh` | 显式选择、需要凭据的 OBS/S3 兼容对象存储往返；不属于普通离线执行。 |
@@ -78,6 +79,8 @@ Manifest/flatten 覆盖使用已准备的 `flatten-ctl` 内含的生成器，不
 - `OBS_SK`
 
 `OBS_REGION` 和 `OBS_PREFIX` 可选。该用例不会把 `~/.obsconfig` 当作凭据来源，因为 `store-ctl` 本身不读取该文件。用例使用每轮独立 prefix，并在结束时尝试清理该 prefix。普通 storage/image 测试不需要 OBS 凭据或云 API。
+
+`storage.socket-activation.sh` 声明 `# e2e-requires: ["systemd"]`,须在真正运行 systemd 且具备 root/非交互 sudo 的环境显式执行 `--include storage.socket-activation.sh`.它使用预构建 Store/Cache/Manifest/flatten,创建独占临时 units,目录,端口和 Redis;只清理已确认由本次创建的资源.实际协议请求保持 single attempt,不靠连接成功或新 PID 判定恢复.helper FD/race 测试不能替代此产品验收.
 
 ## Manifest fixture 与离线行为
 

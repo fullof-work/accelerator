@@ -16,7 +16,7 @@ On-demand loading reads the ranges a consumer needs; it does not require every a
 
 - **Data plane:** a custom wire protocol with a 39-byte request header, 8-byte response header and six opcodes.
 - **Control plane:** `health_listen` serves both standard `grpc.health.v1.Health` probing and `cac.cache.v1.Info` (`Get` returns runtime counters) on a separate listener.
-- **Addresses:** `listen` and `health_listen` accept TCP `host:port` or a Unix socket such as `/run/sandbox/cache.sock` or `unix:///...`. Socket startup handles stale socket paths and sets mode 0600. The data client uses the same address in `cache.endpoint`; use a `unix:///` target for control-plane `ping`/`info --endpoint`.
+- **Addresses:** `listen` and `health_listen` accept TCP `host:port` or a Unix socket such as `/run/sandbox/cache.sock` or `unix:///...`. Ordinary UDS bind handles stale socket paths and sets mode 0600; inherited `fd=<name>` listeners retain manager ownership (§6.7). The data client uses the same address in `cache.endpoint`; use a `unix:///` target for control-plane `ping`/`info --endpoint`.
 - **Physical cache backend:** embedded RocksDB or a Redis-compatible server over UDS/TCP. See [the Redis backend guide](cache-redis.md) for configuration, cancellation and an external Dragonfly deployment example.
 - **Writes:** no application-level frequency admission filter. Embedded disk eviction uses a CMS-driven RocksDB CompactionFilter; a Redis-compatible server owns its own eviction/capacity policy. Neither policy guarantees a write succeeds through storage/resource failures.
 - **Filling:** successful lower-tier reads asynchronously fill upper tiers.
@@ -224,15 +224,15 @@ tiers:
 
 | Parameter | Meaning |
 |---|---|
-| `listen` | Wire data listener, TCP or Unix socket. |
-| `health_listen` | One gRPC listener for Health probes and Info counter snapshots; omitted means neither service starts. |
+| `listen` | Wire data listener: TCP, Unix socket or `fd=<name>` (§6.7). |
+| `health_listen` | TCP/UDS or `fd=<name>`. One gRPC listener for Health probes and Info counter snapshots; omitted means neither service starts. |
 | `stats_interval` | Adaptive stderr statistics base period (§6.6), default 30s. `0`/`off` disables it. Active windows print throughput, bandwidth, latency, concurrency, hit cascade and backend gauges; idle windows are silent. |
 | `freq.disable_eviction` | Embedded RocksDB frequency tracking continues, but the installed filter remains unarmed and preserves keys. Useful when a test local daemon serves as an origin. It does not turn cache storage into failure-proof authoritative persistence or control external Redis eviction. |
 | `pool` | Wire connections to one peer; each connection's synchronous request/response flow serializes its own requests. |
 | `max_inflight` | Synchronous tier-query concurrency, 0 for unlimited. Async fill uses backend pools/limits. Redis tiers reject this field; use their separate get_pool/set_pool. |
 | `rpc_timeout` | Server request context budget. Missing, empty, invalid or nonpositive means no per-request deadline. A positive duration cancels context-aware work; synchronous RocksDB CGO cannot be interrupted mid-operation. Timeout/errors are not universally converted into cache misses (§4.2). |
 | `timeout` | Client per-operation timeout. **An intermediate upstream tier (`tiers[].timeout`) and an EC cluster (`tiers[].cluster.timeout`) default to 2s** when empty/invalid/nonpositive. **Origin clients (`origin.store.timeout` and `origin.upstream.timeout`) default to 0**, bounded by caller/connection lifetime. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
-| `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060. Leave empty normally; enable temporarily for diagnostics (§6.4). |
+| `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060 or `fd=pprof`. Leave empty normally; enable temporarily for diagnostics (§6.4). |
 
 ## 4. Design
 
@@ -634,6 +634,36 @@ This is a format example, not a fresh benchmark. In tiered mode, internal fill w
 
 Adaptive statistics give ongoing window-level visibility; Info provides cumulative values for scripts and benchmark deltas. CACHE_CTL_DEBUG instead focuses on abnormal long tails.
 
+### 6.7 Named listeners and socket activation
+
+On Linux, server `listen`, `health_listen` and an enabled `pprof_listen` also accept `fd=<name>`. Clients keep their TCP/UDS endpoint; `fd=` is never a client address. The CLI explicitly imports `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`. The App accepts `Options.ListenerFDs` and never reads those variables. Every supplied descriptor must be used exactly once by a configured entrance. Wrong PID/count/name, missing/extra/duplicate names, aliased sockets, unsupported address families, non-stream or non-listening descriptors are fatal before backend creation. An explicit FD error never falls back to bind. Ordinary pprof TCP bind retains its warning-only failure behavior. Ordinary bind builds remain supported on other platforms; explicit activation is rejected there.
+
+The [cache service](../deploy/systemd/cache-ctl.service), [data socket](../deploy/systemd/cache-ctl.socket), [health socket](../deploy/systemd/cache-ctl-health.socket) and [configuration](../deploy/systemd/cache-activation.yaml.example) form one example. Prepare the `kuasar-cache` system account/group, binary and configuration at their example locations before installation. `Accept=no` gives one complete Cache process all named listeners. The manager waits for that process to exit before starting the next, which opens RocksDB through the existing path. Native wrappers, column families/options/formats, Sketch, locks and Close/Open ordering stay unchanged. Redis remains an external backend.
+
+```sh
+sudo install -m 0644 deploy/systemd/cache-ctl.service deploy/systemd/cache-ctl.socket deploy/systemd/cache-ctl-health.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cache-ctl.socket cache-ctl-health.socket
+```
+
+Enable profiling only when needed: install [cache-ctl-pprof.socket](../deploy/systemd/cache-ctl-pprof.socket), set `pprof_listen: fd=pprof`, and add this service drop-in before starting that socket and restarting the service:
+
+```ini
+[Unit]
+Requires=cache-ctl-pprof.socket
+After=cache-ctl-pprof.socket
+[Service]
+Sockets=cache-ctl-pprof.socket
+```
+
+The socket units own their UDS pathnames under `/run/kuasar-accelerator`; the service does not use that path as a `RuntimeDirectory`. The external Dragonfly service's runtime directory must remain separate. Inherited listeners bypass stale-path cleanup, bind, chmod and unlink. The App closes only its descriptor copies, without socket-wide shutdown. There is no socket `PartOf=`/`BindsTo=` the service, and no `ExecStartPre`/`ExecStop` path deletion. Restart the service while retaining its socket units. Stopping a socket intentionally removes its pathname (`RemoveOnStop=yes`).
+
+The example uses directives available in [systemd 247 socket units](https://www.freedesktop.org/software/systemd/man/247/systemd.socket.html): `FlushPending=no` retains pending connections when the service exits; `TriggerLimitIntervalSec=2s`/`TriggerLimitBurst=20` bounds activation triggers. [Service settings](https://www.freedesktop.org/software/systemd/man/247/systemd.service.html) use `Restart=on-failure`, `RestartSec=1s`, and 90-second start/stop budgets; the 30-second App drain budget can cancel work earlier but cannot close resources still in use. With `Type=exec`, the start timeout does not bound post-exec App initialization. [Start limits](https://www.freedesktop.org/software/systemd/man/247/systemd.unit.html) allow five starts in ten seconds. A temporary initialization failure can retry through the existing manager policy. Persistent failures can exhaust these limits; diagnose and repair the cause, then reset the failed owned units and start them. No internal restart loop is added.
+
+A retained listener, successful connect or `Type=exec` startup does not prove readiness. Complete backend/source initialization and a real protocol request are required. EC deployments require the real wire Ping validation in §4.9. Membership still expresses health and keeps the existing placement/change rules. Socket activation retains only the entrance and not-yet-accepted queue: old connections are not migrated, queue capacity is finite, and interrupted requests remain errors. Low-level reads remain single attempt.
+
+For rollback, stop/disable all enabled socket units (including optional pprof) and stop the service; verify they are inactive before any ordinary bind or pathname cleanup. Remove the service's activation `Requires`/`After`/`Sockets` settings and profiling drop-in, change every `fd=` setting back to the original TCP/UDS endpoint, reload systemd and start the service. Keep its restart/drain policy and existing data. Never bind or unlink a pathname while its socket unit still holds it. Removing real EC Ping also requires withdrawing EC socket activation first.
+
 ## 7. Performance characteristics
 
 Measure local, shard and tiered paths separately, recording source/binary revisions, hardware, backend configuration, object sizes, concurrency, cache state and failures. Define timing boundaries and hit/miss denominators before comparing measurements. Conditional per-tier hit rates cannot simply be added. No universal latency, hit-rate or capacity guarantee follows from a cache topology.
@@ -789,7 +819,7 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 
 ## 8. Reusable Cache application entry point
 
-`app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains `Logger`, `Reload`, `LoadMembership`, `Drain` and `DrainTimeout`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
+`app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains `Logger`, `Reload`, `LoadMembership`, `Drain`, `DrainTimeout` and `ListenerFDs`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
 
 A minimal custom executable is:
 
@@ -831,6 +861,20 @@ For EC membership refresh, the caller supplies both `Reload` and `LoadMembership
 The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. It closes dependencies and returns only after actual users finish; §6.2 defines the ordering. Custom callers own their signals and borrowed inputs.
 
 `Options.Drain <-chan struct{}` defaults to nil, preserving the ctx cancellation behavior of the example above. Closing an explicitly supplied Drain starts soft shutdown. Cancelling the `Run(ctx)` context always cancels in-flight work, takes priority over simultaneous drain, and does not silently become a graceful wait. `Options.DrainTimeout time.Duration` uses the shared budget in §6.2. Drain during initialization prevents subsequent started/SERVING publication. A host that distinguishes soft shutdown from cancellation can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its context cancel function. The App does not take over host signals, args or process exit.
+
+`Options.ListenerFDs map[string]*os.File` supplies named original descriptors explicitly; the App never discovers activation environment. A custom main can use public `pkg/activation.FilesFromEnv()` (also import `errors` for this example) or obtain Files from its own manager:
+
+```go
+func runActivated(ctx context.Context, cfg cacheapp.Config) error {
+    files, err := activation.FilesFromEnv()
+    if err != nil { return err }
+    err = cacheapp.Run(ctx, cfg, cacheapp.Options{ListenerFDs: files})
+    for _, file := range files { err = errors.Join(err, file.Close()) }
+    return err
+}
+```
+
+On helper success, the caller owns the original Files starting at FD 3 and must close them. The helper marks them close-on-exec and clears the three `LISTEN_*` variables. On failure it transfers no ownership, closes no original and leaves no duplicate behind; the host still owns the originals. App import borrows a stable map/Files, validates the whole entrance set and creates close-on-exec listener duplicates. Failure rollback closes created duplicates without closing originals. Go listener import sets nonblocking I/O on the shared socket description; this status flag also affects originals, while close-on-exec is per descriptor. Close the originals after Run returns. The App closes only its copies, without unlinking inherited UDS or shutting down the manager socket. Initialization failure, drain and cancellation follow the same ownership. This example keeps SDK context cancellation; pass the Drain/DrainTimeout inputs above as well when soft shutdown is wanted.
 
 ## 8. See Also
 

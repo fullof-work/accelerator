@@ -23,8 +23,8 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 - **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `grpc.health.v1.Health`
   探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照)。
 - **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
-  socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
-  socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
+  socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;普通 UDS bind 时清理 stale
+  socket、chmod 0600),还可显式使用 `fd=<name>` 继承 manager listener (§6.7)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
   后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md（英文）](cache-redis.md)。
@@ -259,15 +259,15 @@ tiers:
 
 | 参数 | 说明 |
 |---|---|
-| `listen` | wire 数据面 TCP 或 Unix socket 监听 |
-| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照)。省略则两者都不启动 |
+| `listen` | wire 数据面 TCP、Unix socket 或 `fd=<name>` 监听 (§6.7) |
+| `health_listen` | TCP/UDS 或 `fd=<name>` 的 gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照)。省略则两者都不启动 |
 | `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | embedded 的 sketch 仍维护,但已安装 filter 保持 unarmed、保留 key。可用于测试 local origin;不把 cache 变成无故障权威持久层,也不控制外部 Redis 淘汰 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 到该 tier 的同步查询并发上限;`0` 表示不限制。异步 fill 使用各 backend 自身的连接池/并发控制。Redis tier 禁止设置,应使用 `redis.get_pool` / `redis.set_pool` |
 | `rpc_timeout` | 服务端请求 context 预算。缺省/空/非法/非正数不设 deadline;正 duration 可取消响应 context 的工作,不能中断同步 RocksDB CGO。超时/错误不普遍变成 cache miss(§4.2);慢请求可用 §6.5 tracer 观察 |
 | `timeout`(tier/origin) | 客户端每次操作超时。**中间 upstream tier 的 `tiers[].timeout` 与 EC 的 `tiers[].cluster.timeout` 在空/非法/非正值时默认 2s**；**origin 客户端的 `origin.store.timeout` 与 `origin.upstream.timeout` 默认 0**，受 caller/connection 生命周期约束。Redis 有独立默认与严格校验，显式值必须有效且为正 |
-| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060`)。**生产留空**;仅离线诊断临时开启(§6.4) |
+| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060` 或 `fd=pprof`)。**生产留空**;仅离线诊断临时开启(§6.4) |
 
 ## 4. 设计
 
@@ -750,6 +750,36 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 给精确累计快照(bench / 脚本按需拉);与 §6.5 的 `CACHE_CTL_DEBUG` 正交(后者
 只打异常长尾)。
 
+### 6.7 命名监听与 socket activation
+
+Linux 上,服务端 `listen`,`health_listen` 和已启用的 `pprof_listen` 还可取 `fd=<name>`.客户端继续使用 TCP/UDS endpoint;`fd=` 不是客户端地址.CLI 显式导入 `LISTEN_PID`,`LISTEN_FDS` 和 `LISTEN_FDNAMES`;App 只接收 `Options.ListenerFDs`,不读取这些环境变量.每个传入 FD 必须且只能被一个已配置入口消费.PID/数量/名称错误,缺失/多余/重复名称,socket 别名,不支持的地址族,非 stream 或非 listening FD,均在创建 backend 前报错.显式 FD 错误不会回退 bind.普通 pprof TCP bind 失败仍只记录 warning.其他平台继续支持普通 bind 构建,显式 activation 则拒绝.
+
+[Cache service](../deploy/systemd/cache-ctl.service),[数据 socket](../deploy/systemd/cache-ctl.socket),[health socket](../deploy/systemd/cache-ctl-health.socket) 和[配置](../deploy/systemd/cache-activation.yaml.example) 构成完整示例.安装前准备 `kuasar-cache` 系统账号/组,并将二进制和配置放到示例位置.`Accept=no` 将全部命名 listener 交给一个完整 Cache 进程.manager 等待该进程退出后才启动下一实例,后者沿既有路径打开 RocksDB.native wrapper,CF/options/格式,Sketch,锁及 Close/Open 顺序不变;Redis 仍是外部 backend.
+
+```sh
+sudo install -m 0644 deploy/systemd/cache-ctl.service deploy/systemd/cache-ctl.socket deploy/systemd/cache-ctl-health.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cache-ctl.socket cache-ctl-health.socket
+```
+
+仅在需要诊断时启用 profiling:安装 [cache-ctl-pprof.socket](../deploy/systemd/cache-ctl-pprof.socket),设置 `pprof_listen: fd=pprof`,添加以下 service drop-in,再启动该 socket 并重启 service:
+
+```ini
+[Unit]
+Requires=cache-ctl-pprof.socket
+After=cache-ctl-pprof.socket
+[Service]
+Sockets=cache-ctl-pprof.socket
+```
+
+socket units 拥有 `/run/kuasar-accelerator` 下的 UDS pathname;service 不将该路径作为 `RuntimeDirectory`.外部 Dragonfly service 的 runtime directory 必须保持独立.继承 listener 不执行 stale-path cleanup,bind,chmod 或 unlink.App 只关闭自己的 FD 副本,不做 socket-wide shutdown.socket 不配置指向 service 的 `PartOf=`/`BindsTo=`,也没有删除路径的 `ExecStartPre`/`ExecStop`.重启 service 时保留 socket units;显式停止 socket 才删除其 pathname (`RemoveOnStop=yes`).
+
+示例使用 [systemd 247 socket units](https://www.freedesktop.org/software/systemd/man/247/systemd.socket.html) 已支持的指令:`FlushPending=no` 在 service 退出时保留 pending connections;`TriggerLimitIntervalSec=2s`/`TriggerLimitBurst=20` 限制 activation 触发频率.[Service 配置](https://www.freedesktop.org/software/systemd/man/247/systemd.service.html) 使用 `Restart=on-failure`,`RestartSec=1s` 和 90 秒启动/停止预算;App 的 30 秒 drain 预算可提前取消工作,但不能关闭仍在使用的资源.`Type=exec` 下,启动 timeout 不限制 exec 之后的 App 初始化.[Start limits](https://www.freedesktop.org/software/systemd/man/247/systemd.unit.html) 允许十秒内启动五次.暂时初始化失败可通过既有 manager 策略重试;持续失败可能耗尽限制,应诊断并修复原因,再 reset 对应失败 units 并启动.不增加内部 restart loop.
+
+监听保留,connect 成功或 `Type=exec` 启动均不证明 ready;必须完成 backend/source 初始化并处理真实协议请求.EC 部署必须包含 §4.9 的真实 wire Ping 校验.membership 仍表达健康,placement/成员变更规则不变.socket activation 只保留入口及尚未 accept 的队列:不迁移旧连接,队列容量有限,中断请求仍返回错误.低层读取继续 single attempt.
+
+回滚时先 stop/disable 全部已启用的 socket units (包括可选 pprof),并停止 service;确认 inactive 后才能普通 bind 或清理 pathname.移除 service 的 activation `Requires`/`After`/`Sockets` 配置和 profiling drop-in,把每个 `fd=` 改回原 TCP/UDS endpoint,重新加载 systemd 并启动 service.保留 restart/drain 策略和原数据.socket unit 仍持有路径时不得 bind 或 unlink.移除真实 EC Ping 前,还须先撤销 EC socket activation 部署.
+
 ## 7. 性能特征
 
 分别测量 local、shard 和 tiered 路径，记录源码/二进制版本、硬件、后端配置、对象大小、并发、缓存状态与失败。比较前明确计时边界及 hit/miss 分母；各层条件命中率不能简单相加。缓存拓扑本身不构成普遍时延、命中率或容量保证。
@@ -927,7 +957,7 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
 
 ## 8. 可复用的 Cache App 入口
 
-`app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 包含 `Logger`、`Reload`、`LoadMembership`、`Drain` 和 `DrainTimeout`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
+`app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 包含 `Logger`、`Reload`、`LoadMembership`、`Drain`、`DrainTimeout` 和 `ListenerFDs`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
 
 最小定制程序：
 
@@ -969,6 +999,20 @@ EC membership 刷新时，调用方同时提供 `Reload` 与 `LoadMembership`。
 App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。所有实际使用者结束后才关闭依赖并返回;退出顺序见 §6.2。定制调用方拥有信号与借入输入。
 
 `Options.Drain <-chan struct{}` 默认为 nil,保留上例的 ctx 取消行为。关闭显式传入的 Drain 发起软停;`Run(ctx)` 的 ctx 取消始终取消在途工作,不会偷偷改成等待排空,且与 drain 同时发生时优先。`Options.DrainTimeout time.Duration` 使用 §6.2 的共享预算。初始化期间收到 drain 后不再发布 started/SERVING。若宿主希望区分软停和取消,可传入 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,自行将第一次退出请求适配为 `close(drain)`,将后续请求适配为 ctx 的 cancel;App 不接管宿主 signals、args 或进程退出。
+
+`Options.ListenerFDs map[string]*os.File` 显式传入命名原始 FD;App 从不隐式读取 activation 环境.自定义 main 可使用公共 `pkg/activation.FilesFromEnv()` (下例还需导入 `errors`),也可从自己的 manager 取得 Files:
+
+```go
+func runActivated(ctx context.Context, cfg cacheapp.Config) error {
+    files, err := activation.FilesFromEnv()
+    if err != nil { return err }
+    err = cacheapp.Run(ctx, cfg, cacheapp.Options{ListenerFDs: files})
+    for _, file := range files { err = errors.Join(err, file.Close()) }
+    return err
+}
+```
+
+helper 成功后,调用方拥有从 FD 3 开始的原始 Files,须关闭它们;helper 设置 close-on-exec 并清除三个 `LISTEN_*` 变量.失败时不转移所有权,不关闭原始 FD,不遗留副本,原始 FD 仍由宿主负责.App 导入时借用稳定的 map/Files,校验完整入口集后创建 close-on-exec listener 副本;失败回滚关闭已创建副本,不关闭原始 Files.Go listener 导入会在共享 socket description 上设置 nonblocking I/O,该状态标志也影响原始 FD;close-on-exec 则属于每个 FD.调用方应在 Run 返回后关闭原始 Files;App 只关闭自己的副本,不删除继承 UDS pathname,不 shutdown manager socket.初始化失败,drain 或取消均遵守此所有权.上例保留 SDK ctx 取消方式;需要软停时同时传入前述 Drain/DrainTimeout.
 
 ## 8. See Also
 

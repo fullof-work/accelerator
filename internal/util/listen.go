@@ -60,6 +60,19 @@ func Listen(addr string) (net.Listener, error) {
 	return lis, nil
 }
 
+// ListenActivated resolves only explicitly requested, already validated App
+// listener copies. Inherited UDS never enter ordinary bind/stale-path cleanup.
+func ListenActivated(addr string, inherited map[string]net.Listener) (net.Listener, error) {
+	if strings.HasPrefix(addr, "fd=") {
+		listener := inherited[strings.TrimPrefix(addr, "fd=")]
+		if listener == nil {
+			return nil, fmt.Errorf("activation: missing listener %s", addr)
+		}
+		return listener, nil
+	}
+	return Listen(addr)
+}
+
 // clearStaleSocket removes a leftover unix socket so a fresh bind can succeed,
 // but only when it is safe to do so: a path that is not a socket is left in
 // place (we must never clobber a regular file or directory), and a socket that

@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/internal/appshutdown"
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/pkg/activation"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	cacheserver "github.com/kuasar-sandbox/accelerator/pkg/cache/server"
 	pkgstore "github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -48,6 +49,15 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 	life := appshutdown.New(ctx, opts.Drain, opts.DrainTimeout)
 	defer func() { retErr = errors.Join(retErr, life.Err()); life.Close() }()
 	ctx = life.Context
+	inherited, err := activation.Import(opts.ListenerFDs, cfg.Listen, cfg.CacheListen)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, listener := range inherited {
+			_ = listener.Close()
+		}
+	}()
 	if !life.Active(nil) {
 		return nil
 	}
@@ -83,13 +93,13 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 	if err != nil {
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
-	gl, err := util.Listen(cfg.Listen)
+	gl, err := util.ListenActivated(cfg.Listen, inherited)
 	if err != nil {
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
 	var wl net.Listener
 	if cfg.CacheListen != "" {
-		wl, err = util.Listen(cfg.CacheListen)
+		wl, err = util.ListenActivated(cfg.CacheListen, inherited)
 		if err != nil {
 			return startupError(ctx, errors.Join(err, gl.Close(), closeOwned()))
 		}

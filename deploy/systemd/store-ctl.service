@@ -1,0 +1,26 @@
+[Unit]
+Description=Accelerator store service
+Requires=store-ctl.socket store-ctl-cache.socket
+After=store-ctl.socket store-ctl-cache.socket
+StartLimitIntervalSec=10s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=kuasar-store
+Group=kuasar-store
+StateDirectory=kuasar-accelerator-store
+StateDirectoryMode=0750
+Sockets=store-ctl.socket store-ctl-cache.socket
+ExecStart=/opt/kuasar/bin/store-ctl serve --config /etc/kuasar/store.yaml --drain-timeout 30s
+Restart=on-failure
+RestartSec=1s
+TimeoutStartSec=90s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+KillMode=control-group
+NoNewPrivileges=true
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

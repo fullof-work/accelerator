@@ -19,6 +19,7 @@ A case ID is its filename. The suite is the first filename segment. Accelerator 
 | `storage.cache-membership.sh` | Rolling EC cache membership and reconstruction with surviving peers. |
 | `storage.cache-probe.sh` | Real TCP/UDS Ping and single-attempt shard round trips with RocksDB/Redis; SIGHUP excludes listener-only peers. |
 | `storage.service-drain.sh` | Real Store/Cache CLI over TCP/UDS: slow readers, first-signal drain, second-signal cancellation, budget expiry and ordinary bind restart, with RocksDB, Redis and Store FS. |
+| `storage.socket-activation.sh` | Real systemd and Store/Cache binaries over TCP/UDS: named FD rejection, retained listeners, drain/SIGKILL/repeated restarts, recovery after first initialization failure and ordinary bind rollback; RocksDB, Redis and Store FS. |
 | `storage.store-cache.sh` | Store's embedded read-only cache protocol, generation rollout, old-manifest reads, blob namespace and rejected writes. |
 | `image.manifest.sh` | Real flatten/EROFS plus Manifest store/load, dedup, verification, sparse/zero-block and image-diff contracts. |
 | `storage.obs.sh` | Explicit credentialed OBS/S3-compatible round trip. This case is not part of ordinary offline execution. |
@@ -78,6 +79,8 @@ Tiered/cache cases that exercise Redis require `redis-server` on `PATH` or the e
 - `OBS_SK`
 
 `OBS_REGION` and `OBS_PREFIX` are optional. The case does not treat `~/.obsconfig` as credentials because `store-ctl` does not consume that file. It uses an isolated per-run prefix and attempts to purge that prefix during cleanup. Ordinary storage/image runs require no OBS credentials or cloud API access.
+
+`storage.socket-activation.sh` declares `# e2e-requires: ["systemd"]`. Select it explicitly with `--include storage.socket-activation.sh` on a machine actually running systemd with root/noninteractive sudo. It consumes prebuilt Store/Cache/Manifest/flatten, creates isolated temporary units, directories, ports and Redis, and cleans only resources it confirmed creating. Actual protocol requests remain single attempt; connect success or a new PID is not recovery evidence. Helper FD/race tests cannot replace this product acceptance case.
 
 ## Manifest fixtures and offline behavior
 

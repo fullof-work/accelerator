@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,7 +37,10 @@ type Options struct {
 	Drain <-chan struct{}
 	// DrainTimeout bounds graceful waiting, never the lifetime of resource users.
 	// Zero is unlimited; negative values are rejected before acquiring resources.
-	DrainTimeout          time.Duration
+	DrainTimeout time.Duration
+	// ListenerFDs binds fd=<name> entrances to borrowed original Files. Run owns
+	// listener duplicates; the caller closes original Files after Run returns.
+	ListenerFDs           map[string]*os.File
 	Logger                *slog.Logger
 	Reload                <-chan struct{}
 	Generations           *GenerationSource
