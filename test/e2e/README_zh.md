@@ -10,10 +10,11 @@ Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行
 预构建产品 -> prepare -> <suite>.<case>.sh -> run
 ```
 
-用例 ID 就是文件名，suite 是文件名第一段。Accelerator 当前提供以下 `storage` 和 `image` 用例：
+用例 ID 就是文件名，suite 是文件名第一段。Accelerator 当前提供以下 `basic`, `storage` 和 `image` 用例:
 
 | 用例 | 验证契约 |
 | --- | --- |
+| `basic.accelerator-activation.sh` | 真实 systemd,Store/Cache 二进制与 TCP/UDS:命名 FD 拒绝,监听保留,排空/SIGKILL/重复重启,首次初始化失败恢复和普通 bind 回滚;RocksDB,Redis,Store FS. |
 | `storage.cache.sh` | 文件系统/本地缓存与 Store 往返、cache 协议、tiered 只读写拒绝等缓存正确性。 |
 | `storage.tiered-cache.sh` | Redis/tiered/sharded/EC、上游填充与回写、故障恢复、重启回填及无 origin 热读取。 |
 | `storage.cache-membership.sh` | EC cache 成员滚动变化及利用存活节点完成重建。 |
@@ -78,6 +79,8 @@ Manifest/flatten 覆盖使用已准备的 `flatten-ctl` 内含的生成器，不
 - `OBS_SK`
 
 `OBS_REGION` 和 `OBS_PREFIX` 可选。该用例不会把 `~/.obsconfig` 当作凭据来源，因为 `store-ctl` 本身不读取该文件。用例使用每轮独立 prefix，并在结束时尝试清理该 prefix。普通 storage/image 测试不需要 OBS 凭据或云 API。
+
+`basic.accelerator-activation.sh` 验证服务部署及进程生命周期;Store/Cache 请求用来证明重启后的实际服务恢复. 存储协议和数据算法用例继续归入 `storage`. 它声明 `# e2e-requires: ["systemd"]`,须在真正运行 systemd 且具备 root/非交互 sudo 的环境显式执行 `--include basic.accelerator-activation.sh`.它使用预构建 Store/Cache/Manifest/flatten,创建独占临时 units,目录,端口和 Redis;只清理已确认由本次创建的资源.实际协议请求保持 single attempt,不靠连接成功或新 PID 判定恢复.helper FD/race 测试不能替代此产品验收.
 
 ## Manifest fixture 与离线行为
 

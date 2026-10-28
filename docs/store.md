@@ -343,6 +343,24 @@ The commands above are source/unit/helper validation. Product Store/cache E2E is
 
 The race-detector command requires CGO and a working C toolchain. Disabling CGO is valid for the ordinary test command above, not for `go test -race`.
 
+### 8.1 Named listeners and socket activation
+
+On Linux, `listen: fd=store` and optional `cache_listen: fd=store-cache` consume distinct named listening descriptors. Client endpoints remain TCP/UDS addresses. The CLI explicitly parses `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`; the App only uses `Options.ListenerFDs`. All supplied FDs must be consumed exactly once. Invalid PID/count/names, missing/extra descriptors, duplicate socket aliases, wrong address family or non-listening/non-stream types fail before backend/source initialization, without fallback bind. Ordinary bind continues to work; activation is explicitly rejected on unsupported platforms.
+
+The [service](../deploy/systemd/store-ctl.service), [gRPC socket](../deploy/systemd/store-ctl.socket), [optional cache socket](../deploy/systemd/store-ctl-cache.socket) and [configuration](../deploy/systemd/store-activation.yaml.example) are a complete dual-entrance example. Prepare the `kuasar-store` system account/group, binary and configuration at the example locations. If cache wire is disabled, omit its socket and remove it from the service's `Requires`/`After`/`Sockets` lists as well as clearing `cache_listen`.
+
+```sh
+sudo install -m 0644 deploy/systemd/store-ctl.service deploy/systemd/store-ctl.socket deploy/systemd/store-ctl-cache.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now store-ctl.socket store-ctl-cache.socket
+```
+
+`Accept=no` runs one complete Store instance. Both entrances share the App's shutdown barrier; the manager starts the replacement only after the old process exits. The manager owns `/run/kuasar-accelerator` socket pathnames; the service has no `RuntimeDirectory` there or path-deleting start/stop command. App copies never bind/chmod/unlink inherited UDS or shut down the shared listening socket. Restart only the service to retain queued connections. The existing FS backend may still be remote/shared, with its accepted eventual-consistency and revocable-object deduplication constraints unchanged.
+
+The example's systemd 247-compatible `FlushPending=no`, failure restart/backoff, start/trigger limits and 90-second start/stop budgets have the same ownership and recovery semantics described in [Cache §6.7](cache.md#67-named-listeners-and-socket-activation). The 30-second drain budget is shared by gRPC and cache wire; uncancellable backend/provider users still join before resources close. A listener/connect/`Type=exec` result is insufficient: initialization must complete and an actual Store RPC must succeed. No Store management port is added. Retention covers only listeners and unaccepted queues, without old-connection migration, unlimited queuing or client retry.
+
+To roll back, stop/disable both configured socket units and stop the service, confirm that the manager has released the endpoints, remove activation dependencies, change `fd=` back to the same ordinary endpoint and reload/start the service. Preserve data and the shutdown policy. Never let ordinary UDS cleanup delete a path still owned by a socket unit. These examples are opt-in deployment configuration; installing code alone does not enable activation.
+
 ## 9. Reusable Store application entry point
 
 `app/store.Run(ctx, cfg, opts)` owns the complete Store serving lifecycle. `store-ctl serve` is only one caller; a custom executable may link the same App directly and does not exec or require the official service binary. `Run` does not read `STORE_CONFIG`, register process signals, call `os.Exit`/`log.Fatal`, or mutate a process-global logger. The caller owns configuration loading, signals and exit policy.
@@ -387,6 +405,20 @@ Direct Go construction of `storeapp.Config` is equally supported. Dynamic genera
 `Options` adds zero-value-compatible `Drain <-chan struct{}` and `DrainTimeout time.Duration`. A nil Drain preserves the old SDK cancellation usage shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See §8 for the budget and resource ordering.
 
 Validation of the reusable entry point should compile the custom module independently and exercise real Store protocol requests with the official service binary absent from `PATH`.
+
+`Options.ListenerFDs map[string]*os.File` supplies named original descriptors explicitly; the App never discovers activation environment. A custom main can use public `pkg/activation.FilesFromEnv()` (also import `errors` for this example) or obtain Files from its own manager:
+
+```go
+func runActivated(ctx context.Context, cfg storeapp.Config) error {
+    files, err := activation.FilesFromEnv()
+    if err != nil { return err }
+    err = storeapp.Run(ctx, cfg, storeapp.Options{ListenerFDs: files})
+    for _, file := range files { err = errors.Join(err, file.Close()) }
+    return err
+}
+```
+
+On helper success, the caller owns the original Files starting at FD 3 and must close them. The helper marks them close-on-exec and clears the three `LISTEN_*` variables. On failure it transfers no ownership, closes no original and leaves no duplicate behind; the host still owns the originals. App import borrows a stable map/Files, validates the whole entrance set and creates close-on-exec listener duplicates. Failure rollback closes created duplicates without closing originals. Go listener import sets nonblocking I/O on the shared socket description; this status flag also affects originals, while close-on-exec is per descriptor. Close the originals after Run returns. The App closes only its copies, without unlinking inherited UDS or shutting down the manager socket. Initialization failure, drain and cancellation follow the same ownership. This example keeps SDK context cancellation; pass the Drain/DrainTimeout inputs above as well when soft shutdown is wanted.
 
 ## 9. See also
 

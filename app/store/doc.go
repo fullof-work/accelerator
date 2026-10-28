@@ -9,6 +9,10 @@
 // serving, and statistics. Borrowed loggers and input providers remain owned by
 // the caller. Application shutdown must finish using them before returning.
 //
+// ListenerFDs is an explicit borrowed descriptor input. Named fd=<name>
+// entrances use App-owned listener copies; the caller retains originals.
+// Environment parsing belongs to the CLI or public pkg/activation helper.
+//
 // Declarative configuration is separate from process-local input bindings.
 // A programmatically supplied inline generation list has no implicit YAML path.
 // A caller that needs dynamic generations supplies their source explicitly.

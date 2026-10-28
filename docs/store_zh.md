@@ -391,6 +391,24 @@ make test-e2e-scripts
 race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测试可以关闭 CGO，
 `go test -race` 则不能使用 `CGO_ENABLED=0`。
 
+### 8.1 命名监听与 socket activation
+
+Linux 上,`listen: fd=store` 和可选的 `cache_listen: fd=store-cache` 分别消费不同的命名 listening FD.客户端 endpoint 仍是 TCP/UDS 地址.CLI 显式解析 `LISTEN_PID`,`LISTEN_FDS` 和 `LISTEN_FDNAMES`;App 只使用 `Options.ListenerFDs`.传入的每个 FD 必须且只能消费一次.PID/数量/名称错误,缺失/多余 FD,重复 socket 别名,错误地址族或非 listening/stream 类型,均在 backend/source 初始化前失败,不会回退 bind.普通 bind 继续有效;不支持的平台明确拒绝 activation.
+
+[Service](../deploy/systemd/store-ctl.service),[gRPC socket](../deploy/systemd/store-ctl.socket),[可选 cache socket](../deploy/systemd/store-ctl-cache.socket) 和[配置](../deploy/systemd/store-activation.yaml.example) 是完整双入口示例.准备 `kuasar-store` 系统账号/组,以及示例位置的二进制和配置.禁用 cache wire 时,除清空 `cache_listen`,还应省略对应 socket,并从 service 的 `Requires`/`After`/`Sockets` 列表移除它.
+
+```sh
+sudo install -m 0644 deploy/systemd/store-ctl.service deploy/systemd/store-ctl.socket deploy/systemd/store-ctl-cache.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now store-ctl.socket store-ctl-cache.socket
+```
+
+`Accept=no` 运行一个完整 Store 实例.两个入口共享 App 退出屏障;manager 只在旧进程退出后启动替代实例.manager 拥有 `/run/kuasar-accelerator` 下的 socket pathname;service 不在那里设置 `RuntimeDirectory`,也没有删除路径的启动/停止命令.App 副本不对继承 UDS 执行 bind/chmod/unlink,不 shutdown 共享 listening socket.只重启 service 可保留排队连接.既有 FS backend 仍可为远程/共享实现,最终一致和可撤销对象参与去重的已接受约束不变.
+
+示例中的 systemd 247 兼容 `FlushPending=no`,失败 restart/backoff,start/trigger 限制和 90 秒启动/停止预算,与 [Cache §6.7](cache_zh.md#67-命名监听与-socket-activation) 描述的所有权及恢复语义一致.30 秒 drain 预算由 gRPC 与 cache wire 共享;不可取消的 backend/provider 使用者仍须 join 后才能关闭资源.监听/connect/`Type=exec` 不足以证明 ready:必须完成初始化并成功处理实际 Store RPC.不新增 Store 管理端口.监听保留只覆盖 listener 及未 accept 的队列,不迁移旧连接,不保证无限排队,不增加客户端重试.
+
+回滚时先 stop/disable 已配置的两个 socket units 并停止 service,确认 manager 释放入口,再移除 activation 依赖,把 `fd=` 改回原普通 endpoint,重新加载并启动 service.保留数据及退出策略.不得由普通 UDS cleanup 删除仍被 socket unit 持有的路径.这些示例需要部署方显式启用;安装代码本身不会启用 activation.
+
 ## 9. 可复用的 Store App 入口
 
 `app/store.Run(ctx, cfg, opts)` 拥有完整 Store 服务生命周期。`store-ctl serve` 只是一个调用方；定制二进制可直接静态链接同一个 App，不 exec、也不要求安装官方服务二进制。`Run` 不读取 `STORE_CONFIG`、不注册进程信号、不调用 `os.Exit`/`log.Fatal`、不修改进程全局 logger；配置加载、信号和退出策略由调用方拥有。
@@ -435,6 +453,20 @@ KillSignal=SIGTERM
 `Options` 新增零值兼容的 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 保留上例的旧 SDK 取消用法;关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 §8。
 
 可复用入口的验收应独立编译定制 module，并在服务 `PATH` 中没有官方二进制时执行真实 Store 协议请求。
+
+`Options.ListenerFDs map[string]*os.File` 显式传入命名原始 FD;App 从不隐式读取 activation 环境.自定义 main 可使用公共 `pkg/activation.FilesFromEnv()` (下例还需导入 `errors`),也可从自己的 manager 取得 Files:
+
+```go
+func runActivated(ctx context.Context, cfg storeapp.Config) error {
+    files, err := activation.FilesFromEnv()
+    if err != nil { return err }
+    err = storeapp.Run(ctx, cfg, storeapp.Options{ListenerFDs: files})
+    for _, file := range files { err = errors.Join(err, file.Close()) }
+    return err
+}
+```
+
+helper 成功后,调用方拥有从 FD 3 开始的原始 Files,须关闭它们;helper 设置 close-on-exec 并清除三个 `LISTEN_*` 变量.失败时不转移所有权,不关闭原始 FD,不遗留副本,原始 FD 仍由宿主负责.App 导入时借用稳定的 map/Files,校验完整入口集后创建 close-on-exec listener 副本;失败回滚关闭已创建副本,不关闭原始 Files.Go listener 导入会在共享 socket description 上设置 nonblocking I/O,该状态标志也影响原始 FD;close-on-exec 则属于每个 FD.调用方应在 Run 返回后关闭原始 Files;App 只关闭自己的副本,不删除继承 UDS pathname,不 shutdown manager socket.初始化失败,drain 或取消均遵守此所有权.上例保留 SDK ctx 取消方式;需要软停时同时传入前述 Drain/DrainTimeout.
 
 ## 9. See also
 

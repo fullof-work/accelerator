@@ -1,0 +1,10 @@
+mode: local
+type: embedded
+listen: fd=cache
+health_listen: fd=health
+# To enable pprof, also install/attach cache-ctl-pprof.socket as documented.
+pprof_listen: ""
+rocks:
+  path: /var/lib/kuasar-accelerator-cache/rocks
+  disk_bytes: 1TiB
+  mem_ratio: 0.01

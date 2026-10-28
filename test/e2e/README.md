@@ -10,10 +10,11 @@ The execution model is deliberately small:
 prebuilt products -> prepare -> <suite>.<case>.sh -> run
 ```
 
-A case ID is its filename. The suite is the first filename segment. Accelerator currently contributes the `storage` and `image` cases below:
+A case ID is its filename. The suite is the first filename segment. Accelerator currently contributes the `basic`, `storage` and `image` cases below:
 
 | Case | Contract |
 | --- | --- |
+| `basic.accelerator-activation.sh` | Real systemd and Store/Cache binaries over TCP/UDS: named FD rejection, retained listeners, drain/SIGKILL/repeated restarts, recovery after first initialization failure and ordinary bind rollback; RocksDB, Redis and Store FS. |
 | `storage.cache.sh` | Filesystem/local cache and Store round trips, cache protocol behavior, read-only tiered write rejection and related cache correctness. |
 | `storage.tiered-cache.sh` | Redis/tiered/sharded/EC behavior, upstream fill/writeback, failure/recovery, restart/refill and origin-free warm reads. |
 | `storage.cache-membership.sh` | Rolling EC cache membership and reconstruction with surviving peers. |
@@ -78,6 +79,8 @@ Tiered/cache cases that exercise Redis require `redis-server` on `PATH` or the e
 - `OBS_SK`
 
 `OBS_REGION` and `OBS_PREFIX` are optional. The case does not treat `~/.obsconfig` as credentials because `store-ctl` does not consume that file. It uses an isolated per-run prefix and attempts to purge that prefix during cleanup. Ordinary storage/image runs require no OBS credentials or cloud API access.
+
+`basic.accelerator-activation.sh` validates service deployment and process lifecycle; Store/Cache requests establish actual recovery after restart. Storage protocol and data-algorithm cases remain in `storage`. It declares `# e2e-requires: ["systemd"]`. Select it explicitly with `--include basic.accelerator-activation.sh` on a machine actually running systemd with root/noninteractive sudo. It consumes prebuilt Store/Cache/Manifest/flatten, creates isolated temporary units, directories, ports and Redis, and cleans only resources it confirmed creating. Actual protocol requests remain single attempt; connect success or a new PID is not recovery evidence. Helper FD/race tests cannot replace this product acceptance case.
 
 ## Manifest fixtures and offline behavior
 

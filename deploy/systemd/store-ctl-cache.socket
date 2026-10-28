@@ -1,0 +1,19 @@
+[Unit]
+Description=Accelerator store-cache listening socket
+
+[Socket]
+ListenStream=/run/kuasar-accelerator/store-cache.sock
+FileDescriptorName=store-cache
+Service=store-ctl.service
+Accept=no
+FlushPending=no
+SocketUser=kuasar-store
+SocketGroup=kuasar-store
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+TriggerLimitIntervalSec=2s
+TriggerLimitBurst=20
+
+[Install]
+WantedBy=sockets.target

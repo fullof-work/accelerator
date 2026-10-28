@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	appstore "github.com/kuasar-sandbox/accelerator/app/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/activation"
 )
 
 // cmdServe owns CLI configuration, process signals, and exit behavior. The
@@ -38,7 +40,17 @@ func cmdServe(args []string) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(hup, syscall.SIGHUP)
-	err = serveStore(*cfg, resolved, term, hup, os.Stderr, *drainTimeout, appstore.Run)
+	files, err := activation.FilesFromEnv()
+	if err != nil {
+		fatal("activation: %v", err)
+	}
+	err = serveStore(*cfg, resolved, term, hup, os.Stderr, *drainTimeout, func(ctx context.Context, cfg appstore.Config, opts appstore.Options) error {
+		opts.ListenerFDs = files
+		return appstore.Run(ctx, cfg, opts)
+	})
+	for _, file := range files {
+		err = errors.Join(err, file.Close())
+	}
 	signal.Stop(hup)
 	signal.Stop(term)
 	if err != nil {

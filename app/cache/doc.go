@@ -10,6 +10,10 @@
 // finish handlers, asynchronous fills and repairs, refresh, and observation work
 // before releasing resources still used by those activities.
 //
+// ListenerFDs is an explicit borrowed descriptor input. Named fd=<name>
+// entrances use App-owned listener copies; the caller retains originals.
+// Environment parsing belongs to the CLI or public pkg/activation helper.
+//
 // Configuration defines the initial topology and resource budgets. An optional
 // membership input supplies candidate peers only for existing EC tiers. Refresh
 // retains the existing per-tier probe and membership application semantics; it

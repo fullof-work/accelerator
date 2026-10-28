@@ -18,17 +18,17 @@ import (
 type Config struct {
 	Mode         string `yaml:"mode"`          // "local" | "shard" | "tiered"
 	Type         string `yaml:"type"`          // local/shard: "embedded" | "redis"
-	Listen       string `yaml:"listen"`        // e.g. "0.0.0.0:7070" (wire data)
-	HealthListen string `yaml:"health_listen"` // e.g. "0.0.0.0:7071" (gRPC health)
+	Listen       string `yaml:"listen"`        // TCP, UDS, or fd=<name> (wire data)
+	HealthListen string `yaml:"health_listen"` // TCP, UDS, or fd=<name> (gRPC health)
 	RPCTimeout   string `yaml:"rpc_timeout"`   // e.g. "2s"
 	// StatsInterval is the base period for the adaptive stats line printed to
 	// stderr (silent in windows with no traffic). Empty/absent → 30s (on by
 	// default); "0"/"off" disables it.
 	StatsInterval string `yaml:"stats_interval"`
-	// PprofListen, if non-empty, binds an HTTP listener that serves
+	// PprofListen, if non-empty, binds TCP or imports fd=<name> for HTTP serving
 	// /debug/pprof/{profile,heap,goroutine,...}. Intended for
 	// perf investigation — leave empty in production.
-	PprofListen string        `yaml:"pprof_listen"` // e.g. "127.0.0.1:6060"
+	PprofListen string        `yaml:"pprof_listen"` // TCP or fd=<name>
 	Freq        FreqConfig    `yaml:"freq"`
 	Rocks       RocksConfig   `yaml:"rocks"`  // used by type=embedded
 	Redis       *RedisConfig  `yaml:"redis"`  // used by type=redis
