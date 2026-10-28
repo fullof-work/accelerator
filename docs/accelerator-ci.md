@@ -41,14 +41,14 @@ worker count does not change block identities or output order.
 
 The [accelerator E2E guide](../test/e2e/README.md) lists the prepared-product,
 EROFS, Redis, scratch-storage and privilege prerequisites and each accelerator
-`storage.*.sh` / `image.*.sh` product case. Product E2E is executed only through
+`basic.*.sh` / `storage.*.sh` / `image.*.sh` product case. Product E2E is executed only through
 the platform-owned prepared-workspace runner; accelerator no longer owns a
 `run_all.sh` or an owner-suite entry point. Local filesystem/cache and
 S3-compatible fixtures demonstrate local behavior; they do not establish real
 cloud coverage.
 
 For ordinary non-credentialed validation, prepare a workspace from the exact
-prebuilt platform release and explicitly select the five non-OBS accelerator
+prebuilt platform release and explicitly select the non-OBS accelerator storage/image
 cases:
 
 ```bash
@@ -61,9 +61,13 @@ WORK=/tmp/kuasar-e2e
   --include storage.cache.sh \
   --include storage.tiered-cache.sh \
   --include storage.cache-membership.sh \
+  --include storage.cache-probe.sh \
+  --include storage.service-drain.sh \
   --include storage.store-cache.sh \
   --include image.manifest.sh
 ```
+
+`basic.accelerator-activation.sh` separately validates service-manager lifecycle and named listener ownership. Run it with `--include basic.accelerator-activation.sh` on a systemd-capable environment; its mandatory `["systemd"]` declaration routes formal CI to the existing system executor. The actual Store/Cache requests verify recovery, while storage protocol/algorithm cases keep their storage classification and clean runtime. See the E2E guide for owned resources and prerequisites.
 
 Credentialed OBS remains opt-in and is selected by case ID, not by an
 `OBS_E2E` marker. With `OBS_BUCKET`, `OBS_ENDPOINT`, `OBS_AK` and `OBS_SK`

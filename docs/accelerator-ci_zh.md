@@ -33,12 +33,12 @@ Publisher 在独立 Workbench 调用中从受信源码编译归档校验器, 该
 ## Prepared 产品 E2E 与本地证据
 
 [Accelerator E2E 指南](../test/e2e/README_zh.md) 列出预构建产品、EROFS、Redis、
-临时存储和权限要求，以及 accelerator 的 `storage.*.sh` / `image.*.sh` 产品 case。
+临时存储和权限要求，以及 accelerator 的 `basic.*.sh` / `storage.*.sh` / `image.*.sh` 产品 case。
 产品 E2E 只通过平台统一的 prepared-workspace runner 执行；accelerator 不再拥有
 `run_all.sh` 或 owner-suite 入口。本地 filesystem/cache 和 S3-compatible fixture
 仅证明本地行为，不代表真实云覆盖。
 
-普通无凭据验证先从精确预构建平台 release 准备 workspace，并显式选择五个非 OBS case：
+普通无凭据验证先从精确预构建平台 release 准备 workspace，并显式选择非 OBS storage/image case：
 
 ```bash
 RUNNER=/path/to/platform/test/e2e/e2e
@@ -50,9 +50,13 @@ WORK=/tmp/kuasar-e2e
   --include storage.cache.sh \
   --include storage.tiered-cache.sh \
   --include storage.cache-membership.sh \
+  --include storage.cache-probe.sh \
+  --include storage.service-drain.sh \
   --include storage.store-cache.sh \
   --include image.manifest.sh
 ```
+
+`basic.accelerator-activation.sh` 单独验证 service-manager 生命周期和命名 listener 所有权. 在具备 systemd 的环境使用 `--include basic.accelerator-activation.sh`;其必需的 `["systemd"]` 声明将正式 CI 分配给既有 system executor. 实际 Store/Cache 请求用于验证恢复,存储协议/算法用例继续保持 storage 分类及 clean runtime. 自有资源和前置条件见 E2E guide.
 
 凭据化 OBS 保持显式 opt-in，并通过 case ID 选择，而不是依赖 `OBS_E2E` marker。
 明确配置 `OBS_BUCKET`、`OBS_ENDPOINT`、`OBS_AK` 和 `OBS_SK` 后，在同一个 prepared

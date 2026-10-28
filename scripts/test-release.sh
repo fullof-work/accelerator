@@ -240,13 +240,13 @@ if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
 fi
 
 expected_cases=(
+  test/e2e/cases/basic.accelerator-activation.sh
   test/e2e/cases/image.manifest.sh
   test/e2e/cases/storage.cache-membership.sh
   test/e2e/cases/storage.cache-probe.sh
   test/e2e/cases/storage.cache.sh
   test/e2e/cases/storage.obs.sh
   test/e2e/cases/storage.service-drain.sh
-  test/e2e/cases/storage.socket-activation.sh
   test/e2e/cases/storage.store-cache.sh
   test/e2e/cases/storage.tiered-cache.sh
 )
