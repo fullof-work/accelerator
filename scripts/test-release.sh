@@ -242,6 +242,7 @@ fi
 expected_cases=(
   test/e2e/cases/image.manifest.sh
   test/e2e/cases/storage.cache-membership.sh
+  test/e2e/cases/storage.cache-probe.sh
   test/e2e/cases/storage.cache.sh
   test/e2e/cases/storage.obs.sh
   test/e2e/cases/storage.store-cache.sh
@@ -253,7 +254,7 @@ mapfile -t sorted_expected_cases < <(printf '%s\n' "${expected_cases[@]}" | sort
   || fail "unexpected number of accelerator product E2E cases"
 for i in "${!sorted_expected_cases[@]}"; do
   [ "${actual_cases[$i]}" = "${sorted_expected_cases[$i]}" ] \
-    || fail "accelerator E2E case set differs from the six prepared cases"
+    || fail "accelerator E2E case set differs from the expected prepared cases"
 done
 for case_path in "${expected_cases[@]}"; do
   [ "$(git -C "$ROOT" ls-files -s -- "$case_path" | awk '{print $1}')" = 100644 ] \
