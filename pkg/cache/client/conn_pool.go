@@ -348,23 +348,9 @@ func (pc *PoolConn) Drain(pool cache.BlobPool) {
 }
 
 func (pc *PoolConn) Ping(timeout time.Duration) error {
-	_ = pc.conn.SetDeadline(time.Now().Add(timeout))
-	// The ping deadline must not outlive this call: net.Conn deadlines
-	// are absolute timestamps that persist across ownership, so a
-	// connection returned to the pool afterwards must go back with a
-	// zero deadline, not the expired ping one.
-	defer func() { _ = pc.conn.SetDeadline(time.Time{}) }()
-	if err := pc.conn.WriteRequest(&wire.Request{Opcode: wire.OpcodePing}); err != nil {
-		return err
-	}
-	resp, err := pc.conn.ReadResponse(nil)
-	if err != nil {
-		return err
-	}
-	if resp.Value != nil {
-		resp.Value.Release()
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return pc.ping(ctx)
 }
 
 func (pc *PoolConn) closeConn() error {

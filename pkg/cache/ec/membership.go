@@ -60,29 +60,19 @@ func formatPeerIDs(peers []Peer) string {
 	return "[" + strings.Join(ids, " ") + "]"
 }
 
-// ProbePeer opens a short-lived shard client to endpoint and returns
-// nil iff the peer accepts connections. Used by the SIGHUP reload
-// path to drop unreachable peers from a candidate membership before
-// they become routable.
+// ProbePeer completes one wire Ping on an independent short-lived connection.
+// A listening socket alone does not establish health. This proves only that
+// the peer's wire service responds, not that every object or shard is available.
 //
 // Timeout: hard-coded small value (not tuneable) because this runs
 // inline with SIGHUP handling; a slow peer should be excluded, not
 // delay the whole reload.
 func ProbePeer(ctx context.Context, endpoint string) error {
-	timeout := 2 * time.Second
-	if dl, ok := ctx.Deadline(); ok {
-		if remain := time.Until(dl); remain < timeout {
-			timeout = remain
-		}
-	}
-	c, err := client.NewShard(endpoint, client.Options{
-		Pool:    1,
-		Timeout: timeout,
-	})
-	if err != nil {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx, endpoint); err != nil {
 		return fmt.Errorf("probe %s: %w", endpoint, err)
 	}
-	_ = c.Close()
 	return nil
 }
 
