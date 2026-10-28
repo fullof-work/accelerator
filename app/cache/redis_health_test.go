@@ -6,12 +6,41 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/health"
+
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 type healthStatusRecorder struct {
 	mu       sync.Mutex
 	statuses []healthgrpc.HealthCheckResponse_ServingStatus
+}
+
+type pausedHealthPublication struct {
+	server           *health.Server
+	entered, release chan struct{}
+}
+
+func (p *pausedHealthPublication) SetServingStatus(service string, status healthgrpc.HealthCheckResponse_ServingStatus) {
+	close(p.entered)
+	<-p.release
+	p.server.SetServingStatus(service, status)
+}
+
+func TestShutdownFencesAlreadySuccessfulRedisProbe(t *testing.T) {
+	h := health.NewServer()
+	p := &pausedHealthPublication{server: h, entered: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startRedisHealthMonitor(ctx, p, nil)
+	<-p.entered // successful probe passed its ctx check but has not published yet
+	h.Shutdown()
+	cancel()
+	close(p.release)
+	<-done
+	resp, err := h.Check(context.Background(), &healthgrpc.HealthCheckRequest{})
+	if err != nil || resp.Status != healthgrpc.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("late health success escaped shutdown: %v, %v", resp, err)
+	}
 }
 
 func (r *healthStatusRecorder) SetServingStatus(_ string, status healthgrpc.HealthCheckResponse_ServingStatus) {

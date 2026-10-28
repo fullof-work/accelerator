@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	appstore "github.com/kuasar-sandbox/accelerator/app/store"
 )
@@ -18,7 +19,11 @@ import (
 func cmdServe(args []string) {
 	fset := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
+	drainTimeout := fset.Duration("drain-timeout", 0, "graceful shutdown budget (0 = unlimited)")
 	fset.Parse(args)
+	if *drainTimeout < 0 {
+		fatal("drain timeout must not be negative")
+	}
 
 	resolved := resolveConfigPath(*configPath)
 	if resolved == "" {
@@ -33,7 +38,7 @@ func cmdServe(args []string) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(hup, syscall.SIGHUP)
-	err = serveStore(*cfg, resolved, term, hup, os.Stderr, appstore.Run)
+	err = serveStore(*cfg, resolved, term, hup, os.Stderr, *drainTimeout, appstore.Run)
 	signal.Stop(hup)
 	signal.Stop(term)
 	if err != nil {
@@ -43,9 +48,10 @@ func cmdServe(args []string) {
 
 type storeRunner func(context.Context, appstore.Config, appstore.Options) error
 
-func serveStore(cfg Config, resolved string, term, hup <-chan os.Signal, output io.Writer, run storeRunner) error {
+func serveStore(cfg Config, resolved string, term, hup <-chan os.Signal, output io.Writer, drainTimeout time.Duration, run storeRunner) error {
 	reload := make(chan struct{}, 1)
-	opts := appstore.Options{Reload: reload}
+	drain := make(chan struct{})
+	opts := appstore.Options{Reload: reload, Drain: drain, DrainTimeout: drainTimeout}
 	if cfg.Generations.IsConfigSource() {
 		source := configGenerationSource{path: resolved}
 		opts.Generations = &appstore.GenerationSource{Load: source.Load}
@@ -57,18 +63,37 @@ func serveStore(cfg Config, resolved string, term, hup <-chan os.Signal, output 
 	signalWG.Add(1)
 	go func() {
 		defer signalWG.Done()
+		draining, forced := false, false
 		for {
 			select {
 			case <-done:
 				return
-			case <-hup:
+			case _, ok := <-hup:
+				if !ok {
+					hup = nil
+					continue
+				}
+				if draining {
+					continue
+				}
 				select {
 				case reload <- struct{}{}:
 				default:
 				}
-			case sig := <-term:
-				fmt.Fprintf(output, "store-ctl: received %s, shutting down...\n", sig)
-				cancel()
+			case sig, ok := <-term:
+				if !ok {
+					term = nil
+					continue
+				}
+				if !draining {
+					draining = true
+					fmt.Fprintf(output, "store-ctl: received %s, draining...\n", sig)
+					close(drain)
+				} else if !forced {
+					forced = true
+					fmt.Fprintf(output, "store-ctl: received %s, cancelling...\n", sig)
+					cancel()
+				}
 			}
 		}
 	}()

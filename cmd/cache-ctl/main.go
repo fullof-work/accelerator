@@ -126,7 +126,11 @@ func resolveDataEndpoint(flagValue string) string {
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "", "YAML config file (overrides CACHE_CONFIG env)")
+	drainTimeout := fs.Duration("drain-timeout", 0, "graceful shutdown budget (0 = unlimited)")
 	fs.Parse(args)
+	if *drainTimeout < 0 {
+		fatal("drain timeout must not be negative")
+	}
 
 	resolved := *configPath
 	if resolved == "" {
@@ -144,12 +148,13 @@ func cmdServe(args []string) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	termCh := make(chan os.Signal, 1)
+	termCh := make(chan os.Signal, 2)
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(hupCh, syscall.SIGHUP)
 
-	var opts appcache.Options
+	drain := make(chan struct{})
+	opts := appcache.Options{Drain: drain, DrainTimeout: *drainTimeout}
 	hasEC := false
 	for _, tier := range cfg.Tiers {
 		if tier.Type == "ec" {
@@ -171,13 +176,23 @@ func cmdServe(args []string) {
 	forward.Add(1)
 	go func() {
 		defer forward.Done()
+		draining, forced := false, false
 		for {
 			select {
 			case sig := <-termCh:
-				fmt.Fprintf(os.Stderr, "\ncache-ctl: received %v, shutting down...\n", sig)
-				cancel()
-				return
+				if !draining {
+					draining = true
+					fmt.Fprintf(os.Stderr, "cache-ctl: received %v, draining...\n", sig)
+					close(drain)
+				} else if !forced {
+					forced = true
+					fmt.Fprintf(os.Stderr, "cache-ctl: received %v, cancelling...\n", sig)
+					cancel()
+				}
 			case <-hupCh:
+				if draining {
+					continue
+				}
 				if reload == nil {
 					log.Printf("SIGHUP: no EC tiers; nothing to reload")
 					continue

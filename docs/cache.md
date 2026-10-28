@@ -28,7 +28,7 @@ For `cache-ctl bench` commands, workload controls and safeguards, see [§7.1](#7
 ### 2.1 `cache-ctl serve`
 
 ```text
-cache-ctl serve --config FILE
+cache-ctl serve --config FILE [--drain-timeout DURATION]
 ```
 
 Either `--config` or `CACHE_CONFIG` is required; the flag takes precedence and both missing is an error. See §3 for YAML examples.
@@ -565,14 +565,16 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 ### 6.2 Signals and shutdown
 
-SIGINT/SIGTERM trigger:
+The first SIGTERM/SIGINT starts irreversible drain without cancelling admitted business work. The second exit signal cancels in-flight work; further signals are idempotent. SIGHUP retains the EC membership refresh behavior in §4.9 while running and stops triggering refresh once shutdown starts.
 
-1. Stop the health monitor and, if enabled, mark gRPC health NOT_SERVING so orchestration can stop routing new work.
-2. Stop accepting wire connections and close all tracked connections, including active ones. The wire `GracefulStop` waits up to five seconds for connection goroutines. Closing a connection can cancel its handler and discard its response; it does not guarantee successful draining of in-flight requests.
-3. Gracefully stop the shared gRPC Health/Info server.
-4. In tiered mode, cancel/join asynchronous fills through TieredCache.Close, then close the origin and constructed tier resources through their registered cleanup. Tier resources close in **reverse YAML construction order**, not a fixed embedded→Redis→EC→upstream type order. Local/shard closes its selected backend.
+1. Atomically close wire admission and withdraw existing health readiness. A late successful Redis health probe cannot change NOT_SERVING back to SERVING.
+2. Drain executing requests, requests admitted by the reader, the reqs queue and pending requests. Local reader shutdown is distinct from peer disconnection. TCP/UDS half-close after local drain starts preserves admitted responses. Outside drain, EOF/disconnection retains its existing cancellation semantics, including client Get/GetShard aborts; a TCP FIN alone cannot distinguish a write-half close from a closed caller. Release Blobs and request buffers only after the full write or a definite write failure. On Linux TCP, wait for the transmitted tail to be acknowledged before final close so unread input cannot cause an RST that truncates the response.
+3. Once foreground work can no longer create fills/repairs, cancel and join background work, detached EC cleanup, membership callbacks, Info/stats and the health monitor. Indefinite management Watch streams are cancelled; actual handlers must still finish.
+4. Close App-owned dependencies last. Tier resources retain reverse YAML construction order; local/shard closes the selected backend. Borrowed loggers and callbacks remain owned by the host.
 
-Clients can observe cancellation, EOF, or another connection error during shutdown. Retry eligible operations against a healthy endpoint according to caller policy; loss of a response does not prove that a write was never applied. The five-second wire wait is not a five-second bound on the entire process shutdown: other cleanup and backend calls can take longer. SIGHUP reloads EC membership as described in §4.9.
+`cache-ctl serve --config FILE --drain-timeout 30s` gives every entrance one shared graceful budget starting at the first drain. The default `0` adds no internal overall limit; negative values are rejected before resources are created. This option has no YAML/env counterpart. Expiry cancels work and closes transports, but still joins uncancellable RocksDB/FS/provider calls before closing their resources. It is not a process lifetime limit; final termination belongs to the manager or SDK host.
+
+New business is rejected, and cancellation or failure can produce real transport errors. A server commit followed by a lost response remains an uncertain result, never fabricated client success. Low-level Get/GetShard remain single attempt. Ordinary bind releases its listeners on exit; the next instance reopens the database and binds after the old instance exits. Drain does not retain listeners or migrate connections. Rollback requires no data-format change.
 
 ### 6.3 Runtime counters: pull-only
 
@@ -787,7 +789,7 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 
 ## 8. Reusable Cache application entry point
 
-`app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains only `Logger`, `Reload` and `LoadMembership`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
+`app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains `Logger`, `Reload`, `LoadMembership`, `Drain` and `DrainTimeout`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
 
 A minimal custom executable is:
 
@@ -826,7 +828,9 @@ KillSignal=SIGTERM
 
 For EC membership refresh, the caller supplies both `Reload` and `LoadMembership`. The callback returns candidate peers only for EC tiers that already exist in the startup configuration. `Run` validates the whole candidate batch, probes and applies each tier independently, and retains that tier's previous membership on failure. It does not hot-replace the topology or other configuration. A closed reload channel is disabled rather than polled.
 
-The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. Shutdown first stops admission and cancels managed work, waits for handlers/fills/repairs/detached EC cleanup and observers, then closes owned dependencies. Custom callers own their signals and borrowed inputs.
+The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. It closes dependencies and returns only after actual users finish; §6.2 defines the ordering. Custom callers own their signals and borrowed inputs.
+
+`Options.Drain <-chan struct{}` defaults to nil, preserving the ctx cancellation behavior of the example above. Closing an explicitly supplied Drain starts soft shutdown. Cancelling the `Run(ctx)` context always cancels in-flight work, takes priority over simultaneous drain, and does not silently become a graceful wait. `Options.DrainTimeout time.Duration` uses the shared budget in §6.2. Drain during initialization prevents subsequent started/SERVING publication. A host that distinguishes soft shutdown from cancellation can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its context cancel function. The App does not take over host signals, args or process exit.
 
 ## 8. See Also
 

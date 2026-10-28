@@ -131,7 +131,7 @@ func TestServeRetriesTemporaryAcceptError(t *testing.T) {
 	}
 }
 
-func TestGracefulStopTimeoutAndWaitForCompletion(t *testing.T) {
+func TestStopWaitsForUncancellableHandler(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	listener := &singleConnListener{conn: serverConn, closed: make(chan struct{})}
 	getter := &blockingGetter{started: make(chan struct{}), release: make(chan struct{})}
@@ -145,18 +145,8 @@ func TestGracefulStopTimeoutAndWaitForCompletion(t *testing.T) {
 	}
 	<-getter.started
 
-	started := time.Now()
-	s.GracefulStop()
-	elapsed := time.Since(started)
-	if elapsed < 4500*time.Millisecond || elapsed > 7*time.Second {
-		t.Fatalf("GracefulStop returned after %v, want legacy five-second bound", elapsed)
-	}
-
 	waitDone := make(chan struct{})
-	go func() {
-		s.Wait()
-		close(waitDone)
-	}()
+	go func() { s.Stop(); close(waitDone) }()
 	select {
 	case <-waitDone:
 		t.Fatal("Wait returned while the handler was still active")

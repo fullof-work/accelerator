@@ -320,6 +320,14 @@ A nonempty `cache_listen` starts a read-only cache wire server. ObjectGet access
 
 `stats_interval` defaults to 30s and emits get/put/admit rates, bandwidth, dedup ratio, latency, inflight counts and errors. `0`/`off` disables it. `STORE_CTL_DEBUG=1` enables slow-S3-operation tracing; `STORE_CTL_SLOW` sets its threshold.
 
+`store-ctl serve --config FILE [--drain-timeout DURATION]` closes admission and drains admitted requests on the first SIGTERM/SIGINT. The second exit signal cancels in-flight work; further signals are idempotent. SIGHUP retains generation refresh while running and stops triggering it during shutdown. Store adds no management port or separate readiness framework.
+
+Drain covers every Get stream Send and Put reception, verification, Commit and SendAndClose. gRPC and optional cache_listen share an exit barrier: neither entrance finishing first can close the shared backend early. Executing, admitted queued and pending wire requests retain complete responses; local reader shutdown does not cancel handlers as though the peer disconnected. After foreground work ends, join generation refresh, stats and other actual users, then close App-owned backends/clients. Borrowed providers/loggers are not closed. Forced cancellation preserves existing Put Abort semantics; a commit followed by a lost response remains uncertain.
+
+`--drain-timeout` defaults to `0`, adding no internal overall limit. A positive value is one graceful budget shared by all entrances from the first soft stop; a negative value is rejected before resource creation. It adds no YAML/env setting. Expiry can cancel work and close transports, but Run must still join uncancellable FS/provider calls before closing resources and returning. Final process termination belongs to the manager or SDK host; this budget is not a hard Run return deadline.
+
+Ordinary bind releases entrances on exit; the next instance initializes and binds after the old instance exits. Drain does not migrate connections or change the accepted eventual-consistency and revocable-object deduplication constraints of FS. Rollback changes no format. Low-level clients remain single attempt; transport errors never become fabricated success or miss.
+
 Validation:
 
 ```bash
@@ -374,7 +382,9 @@ Restart=on-failure
 KillSignal=SIGTERM
 ```
 
-Direct Go construction of `storeapp.Config` is equally supported. Dynamic generation or credential providers belong in the five `Options` fields documented by the Go API; they are process-local bindings and are not written back into YAML. A custom caller that wants reload must own its reload trigger and provider callback just as `store-ctl` owns SIGHUP adaptation.
+Direct Go construction of `storeapp.Config` is equally supported. Dynamic generation or credential providers are explicit `Options` bindings documented by the Go API; they are process-local bindings and are not written back into YAML. A custom caller that wants reload must own its reload trigger and provider callback just as `store-ctl` owns SIGHUP adaptation.
+
+`Options` adds zero-value-compatible `Drain <-chan struct{}` and `DrainTimeout time.Duration`. A nil Drain preserves the old SDK cancellation usage shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See §8 for the budget and resource ordering.
 
 Validation of the reusable entry point should compile the custom module independently and exercise real Store protocol requests with the official service binary absent from `PATH`.
 

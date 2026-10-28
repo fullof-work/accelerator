@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/internal/appshutdown"
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
@@ -37,6 +38,11 @@ type MembershipUpdate struct {
 }
 
 type Options struct {
+	// Closing Drain starts irreversible soft shutdown; nil preserves ctx-only use.
+	Drain <-chan struct{}
+	// DrainTimeout bounds graceful waiting, never the lifetime of resource users.
+	// Zero is unlimited; negative values are rejected before acquiring resources.
+	DrainTimeout   time.Duration
 	Logger         *slog.Logger
 	Reload         <-chan struct{}
 	LoadMembership func(context.Context) ([]MembershipUpdate, error)
@@ -48,7 +54,10 @@ type directStore interface {
 	Close() error
 }
 
-func Run(ctx context.Context, cfg Config, opts Options) error {
+func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
+	if opts.DrainTimeout < 0 {
+		return errors.New("cache: drain timeout must not be negative")
+	}
 	if ctx == nil {
 		return errors.New("cache: nil context")
 	}
@@ -61,6 +70,12 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 	cfg, err := prepareConfig(cfg, opts)
 	if err != nil {
 		return err
+	}
+	life := appshutdown.New(ctx, opts.Drain, opts.DrainTimeout)
+	defer func() { retErr = errors.Join(retErr, life.Err()); life.Close() }()
+	ctx = life.Context
+	if !life.Active(nil) {
+		return nil
 	}
 	log := opts.Logger
 	if log == nil {
@@ -82,6 +97,7 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 		owned        []func() error
 	)
 	closeOwned := func() error {
+		life.Close()
 		var errs []error
 		for i := len(owned) - 1; i >= 0; i-- {
 			if e := owned[i](); e != nil {
@@ -163,7 +179,8 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 		tieredCache = pkgcache.NewTieredCache(origin, tieredComps.Tiers...)
 		tierBackend = &tieredBackend{tc: tieredCache}
 	}
-	if err = ctx.Err(); err != nil {
+	if !life.Active(nil) {
+		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
 
@@ -200,12 +217,14 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 		}
 		return errors.Join(errs...)
 	}
-	if err = ctx.Err(); err != nil {
+	if !life.Active(nil) {
+		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeListeners(), closeOwned()))
 	}
 
 	var grpcServer *grpc.Server
 	var healthSrv interface {
+		Shutdown()
 		SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus)
 	}
 	if healthLis != nil {
@@ -227,6 +246,7 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 			healthSrv.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
 		}
 	}
+	var httpHandlers sync.WaitGroup
 	var pprofServer *http.Server
 	if pprofLis != nil {
 		mux := http.NewServeMux()
@@ -235,88 +255,142 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		pprofServer = &http.Server{Handler: mux}
+		pprofServer = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !life.Active(func() { httpHandlers.Add(1) }) {
+				http.Error(w, "server is stopping", http.StatusServiceUnavailable)
+				return
+			}
+			defer httpHandlers.Done()
+			mux.ServeHTTP(w, r)
+		})}
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	var observers sync.WaitGroup
-	redisStores := collectRedisStores(primaryRedis, tieredComps)
-	if healthSrv != nil && len(redisStores) > 0 {
-		observers.Add(1)
-		go func() {
-			defer observers.Done()
-			monitorRedisHealth(runCtx, healthSrv, redisStores)
-		}()
-	}
-	var statsRocks rocks.Interface = primaryRocks
-	if tieredComps != nil {
-		statsRocks = tieredComps.EmbeddedStore
-	}
-	observers.Add(1)
-	go func() {
-		defer observers.Done()
-		obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), cacheSampler(cfg.Mode, ws, tieredCache, statsRocks, collectRedisGaugeSources(primaryRedis, tieredComps)), func(f string, a ...any) {
-			log.Info(fmt.Sprintf(f, a...))
-		})
-	}()
-	if opts.Reload != nil {
-		observers.Add(1)
-		go func() {
-			defer observers.Done()
-			runMembership(runCtx, opts.Reload, opts.LoadMembership, tieredComps, log)
-		}()
-	}
-
 	type serveResult struct {
 		name string
 		err  error
 	}
 	results := make(chan serveResult, 2)
 	required := 1
-	go func() { results <- serveResult{"wire", ws.Serve(dataLis)} }()
 	if grpcServer != nil {
 		required++
-		go func() { results <- serveResult{"grpc", grpcServer.Serve(healthLis)} }()
 	}
 	var pprofDone chan error
 	if pprofServer != nil {
 		pprofDone = make(chan error, 1)
-		go func() { pprofDone <- pprofServer.Serve(pprofLis) }()
 	}
-	log.Info("cache started", "mode", cfg.Mode, "listen", cfg.Listen, "health", cfg.HealthListen, "pprof", cfg.PprofListen)
+	if !life.Active(func() {
+		redisStores := collectRedisStores(primaryRedis, tieredComps)
+		if healthSrv != nil && len(redisStores) > 0 {
+			observers.Add(1)
+			go func() {
+				defer observers.Done()
+				monitorRedisHealth(runCtx, healthSrv, redisStores)
+			}()
+		}
+		var statsRocks rocks.Interface = primaryRocks
+		if tieredComps != nil {
+			statsRocks = tieredComps.EmbeddedStore
+		}
+		observers.Add(1)
+		go func() {
+			defer observers.Done()
+			obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), cacheSampler(cfg.Mode, ws, tieredCache, statsRocks, collectRedisGaugeSources(primaryRedis, tieredComps)), func(f string, a ...any) {
+				log.Info(fmt.Sprintf(f, a...))
+			})
+		}()
+		if opts.Reload != nil {
+			observers.Add(1)
+			go func() {
+				defer observers.Done()
+				runMembership(runCtx, opts.Reload, opts.LoadMembership, tieredComps, log)
+			}()
+		}
+		go func() { results <- serveResult{"wire", ws.Serve(dataLis)} }()
+		if grpcServer != nil {
+			go func() { results <- serveResult{"grpc", grpcServer.Serve(healthLis)} }()
+		}
+		if pprofServer != nil {
+			go func() { pprofDone <- pprofServer.Serve(pprofLis) }()
+		}
+		log.Info("cache started", "mode", cfg.Mode, "listen", cfg.Listen, "health", cfg.HealthListen, "pprof", cfg.PprofListen)
+
+	}) {
+		cancel()
+		return startupError(ctx, errors.Join(ctx.Err(), closeListeners(), closeOwned()))
+	}
 
 	var out error
 	done := 0
+	force := false
 	select {
-	case <-ctx.Done():
-		if ctx.Err() != context.Canceled {
-			out = ctx.Err()
-		}
+	case <-life.Stopping():
+		force = ctx.Err() != nil
 	case r := <-results:
 		done++
 		out = serveError(r.name, r.err)
+		life.Cancel()
+		force = true
 	}
-
 	cancel()
 	if healthSrv != nil {
-		healthSrv.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
+		// The existing gRPC health server fences later SetServingStatus calls
+		// after Shutdown, including an already-running Redis probe's success.
+		healthSrv.Shutdown()
 	}
-	if tieredCache != nil {
-		tieredCache.Stop()
-	}
+	ws.Drain()
+	pprofCtx, cancelPprof := context.WithCancel(ctx)
+	defer cancelPprof()
+	frontDone := make(chan struct{})
 	var stops sync.WaitGroup
 	stops.Add(1)
-	go func() { defer stops.Done(); ws.GracefulStop() }()
+	go func() { defer stops.Done(); ws.Wait() }()
 	if grpcServer != nil {
 		stops.Add(1)
+		// Management Watch streams may be indefinite. Stop their transports and
+		// join actual Info handlers before any backend is closed.
 		go func() { defer stops.Done(); grpcServer.Stop() }()
 	}
 	if pprofServer != nil {
 		stops.Add(1)
-		go func() { defer stops.Done(); _ = pprofServer.Close() }()
+		go func() { defer stops.Done(); _ = pprofServer.Shutdown(pprofCtx) }()
 	}
-	stops.Wait()
-	ws.Wait()
+	go func() {
+		stops.Wait()
+		// Shutdown can return on budget expiry before HTTP handlers finish.
+		// Keep cancellation escalation live until those actual users join too.
+		httpHandlers.Wait()
+		close(frontDone)
+	}()
+	var forced sync.WaitGroup
+	forceStop := func() {
+		if tieredCache != nil {
+			tieredCache.Stop()
+		}
+		cancelPprof()
+		if pprofServer != nil {
+			_ = pprofServer.Close()
+		}
+		forced.Add(1)
+		go func() { defer forced.Done(); ws.Stop() }()
+	}
+	if force {
+		forceStop()
+	} else {
+		select {
+		case <-frontDone:
+		case <-ctx.Done():
+			forceStop()
+		}
+	}
+	<-frontDone
+	forced.Wait()
+	// Foreground handlers can no longer enqueue fills or repairs. Cancel and
+	// join their background users before closing the shared dependencies.
+	if tieredCache != nil {
+		tieredCache.Stop()
+	}
 	for done < required {
 		r := <-results
 		done++
@@ -339,6 +413,9 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 }
 
 func prepareConfig(cfg Config, opts Options) (Config, error) {
+	if opts.DrainTimeout < 0 {
+		return Config{}, errors.New("drain timeout must not be negative")
+	}
 	cfg = cloneConfig(cfg)
 	if (opts.Reload == nil) != (opts.LoadMembership == nil) {
 		return Config{}, errors.New("cache: Reload and LoadMembership must be configured together")
@@ -503,6 +580,9 @@ func monitorRedisHealth(ctx context.Context, healthSrv interface {
 				break
 			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		healthSrv.SetServingStatus("", status)
 	}
 	probe()
@@ -528,7 +608,13 @@ func runMembership(ctx context.Context, reload <-chan struct{}, load func(contex
 				reload = nil
 				continue
 			}
+			if ctx.Err() != nil {
+				return
+			}
 			updates, err := load(ctx)
+			if ctx.Err() != nil {
+				return
+			}
 			if err != nil {
 				if ctx.Err() == nil {
 					log.Error("cache membership reload failed", "error", err)
@@ -547,6 +633,9 @@ func runMembership(ctx context.Context, reload <-chan struct{}, load func(contex
 					candidates[i] = ec.Peer{ID: p.ID, Endpoint: p.Endpoint}
 				}
 				live := probeAndFilter(ctx, candidates, log)
+				if ctx.Err() != nil {
+					return
+				}
 				if len(live) == 0 {
 					log.Warn("cache membership reload retained old membership", "tier", update.TierIndex, "reason", "no live peers")
 					continue
