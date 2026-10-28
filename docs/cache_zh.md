@@ -610,7 +610,8 @@ EC router 用 atomic.Pointer 发布不可变 `(epoch,peers,maglev_table)` snapsh
 epoch 或重算 placement。
 
 reload 读取并校验 YAML,检查兼容 tier 结构,probe EC 候选,以更高 epoch 应用可达集合。
-非法 reload 或没有可达候选时保留旧 membership。probe 只证明连接就绪,不证明对象/shard
+EC socket activation 部署必须包含真实 Ping 校验; 回滚该校验时也应撤回依赖它的 activation.
+非法 reload 或没有可达候选时保留旧 membership。每次 probe 使用独立短 TCP/UDS 连接完成一次已有 wire Ping. dial/write/read 共用既有两秒总 context 预算,调用者更早的 deadline 优先. 成功要求 `StatusHit`、无错误文本、空 value,与 `PoolConn.Ping` 共用校验; 当前响应协议没有请求 ID 或回显 opcode. 只有监听 socket (包括没有服务进程的 manager socket) 不健康. Ping 只证明 wire 应答,不证明数据库可用或对象/shard
 都存在。后续调用用新 snapshot,在途工作可继续持有旧 snapshot。
 
 增删 peer 后发 HUP,检查日志成员与实际可读性;新 routing 排除被移除 peer。实测受影响

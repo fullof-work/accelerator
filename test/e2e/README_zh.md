@@ -17,6 +17,7 @@ Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行
 | `storage.cache.sh` | 文件系统/本地缓存与 Store 往返、cache 协议、tiered 只读写拒绝等缓存正确性。 |
 | `storage.tiered-cache.sh` | Redis/tiered/sharded/EC、上游填充与回写、故障恢复、重启回填及无 origin 热读取。 |
 | `storage.cache-membership.sh` | EC cache 成员滚动变化及利用存活节点完成重建。 |
+| `storage.cache-probe.sh` | RocksDB/Redis 的真实 TCP/UDS Ping 与 single-attempt shard 往返; SIGHUP 排除仅监听的 peer. |
 | `storage.store-cache.sh` | Store 内嵌只读 cache 协议、generation 切换、旧 manifest 读取、blob 命名空间及拒绝写入。 |
 | `image.manifest.sh` | 真实 flatten/EROFS，以及 Manifest store/load、去重、校验、稀疏/零块与镜像差异契约。 |
 | `storage.obs.sh` | 显式选择、需要凭据的 OBS/S3 兼容对象存储往返；不属于普通离线执行。 |
