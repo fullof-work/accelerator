@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -160,9 +158,11 @@ func (s *WireServer) serveConn(connCtx context.Context, cancelConn context.Cance
 			s.connsMu.Unlock()
 			req, err := wc.ReadRequest()
 			if err != nil {
-				// EOF may be a peer's write-half close. Its complete requests still
-				// deserve responses. Local drain only stops input, never the handler.
-				if !s.closing.Load() && !errors.Is(err, io.EOF) {
+				// Local drain stops input without cancelling admitted handlers.
+				// Outside drain retain the established EOF/disconnect cancellation
+				// contract: read clients abort by closing their connection. A TCP
+				// FIN cannot distinguish that abort from a write-half close.
+				if !s.closing.Load() {
 					cancelConn()
 					_ = c.Close()
 				}

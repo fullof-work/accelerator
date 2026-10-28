@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
@@ -146,7 +147,7 @@ func TestDrainPipelinedResponsesAndSlowReader(t *testing.T) {
 	}
 }
 
-func TestHalfClosePreservesAdmittedHandler(t *testing.T) {
+func TestHalfCloseDuringDrainPreservesAdmittedHandler(t *testing.T) {
 	for _, network := range []string{"tcp", "unix"} {
 		t.Run(network, func(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -165,6 +166,7 @@ func TestHalfClosePreservesAdmittedHandler(t *testing.T) {
 				t.Fatal(err)
 			}
 			<-entered
+			s.Drain()
 			if err := raw.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
 				t.Fatal(err)
 			}
@@ -182,6 +184,107 @@ func TestHalfClosePreservesAdmittedHandler(t *testing.T) {
 			}
 			s.GracefulStop()
 		})
+	}
+}
+
+type cancelledReadTier struct {
+	entered, cancelled chan struct{}
+	calls              atomic.Int32
+}
+
+func (b *cancelledReadTier) Get(ctx context.Context, _ store.Partition, _ store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+	b.calls.Add(1)
+	close(b.entered)
+	<-ctx.Done()
+	close(b.cancelled)
+	return cache.CacheMiss, nil, ctx.Err()
+}
+func (b *cancelledReadTier) GetShard(ctx context.Context, p store.Partition, k store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+	return b.Get(ctx, p, k)
+}
+func (*cancelledReadTier) Fill(context.Context, store.Partition, store.ContentKey, []byte) error {
+	return nil
+}
+func (*cancelledReadTier) FillShard(context.Context, store.Partition, store.ContentKey, []byte) error {
+	return nil
+}
+
+func TestClientCancellationStillCancelsPeerOutsideDrain(t *testing.T) {
+	for _, network := range []string{"tcp", "unix"} {
+		for _, operation := range []string{"object", "shard"} {
+			t.Run(network+"/"+operation, func(t *testing.T) {
+				address := "127.0.0.1:0"
+				if network == "unix" {
+					address = filepath.Join(t.TempDir(), "wire.sock")
+				}
+				l, err := net.Listen(network, address)
+				if err != nil {
+					t.Fatal(err)
+				}
+				backend := &cancelledReadTier{entered: make(chan struct{}), cancelled: make(chan struct{})}
+				s := NewWireServer(NewCacheHandler(backend, backend), 0, 0)
+				served := make(chan error, 1)
+				go func() { served <- s.Serve(l) }()
+				t.Cleanup(func() {
+					s.Stop()
+					if err := <-served; err != nil {
+						t.Error(err)
+					}
+				})
+				ep := l.Addr().String()
+				if network == "unix" {
+					ep = "unix://" + ep
+				}
+				var get func(context.Context, store.Partition, store.ContentKey) (cache.CacheResult, cache.Blob, error)
+				if operation == "object" {
+					c, err := client.New(ep, client.Options{Pool: 1})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer c.Close()
+					get = c.Get
+				} else {
+					c, err := client.NewShard(ep, client.Options{Pool: 1})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer c.Close()
+					get = c.GetShard
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() {
+					_, blob, err := get(ctx, store.PartitionBlob, store.ContentKey{})
+					if blob != nil {
+						blob.Release()
+					}
+					done <- err
+				}()
+				select {
+				case <-backend.entered:
+				case <-time.After(time.Second):
+					t.Fatal("client request never reached handler")
+				}
+				cancel()
+				select {
+				case err := <-done:
+					if err == nil {
+						t.Fatal("cancelled read reported success")
+					}
+				case <-time.After(time.Second):
+					t.Fatal("client cancellation did not interrupt read")
+				}
+				select {
+				case <-backend.cancelled:
+				case <-time.After(time.Second):
+					t.Fatal("ordinary peer EOF did not cancel backend operation")
+				}
+				if backend.calls.Load() != 1 {
+					t.Fatalf("read retried %d times", backend.calls.Load())
+				}
+			})
+		}
 	}
 }
 

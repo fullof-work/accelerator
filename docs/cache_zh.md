@@ -669,7 +669,7 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 第一次 SIGTERM/SIGINT 发起不可逆 drain,不取消已接纳业务的 context;第二次退出信号取消在途工作,后续信号幂等。SIGHUP 在服务运行时仍按 §4.9 刷新 EC membership,进入退出阶段后不再触发刷新。
 
 1. 原子关闭 wire admission,撤销既有 health readiness。已开始的 Redis health probe 即使迟到成功,也不能把 NOT_SERVING 改回 SERVING。
-2. 排空执行中请求、reader 已接纳的请求、reqs 队列和 pending 请求。停止 reader 与 peer 断线分开处理;TCP/UDS half-close 保留响应。Blob 和请求缓冲区在完整写出或明确写失败后才释放。Linux TCP 在最终 close 前等待已发送尾部得到 ACK,避免未读输入导致 RST 截断。
+2. 排空执行中请求、reader 已接纳的请求、reqs 队列和 pending 请求。停止本地 reader 与 peer 断线分开处理;本地 drain 开始后,TCP/UDS half-close 保留已接纳响应。正常运行时,EOF/断线保持既有取消语义,包括客户端 Get/GetShard 的中止;仅凭 TCP FIN 无法区分 write-half close 与调用方关闭连接。Blob 和请求缓冲区在完整写出或明确写失败后才释放。Linux TCP 在最终 close 前等待已发送尾部得到 ACK,避免未读输入导致 RST 截断。
 3. 前台不能再生成 fill/repair 后,取消并 join 后台任务、EC detached cleanup、membership callback、Info/stats 和 health monitor。无限期的管理 Watch 会被取消,正在执行的 handler 仍须结束。
 4. 最后关闭 App 拥有的依赖。Tier 资源保持按 YAML 构造的逆序关闭;local/shard 关闭所选 backend。借入的 logger 和 callback 保持由宿主拥有。
 
