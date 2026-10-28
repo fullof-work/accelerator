@@ -245,6 +245,7 @@ expected_cases=(
   test/e2e/cases/storage.cache-probe.sh
   test/e2e/cases/storage.cache.sh
   test/e2e/cases/storage.obs.sh
+  test/e2e/cases/storage.service-drain.sh
   test/e2e/cases/storage.store-cache.sh
   test/e2e/cases/storage.tiered-cache.sh
 )

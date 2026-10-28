@@ -18,6 +18,7 @@ A case ID is its filename. The suite is the first filename segment. Accelerator 
 | `storage.tiered-cache.sh` | Redis/tiered/sharded/EC behavior, upstream fill/writeback, failure/recovery, restart/refill and origin-free warm reads. |
 | `storage.cache-membership.sh` | Rolling EC cache membership and reconstruction with surviving peers. |
 | `storage.cache-probe.sh` | Real TCP/UDS Ping and single-attempt shard round trips with RocksDB/Redis; SIGHUP excludes listener-only peers. |
+| `storage.service-drain.sh` | Real Store/Cache CLI over TCP/UDS: slow readers, first-signal drain, second-signal cancellation, budget expiry and ordinary bind restart, with RocksDB, Redis and Store FS. |
 | `storage.store-cache.sh` | Store's embedded read-only cache protocol, generation rollout, old-manifest reads, blob namespace and rejected writes. |
 | `image.manifest.sh` | Real flatten/EROFS plus Manifest store/load, dedup, verification, sparse/zero-block and image-diff contracts. |
 | `storage.obs.sh` | Explicit credentialed OBS/S3-compatible round trip. This case is not part of ordinary offline execution. |
@@ -40,6 +41,7 @@ WORK=/tmp/kuasar-e2e
   --include storage.cache.sh \
   --include storage.tiered-cache.sh \
   --include storage.cache-membership.sh \
+  --include storage.service-drain.sh \
   --include storage.store-cache.sh \
   --include image.manifest.sh
 ```

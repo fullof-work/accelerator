@@ -367,6 +367,14 @@ shard 操作被拒绝。它是无 L1 的透传入口；需要本地缓存时仍�
 inflight 和错误数；`0`/`off` 可关闭。`STORE_CTL_DEBUG=1` 可启用慢 S3 操作追踪，
 `STORE_CTL_SLOW` 设置阈值。
 
+`store-ctl serve --config FILE [--drain-timeout DURATION]` 的第一次 SIGTERM/SIGINT 关闭 admission 并排空已接纳请求;第二次退出信号取消在途工作,后续信号幂等。SIGHUP 保留 generation 刷新语义,进入退出阶段后不再触发刷新。Store 不另建管理端口或 readiness 框架。
+
+排空覆盖 Get 的全部 stream Send,以及 Put 的接收、校验、Commit 和 SendAndClose。gRPC 与可选 cache_listen 共用退出屏障,任一侧先结束都不能提前关闭 backend。wire 的执行中、已接纳队列和 pending 请求均保留完整响应;停止本地 reader 不当作 peer 断线取消 handler。前台结束后 join generation refresh、stats 等实际使用者,最后关闭 App 拥有的 backend/client。借入 provider/logger 不由 App 关闭。强制取消保留既有 Put Abort 语义;已提交而响应丢失仍是不确定结果。
+
+`--drain-timeout` 默认为 `0`,不增加内部总上限;正数是从首次软停开始、所有入口共享的一份优雅预算;负数在资源创建前拒绝。不增加 YAML/env 配置。预算耗尽可以取消工作和关闭运输层,但仍须等待不可取消的 FS/provider 调用真正结束,才能 Close 资源并返回。进程终止由 manager 或 SDK 宿主负责,不能把此预算当作 Run 的硬性返回时限。
+
+普通 bind 退出会释放入口,下一实例在旧实例退出后重新初始化并 bind。排空不迁移业务连接、不改变 FS 最终一致或可撤销对象参与去重的约束;回滚不涉及格式变化。低层客户端仍为 single attempt,运输层错误不会变成成功或 miss。
+
 验证：
 
 ```bash
@@ -422,7 +430,9 @@ Restart=on-failure
 KillSignal=SIGTERM
 ```
 
-也可直接用 Go 构造 `storeapp.Config`。动态 generation/credential provider 只通过 Go API 定义的五个 `Options` 字段绑定，不写回 YAML。需要 reload 的定制调用方自行拥有 reload 触发和 provider callback；官方 `store-ctl` 只是把 SIGHUP 适配为这些输入。
+也可直接用 Go 构造 `storeapp.Config`。动态 generation/credential provider 通过 Go API 的 `Options` 显式绑定，不写回 YAML。需要 reload 的定制调用方自行拥有 reload 触发和 provider callback；官方 `store-ctl` 只是把 SIGHUP 适配为这些输入。
+
+`Options` 新增零值兼容的 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 保留上例的旧 SDK 取消用法;关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 §8。
 
 可复用入口的验收应独立编译定制 module，并在服务 `PATH` 中没有官方二进制时执行真实 Store 协议请求。
 

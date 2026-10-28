@@ -32,6 +32,11 @@ type GenerationSource struct {
 
 // Options contains the process-local inputs to the Store application.
 type Options struct {
+	// Closing Drain starts irreversible soft shutdown; nil preserves ctx-only use.
+	Drain <-chan struct{}
+	// DrainTimeout bounds graceful waiting, never the lifetime of resource users.
+	// Zero is unlimited; negative values are rejected before acquiring resources.
+	DrainTimeout          time.Duration
 	Logger                *slog.Logger
 	Reload                <-chan struct{}
 	Generations           *GenerationSource
@@ -42,6 +47,9 @@ type Options struct {
 // prepareConfig makes and normalizes the configuration that Run will own. It
 // validates only selected inputs and performs no external I/O or callbacks.
 func prepareConfig(cfg Config, opts Options) (Config, error) {
+	if opts.DrainTimeout < 0 {
+		return Config{}, errors.New("drain timeout must not be negative")
+	}
 	effective := cfg.Clone()
 	overridden := opts.Generations != nil
 	if overridden {
@@ -126,6 +134,9 @@ func (g *generationInput) refresh(ctx context.Context) error {
 	// snapshot cannot be changed through caller-owned backing storage.
 	next = append([]pkgstore.Generation(nil), next...)
 	if err := pkgstore.ValidateGenerations(next); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	g.snapshot.Store(next)

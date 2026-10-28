@@ -26,9 +26,12 @@ func TestServeStoreTerminationIsIndependentOfSaturatedReload(t *testing.T) {
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- serveStore(Config{}, "", term, hup, &bytes.Buffer{}, func(ctx context.Context, _ appstore.Config, opts appstore.Options) error {
+		done <- serveStore(Config{}, "", term, hup, &bytes.Buffer{}, 0, func(ctx context.Context, _ appstore.Config, opts appstore.Options) error {
 			close(started)
-			<-ctx.Done()
+			<-opts.Drain
+			if ctx.Err() != nil {
+				return errors.New("first signal cancelled Run context")
+			}
 			return nil
 		})
 	}()
@@ -50,7 +53,7 @@ func TestServeStoreTerminationIsIndependentOfSaturatedReload(t *testing.T) {
 func TestServeStoreEarlyRunExitJoinsForwarder(t *testing.T) {
 	term, hup := make(chan os.Signal), make(chan os.Signal)
 	want := errors.New("run failed")
-	if err := serveStore(Config{}, "", term, hup, &bytes.Buffer{}, func(context.Context, appstore.Config, appstore.Options) error { return want }); !errors.Is(err, want) {
+	if err := serveStore(Config{}, "", term, hup, &bytes.Buffer{}, 0, func(context.Context, appstore.Config, appstore.Options) error { return want }); !errors.Is(err, want) {
 		t.Fatalf("serveStore error = %v", err)
 	}
 }
@@ -94,7 +97,7 @@ func TestServeStoreInlineAdapterInitialReloadAndRetention(t *testing.T) {
 	failures := make(reloadFailureWriter, 8)
 	go func() {
 		defer close(stopped)
-		done <- serveStore(*cfg, path, term, hup, &bytes.Buffer{}, func(ctx context.Context, cfg appstore.Config, opts appstore.Options) error {
+		done <- serveStore(*cfg, path, term, hup, &bytes.Buffer{}, 0, func(ctx context.Context, cfg appstore.Config, opts appstore.Options) error {
 			if opts.Generations == nil || opts.Generations.RefreshInterval != 0 {
 				return errors.New("inline YAML adapter missing or unexpectedly periodic")
 			}
@@ -176,7 +179,7 @@ func TestServeStoreLeavesFileAndS3SourcesToApp(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := Config{Generations: generations}
-			err := serveStore(cfg, "ignored", make(chan os.Signal), make(chan os.Signal), &bytes.Buffer{}, func(_ context.Context, _ appstore.Config, opts appstore.Options) error {
+			err := serveStore(cfg, "ignored", make(chan os.Signal), make(chan os.Signal), &bytes.Buffer{}, 0, func(_ context.Context, _ appstore.Config, opts appstore.Options) error {
 				if opts.Generations != nil {
 					t.Fatal("CLI replaced built-in App source")
 				}
@@ -186,5 +189,38 @@ func TestServeStoreLeavesFileAndS3SourcesToApp(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestServeStoreSecondSignalCancelsAndIgnoresLaterSignals(t *testing.T) {
+	term, hup := make(chan os.Signal, 8), make(chan os.Signal, 8)
+	first, second, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- serveStore(Config{}, "", term, hup, &bytes.Buffer{}, time.Second, func(ctx context.Context, _ appstore.Config, opts appstore.Options) error {
+			if opts.DrainTimeout != time.Second {
+				return errors.New("lost CLI drain timeout")
+			}
+			<-opts.Drain
+			if ctx.Err() != nil {
+				return errors.New("first signal cancelled work")
+			}
+			close(first)
+			<-ctx.Done()
+			close(second)
+			<-release
+			return nil
+		})
+	}()
+	term <- syscall.SIGTERM
+	<-first
+	hup <- syscall.SIGHUP
+	term <- syscall.SIGINT
+	<-second
+	term <- syscall.SIGTERM
+	term <- syscall.SIGINT
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

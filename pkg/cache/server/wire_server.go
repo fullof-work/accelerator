@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -23,8 +25,7 @@ type WireServer struct {
 	tr          *optrace.Tracer
 
 	connsMu sync.Mutex
-	conns   map[net.Conn]struct{}
-	readers map[net.Conn]context.CancelFunc
+	conns   map[net.Conn]context.CancelFunc
 }
 
 // NewWireServer creates a wire-protocol server.
@@ -45,8 +46,7 @@ func NewWireServer(handler *CacheHandler, idleTimeout, rpcTimeout time.Duration)
 		idleTimeout: idleTimeout,
 		rpcTimeout:  rpcTimeout,
 		tr:          optrace.FromEnv("cache-ctl"),
-		conns:       make(map[net.Conn]struct{}),
-		readers:     make(map[net.Conn]context.CancelFunc),
+		conns:       make(map[net.Conn]context.CancelFunc),
 	}
 }
 
@@ -106,18 +106,10 @@ func (s *WireServer) startConn(c net.Conn) bool {
 	if s.closing.Load() {
 		return false
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.conns[c] = cancel
 	s.wg.Add(1)
-	go s.serveConn(c)
-	return true
-}
-
-func (s *WireServer) trackConn(c net.Conn) bool {
-	s.connsMu.Lock()
-	defer s.connsMu.Unlock()
-	if s.closing.Load() {
-		return false
-	}
-	s.conns[c] = struct{}{}
+	go s.serveConn(ctx, cancel, c)
 	return true
 }
 
@@ -138,201 +130,222 @@ func (s *WireServer) ConnCount() int {
 // Handler exposes the wire handler so the stats printer can read its counters.
 func (s *WireServer) Handler() *CacheHandler { return s.handler }
 
-func (s *WireServer) serveConn(c net.Conn) {
+func (s *WireServer) serveConn(connCtx context.Context, cancelConn context.CancelFunc, c net.Conn) {
 	defer s.wg.Done()
-	if !s.trackConn(c) {
-		c.Close()
-		return
-	}
-	defer func() {
-		s.untrackConn(c)
-		c.Close()
-	}()
-
-	// TCP tuning.
+	defer s.untrackConn(c)
+	defer c.Close()
+	defer cancelConn()
 	if tc, ok := c.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
 	}
-
 	wc := wire.NewConn(c)
-
-	// Reader goroutine: owns bufio.Reader exclusively. Reads frames
-	// into reqs channel. Idle timeout implemented via SetReadDeadline.
 	reqs := make(chan *wire.Request, 2)
-	readerCtx, cancelReader := context.WithCancel(context.Background())
-	s.connsMu.Lock()
-	s.readers[c] = cancelReader
-	if s.closing.Load() {
-		cancelReader()
-	}
-	s.connsMu.Unlock()
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
 		defer close(reqs)
 		for {
-			if s.idleTimeout > 0 {
-				wc.SetReadDeadline(time.Now().Add(s.idleTimeout))
-			}
-			req, err := wc.ReadRequest()
-			if err != nil {
+			// Serialize deadline installation with drain: the reader must never
+			// overwrite the deadline that interrupts a locally stopped read.
+			s.connsMu.Lock()
+			if s.closing.Load() || connCtx.Err() != nil {
+				s.connsMu.Unlock()
 				return
 			}
+			if s.idleTimeout > 0 {
+				_ = wc.SetReadDeadline(time.Now().Add(s.idleTimeout))
+			}
+			s.connsMu.Unlock()
+			req, err := wc.ReadRequest()
+			if err != nil {
+				// EOF may be a peer's write-half close. Its complete requests still
+				// deserve responses. Local drain only stops input, never the handler.
+				if !s.closing.Load() && !errors.Is(err, io.EOF) {
+					cancelConn()
+					_ = c.Close()
+				}
+				return
+			}
+			s.connsMu.Lock()
+			admitted := !s.closing.Load() && connCtx.Err() == nil
+			s.connsMu.Unlock()
+			if !admitted {
+				req.Release()
+				return
+			}
+			// Admission above is the linearization point. Even if drain now starts,
+			// this request belongs to the accepted set, including a blocked send.
 			select {
 			case reqs <- req:
-			case <-readerCtx.Done():
+			case <-connCtx.Done():
 				req.Release()
 				return
 			}
 		}
 	}()
-
-	var pendingReqs []*wire.Request
+	var pending []*wire.Request
+	drained := false
 	defer func() {
-		cancelReader()
+		if drained && connCtx.Err() == nil {
+			_ = finishResponseDelivery(connCtx, c)
+		}
+		cancelConn()
 		_ = c.Close()
 		<-readerDone
-		s.connsMu.Lock()
-		delete(s.readers, c)
-		s.connsMu.Unlock()
 		for req := range reqs {
 			req.Release()
 		}
-		for _, req := range pendingReqs {
+		for _, req := range pending {
 			req.Release()
 		}
 	}()
-
+	// Every response, including Ping/cancellation, checks transport errors.
+	// Its Blob and the request buffer remain live until the write returns.
+	write := func(resp *wire.Response) error {
+		if resp.Value != nil {
+			defer resp.Value.Release()
+		}
+		return wc.WriteResponse(resp)
+	}
 	for {
+		if connCtx.Err() != nil {
+			return
+		}
 		var req *wire.Request
-		if len(pendingReqs) > 0 {
-			req = pendingReqs[0]
-			pendingReqs = pendingReqs[1:]
+		if len(pending) > 0 {
+			req, pending = pending[0], pending[1:]
 		} else {
 			var ok bool
 			req, ok = <-reqs
 			if !ok {
+				drained = true
 				return
 			}
-		}
-
-		if req.Opcode == wire.OpcodePing {
-			wc.WriteResponse(&wire.Response{Status: wire.StatusHit})
-			req.Release()
-			continue
 		}
 		if req.Opcode == wire.OpcodeCancelRequest {
 			req.Release()
 			continue
 		}
-
-		ctx := context.Background()
-		var cancelHandler context.CancelFunc
-		if s.rpcTimeout > 0 {
-			ctx, cancelHandler = context.WithTimeout(ctx, s.rpcTimeout)
-		} else {
-			ctx, cancelHandler = context.WithCancel(ctx)
+		if req.Opcode == wire.OpcodePing {
+			err := write(&wire.Response{Status: wire.StatusHit})
+			req.Release()
+			if err != nil {
+				return
+			}
+			continue
 		}
-
+		var ctx context.Context
+		var cancel context.CancelFunc
+		if s.rpcTimeout > 0 {
+			ctx, cancel = context.WithTimeout(connCtx, s.rpcTimeout)
+		} else {
+			ctx, cancel = context.WithCancel(connCtx)
+		}
 		resps := make(chan *wire.Response, 1)
 		go func() {
 			end := s.tr.Begin("cache.req")
-			r := s.handler.HandleFrame(ctx, req)
+			resp := s.handler.HandleFrame(ctx, req)
 			end()
-			resps <- r
+			resps <- resp
 		}()
-
-		var cancelled bool
+		// A closed input channel is not cancellation. Disable it and continue
+		// waiting for the admitted handler, then finish pending and queued work.
+		incoming := reqs
+		cancelled := false
+		failed := false
 	inner:
 		for {
 			select {
-			case nextReq, ok := <-reqs:
+			case next, ok := <-incoming:
 				if !ok {
-					cancelHandler()
-					resp := <-resps
+					incoming = nil
+					continue
+				}
+				switch next.Opcode {
+				case wire.OpcodeCancelRequest:
+					next.Release()
+					cancel()
+					cancelled = true
+				case wire.OpcodePing:
+					err := write(&wire.Response{Status: wire.StatusHit})
+					next.Release()
+					if err != nil {
+						cancel()
+						cancelConn()
+						failed = true
+					}
+				default:
+					pending = append(pending, next)
+				}
+			case resp := <-resps:
+				cancel()
+				if connCtx.Err() != nil || failed {
 					if resp.Value != nil {
 						resp.Value.Release()
 					}
 					req.Release()
 					return
 				}
-				if nextReq.Opcode == wire.OpcodeCancelRequest {
-					nextReq.Release()
-					cancelHandler()
-					cancelled = true
-				} else if nextReq.Opcode == wire.OpcodePing {
-					wc.WriteResponse(&wire.Response{Status: wire.StatusHit})
-					nextReq.Release()
-				} else {
-					pendingReqs = append(pendingReqs, nextReq)
-				}
-
-			case resp := <-resps:
-				cancelHandler()
 				if cancelled {
 					if resp.Value != nil {
 						resp.Value.Release()
 					}
-					wc.WriteResponse(&wire.Response{Status: wire.StatusCancelled})
-					for _, pr := range pendingReqs {
-						wc.WriteResponse(&wire.Response{Status: wire.StatusCancelled})
+					resp = &wire.Response{Status: wire.StatusCancelled}
+				}
+				err := write(resp)
+				req.Release()
+				if err != nil {
+					return
+				}
+				if cancelled {
+					for len(pending) > 0 {
+						pr := pending[0]
+						pending = pending[1:]
+						err = write(&wire.Response{Status: wire.StatusCancelled})
 						pr.Release()
-					}
-					pendingReqs = pendingReqs[:0]
-				} else {
-					writeErr := wc.WriteResponse(resp)
-					if resp.Value != nil {
-						resp.Value.Release()
-					}
-					if writeErr != nil {
-						req.Release()
-						return
+						if err != nil {
+							return
+						}
 					}
 				}
-				req.Release()
 				break inner
 			}
 		}
 	}
 }
 
-// GracefulStop stops accepting connections, closes all tracked connections,
-// and waits at most five seconds for connection goroutines to exit. Active
-// handlers can be cancelled and their responses lost; this is not a guarantee
-// that in-flight requests drain successfully.
-func (s *WireServer) GracefulStop() {
+// Drain atomically stops connection and request admission. It interrupts input
+// reads without cancelling accepted handlers or closing their write halves.
+// Wait joins all handlers, response writes and readers. Stop can escalate it.
+func (s *WireServer) Drain() { s.stop(false) }
+
+func (s *WireServer) stop(force bool) {
 	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
 	s.closing.Store(true)
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
-	// Closing also interrupts active connection readers. serveConn cancels
-	// their handler, waits for cleanup, and can return without a response.
-	for _, cancel := range s.readers {
-		cancel()
-	}
-	for c := range s.conns {
-		_ = c.Close()
-	}
-	s.connsMu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+	for c, cancel := range s.conns {
+		if force {
+			cancel()
+			_ = c.Close()
+		} else {
+			_ = c.SetReadDeadline(time.Now())
+		}
 	}
 }
 
-// Wait blocks until every accepted connection goroutine has exited. Callers
-// that must keep handler dependencies alive beyond GracefulStop's legacy
-// five-second bound should call Wait after GracefulStop returns. Wait does not
-// force an uncancellable handler to finish.
-func (s *WireServer) Wait() {
-	s.wg.Wait()
-}
+// GracefulStop drains every admitted request through its complete response.
+// There is no internal grace deadline; callers may concurrently escalate Stop.
+func (s *WireServer) GracefulStop() { s.Drain(); s.Wait() }
+
+// Stop cancels work and closes transports, then waits for actual resource users.
+// An uncancellable backend may delay return; its dependencies must remain live.
+func (s *WireServer) Stop() { s.stop(true); s.Wait() }
+
+// Wait joins accepted connection goroutines. Call Drain or Stop first to fence
+// new WaitGroup additions. It includes readers, handlers and response writers.
+func (s *WireServer) Wait() { s.wg.Wait() }

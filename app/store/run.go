@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/internal/appshutdown"
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
@@ -22,10 +23,15 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store/s3/sdkclient"
 	storeserver "github.com/kuasar-sandbox/accelerator/pkg/store/server"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Run owns a complete Store serving lifecycle.
-func Run(ctx context.Context, cfg Config, opts Options) error {
+func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
+	if opts.DrainTimeout < 0 {
+		return errors.New("store: drain timeout must not be negative")
+	}
 	if ctx == nil {
 		return errors.New("store: nil context")
 	}
@@ -38,6 +44,12 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 	cfg, err := prepareConfig(cfg, opts)
 	if err != nil {
 		return err
+	}
+	life := appshutdown.New(ctx, opts.Drain, opts.DrainTimeout)
+	defer func() { retErr = errors.Join(retErr, life.Err()); life.Close() }()
+	ctx = life.Context
+	if !life.Active(nil) {
+		return nil
 	}
 	log := opts.Logger
 	if log == nil {
@@ -54,15 +66,17 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 	if err != nil {
 		return startupError(ctx, errors.Join(fmt.Errorf("store: initial generations: %w", err), closeSource()))
 	}
-	if err = ctx.Err(); err != nil {
+	if !life.Active(nil) {
+		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeSource()))
 	}
 	backend, closeBackend, err := openBackend(ctx, cfg, opts.ObjectCredentials)
 	if err != nil {
 		return startupError(ctx, errors.Join(err, closeSource()))
 	}
-	closeOwned := func() error { return errors.Join(closeBackend(), closeSource()) }
-	if err = ctx.Err(); err != nil {
+	closeOwned := func() error { life.Close(); return errors.Join(closeBackend(), closeSource()) }
+	if !life.Active(nil) {
+		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
 	srv, err := storeserver.New(storeserver.Options{Backend: backend, Generations: input.view, VerifyKey: cfg.VerifyKey()})
@@ -87,10 +101,25 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 		}
 		return errors.Join(gl.Close(), werr)
 	}
-	if err = ctx.Err(); err != nil {
+	if !life.Active(nil) {
+		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeListeners(), closeOwned()))
 	}
-	gs := grpc.NewServer(grpc.WaitForHandlers(true))
+	// Admission includes the entire stream handler, including every Get Send
+	// and Put Commit/SendAndClose. GracefulStop then joins their transports.
+	gs := grpc.NewServer(grpc.WaitForHandlers(true),
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+			if !life.Active(nil) {
+				return nil, status.Error(codes.Unavailable, "server is stopping")
+			}
+			return next(ctx, req)
+		}),
+		grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+			if !life.Active(nil) {
+				return status.Error(codes.Unavailable, "server is stopping")
+			}
+			return next(srv, stream)
+		}))
 	pb.RegisterStoreServer(gs, srv)
 	var ws *cacheserver.WireServer
 	if wl != nil {
@@ -99,48 +128,79 @@ func Run(ctx context.Context, cfg Config, opts Options) error {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	var observers sync.WaitGroup
-	observers.Add(2)
-	go func() { defer observers.Done(); input.run(runCtx, opts.Reload, log) }()
-	go func() {
-		defer observers.Done()
-		obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), sampler(srv), func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) })
-	}()
 	type result struct {
 		name string
 		err  error
 	}
 	results := make(chan result, 2)
 	n := 1
-	go func() { results <- result{"grpc", gs.Serve(gl)} }()
 	if ws != nil {
 		n++
-		go func() { results <- result{"cache", ws.Serve(wl)} }()
 	}
-	snap := input.current()
-	log.Info("store started", "listen", cfg.Listen, "backend", cfg.Backend, "generation", snap[len(snap)-1], "verify", cfg.VerifyKey(), "direct_io", cfg.Backend == "fs" && cfg.FS.DirectIO)
+	if !life.Active(func() {
+		observers.Add(2)
+		go func() { defer observers.Done(); input.run(runCtx, opts.Reload, log) }()
+		go func() {
+			defer observers.Done()
+			obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), sampler(srv), func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) })
+		}()
+		go func() { results <- result{"grpc", gs.Serve(gl)} }()
+		if ws != nil {
+			go func() { results <- result{"cache", ws.Serve(wl)} }()
+		}
+		snap := input.current()
+		log.Info("store started", "listen", cfg.Listen, "backend", cfg.Backend, "generation", snap[len(snap)-1], "verify", cfg.VerifyKey(), "direct_io", cfg.Backend == "fs" && cfg.FS.DirectIO)
+	}) {
+		cancel()
+		return startupError(ctx, errors.Join(ctx.Err(), closeListeners(), closeOwned()))
+	}
 	var out error
 	done := 0
+	force := false
 	select {
-	case <-ctx.Done():
-		if ctx.Err() != context.Canceled {
-			out = ctx.Err()
-		}
+	case <-life.Stopping():
+		force = ctx.Err() != nil
 	case r := <-results:
 		done++
 		out = serveError(r.name, r.err)
+		life.Cancel()
+		force = true
 	}
+	// Stop reload/stat producers immediately; their current calls remain joined
+	// below. Foreground work retains its contexts during graceful shutdown.
 	cancel()
+	if ws != nil {
+		ws.Drain()
+	}
+	frontDone := make(chan struct{})
 	var stops sync.WaitGroup
 	stops.Add(1)
-	go func() { defer stops.Done(); gs.Stop() }()
+	go func() { defer stops.Done(); gs.GracefulStop() }()
 	if ws != nil {
 		stops.Add(1)
-		go func() { defer stops.Done(); ws.GracefulStop() }()
+		go func() { defer stops.Done(); ws.Wait() }()
 	}
-	stops.Wait()
-	if ws != nil {
-		ws.Wait()
+	go func() { stops.Wait(); close(frontDone) }()
+	var forced sync.WaitGroup
+	forceStop := func() {
+		forced.Add(1)
+		go func() { defer forced.Done(); gs.Stop() }()
+		if ws != nil {
+			forced.Add(1)
+			go func() { defer forced.Done(); ws.Stop() }()
+		}
 	}
+	if force {
+		forceStop()
+	} else {
+		select {
+		case <-frontDone:
+		case <-ctx.Done():
+			forceStop()
+		}
+	}
+	<-frontDone
+	forced.Wait()
 	for done < n {
 		r := <-results
 		done++

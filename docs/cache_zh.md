@@ -39,7 +39,7 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 ### 2.1 `cache-ctl serve`
 
 ```
-cache-ctl serve --config FILE
+cache-ctl serve --config FILE [--drain-timeout DURATION]
 ```
 
 `--config` 与 `CACHE_CONFIG` 必有其一(flag 优先);两者皆缺则报错。
@@ -666,17 +666,16 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 ### 6.2 信号处理
 
-SIGINT/SIGTERM 顺序:
+第一次 SIGTERM/SIGINT 发起不可逆 drain,不取消已接纳业务的 context;第二次退出信号取消在途工作,后续信号幂等。SIGHUP 在服务运行时仍按 §4.9 刷新 EC membership,进入退出阶段后不再触发刷新。
 
-1. 停止 health monitor;若启用,设 gRPC health 为 NOT_SERVING,让编排停止新流量。
-2. 停止接收 wire 连接，关闭所有已登记连接，包括 active connection。Wire `GracefulStop` 最多等待 connection goroutine 5 秒；关闭连接可能取消 handler 并丢弃其响应，不保证在途请求成功排空。
-3. graceful stop 共用的 gRPC Health/Info server。
-4. tiered 通过 TieredCache.Close 取消/join async fills,随后按注册清理关闭 origin 和
-   tier 资源。tiers 按 **YAML 构造的逆序**关闭,不是固定 embedded→Redis→EC→upstream
-   类型顺序。local/shard 关闭所选 backend。
+1. 原子关闭 wire admission,撤销既有 health readiness。已开始的 Redis health probe 即使迟到成功,也不能把 NOT_SERVING 改回 SERVING。
+2. 排空执行中请求、reader 已接纳的请求、reqs 队列和 pending 请求。停止 reader 与 peer 断线分开处理;TCP/UDS half-close 保留响应。Blob 和请求缓冲区在完整写出或明确写失败后才释放。Linux TCP 在最终 close 前等待已发送尾部得到 ACK,避免未读输入导致 RST 截断。
+3. 前台不能再生成 fill/repair 后,取消并 join 后台任务、EC detached cleanup、membership callback、Info/stats 和 health monitor。无限期的管理 Watch 会被取消,正在执行的 handler 仍须结束。
+4. 最后关闭 App 拥有的依赖。Tier 资源保持按 YAML 构造的逆序关闭;local/shard 关闭所选 backend。借入的 logger 和 callback 保持由宿主拥有。
 
-关闭过程中，客户端可能看到 cancellation、EOF 或其他 connection error。应按 caller policy 向健康 endpoint 重试允许重试的操作；没有收到响应不证明写入从未生效。Wire wait 的 5 秒不等于整个进程关闭最多 5 秒，其他清理/backend 调用可能更久。
-SIGHUP 仅按 §4.9 更新 EC membership。
+`cache-ctl serve --config FILE --drain-timeout 30s` 为所有入口设置同一份优雅预算,从首次 drain 起算。默认 `0` 不增加内部总上限;负数在创建资源前拒绝。该选项没有对应 YAML/env 字段。预算耗尽会取消工作并关闭运输层,但仍等待不可取消的 RocksDB/FS/provider 调用返回,然后才 Close 资源。它不是进程寿命上限;最终终止由 manager/SDK 宿主决定。
+
+新业务会被拒绝,取消或故障可以产生真实运输层错误。服务端已提交但响应丢失仍是不确定结果,不能报告客户端成功。低层 Get/GetShard 仍为 single attempt。普通 bind 的监听在退出时释放,下一实例在旧实例退出后重新打开数据库并 bind;排空不保留监听或迁移连接。回滚不改变数据格式。
 
 ### 6.3 运行时计数(pull-only)
 
@@ -928,7 +927,7 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
 
 ## 8. 可复用的 Cache App 入口
 
-`app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 仅包含 `Logger`、`Reload` 和 `LoadMembership`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
+`app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 包含 `Logger`、`Reload`、`LoadMembership`、`Drain` 和 `DrainTimeout`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
 
 最小定制程序：
 
@@ -967,7 +966,9 @@ KillSignal=SIGTERM
 
 EC membership 刷新时，调用方同时提供 `Reload` 与 `LoadMembership`。callback 只返回启动配置中已有 EC tier 的候选 peers。`Run` 先校验整批候选，再逐层 probe/apply；某层失败时保留该层旧 membership，不热替换拓扑或其他配置。关闭的 reload channel 会被禁用而不是持续轮询。
 
-App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。退出时先停止 admission 并取消受管工作，等待 handler/fill/repair/EC detached cleanup 与 observer 真正结束，再关闭拥有的依赖。定制调用方拥有自己的信号与借入输入。
+App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。所有实际使用者结束后才关闭依赖并返回;退出顺序见 §6.2。定制调用方拥有信号与借入输入。
+
+`Options.Drain <-chan struct{}` 默认为 nil,保留上例的 ctx 取消行为。关闭显式传入的 Drain 发起软停;`Run(ctx)` 的 ctx 取消始终取消在途工作,不会偷偷改成等待排空,且与 drain 同时发生时优先。`Options.DrainTimeout time.Duration` 使用 §6.2 的共享预算。初始化期间收到 drain 后不再发布 started/SERVING。若宿主希望区分软停和取消,可传入 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,自行将第一次退出请求适配为 `close(drain)`,将后续请求适配为 ctx 的 cancel;App 不接管宿主 signals、args 或进程退出。
 
 ## 8. See Also
 
