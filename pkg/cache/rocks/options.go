@@ -8,19 +8,25 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
 
+// diskBytes is shared by block-cache sizing and successful-fill aging.
+func diskBytes(cfg runtime.RocksConfig) uint64 {
+	n, _ := util.ParseSize(cfg.DiskBytes)
+	if n == 0 {
+		return 1 << 40 // 1 TiB default
+	}
+	return n
+}
+
 // buildConfig resolves only the settings used by this store. Native construction
 // preserves their historical scope, including default-only write buffer sizes.
 func buildConfig(cfg runtime.RocksConfig) native.Config {
-	// BlockCache size = disk_bytes * mem_ratio
-	diskBytes, _ := util.ParseSize(cfg.DiskBytes)
-	if diskBytes == 0 {
-		diskBytes = 1 << 40 // 1 TiB default
-	}
+	// BlockCache size = disk_bytes * mem_ratio.
+	budget := diskBytes(cfg)
 	memRatio := cfg.MemRatio
 	if memRatio <= 0 {
 		memRatio = 0.01
 	}
-	blockCacheBytes := uint64(float64(diskBytes) * memRatio)
+	blockCacheBytes := uint64(float64(budget) * memRatio)
 	if blockCacheBytes < 64<<20 {
 		blockCacheBytes = 64 << 20 // min 64 MiB
 	}
@@ -36,7 +42,7 @@ func buildConfig(cfg runtime.RocksConfig) native.Config {
 	if bloomBits <= 0 {
 		bloomBits = 15
 	}
-	// Write buffer — default 256 MiB to reduce flush frequency under concurrent writes.
+	// The legacy write-buffer setting applies only to the default metadata CF.
 	writeBufferBytes, _ := util.ParseSize(cfg.WriteBufferBytes)
 	if writeBufferBytes == 0 {
 		writeBufferBytes = 256 << 20 // 256 MiB default (was 64 MiB Go/RocksDB default)

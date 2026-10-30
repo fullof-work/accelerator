@@ -103,7 +103,7 @@ rpc_timeout: ""               # Empty/invalid/nonpositive: no request context de
                              # A positive Go duration sets the context budget, not a CGO interrupt
 
 freq:
-  counters: 8M                # 4-bit CMS counters; about 4 MiB per active generation
+  counters: 8M                # Number of 4-bit counters per CMS row
   reset_after: 1M             # Count-triggered rolling decay
   reset_interval: 1h          # Time-triggered decay for low traffic
   evict_threshold: 1          # Evict estimates at or below this threshold
@@ -111,7 +111,7 @@ freq:
 
 rocks:
   path: /var/cache/accel-l1
-  disk_bytes: 1TiB            # Sizing input for BlockCache; not an enforced disk quota
+  disk_bytes: 1TiB            # BlockCache sizing and write-turnover aging; not a disk quota
   mem_ratio: 0.01             # 1 TiB × 1% = 10.24 GiB
   direct_reads: true
   bloom_bits: 15
@@ -328,13 +328,13 @@ Placing shard identity in the value makes a surviving peer's existing shard disc
 
 | Parameter/option | Default | Meaning |
 |---|---|---|
-| `disk_bytes` | 1 TiB. | Sizing input, **not an enforced disk quota**. |
+| `disk_bytes` | 1 TiB. | BlockCache sizing and successful-write byte budget per sketch generation (§4.5); **not an enforced disk quota**. |
 | `mem_ratio` | 0.01. | Shared BlockCache budget = disk_bytes × mem_ratio, minimum 64 MiB. |
 | `block_size` | 64 KiB. | SST data-block size. |
 | `bloom_bits` | 15. | Bits per key for Bloom filters; actual false-positive behavior is not a fixed documented percentage. |
 | Compression | None. | Fixed RocksDB option; encrypted chunk values are already high-entropy. |
 | `direct_reads` | true. | Enables UseDirectReads for supported reads. |
-| `write_buffer_bytes` | 256 MiB. | Configured write-buffer sizing input. |
+| `write_buffer_bytes` | 256 MiB. | Write-buffer size for default CF only, with four buffers. The three data CFs retain the engine defaults. |
 | `max_background_jobs` | 8. | Used for maximum background compactions; the implementation separately allows two background flushes. |
 | Compaction | Leveled/default RocksDB behavior. | Data organization follows the underlying configured options. |
 | Pin L0 filters/indexes | true. | CacheIndexAndFilterBlocks plus PinL0FilterAndIndexBlocksInCache; this does not pin every level's metadata forever. |
@@ -361,6 +361,12 @@ All three CFs enable RocksDB BlobDB with fixed options, not YAML knobs:
 
 Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. Actual amplification depends on key sizes, RocksDB format, workload, compaction and blob GC. Fetching a blob value can require additional I/O beyond locating its SST reference.
 
+#### Write durability and shutdown
+
+The chunk, manifest and blob CFs store rebuildable cache values and always write with WAL disabled. The default CF, including `__freq_sketch__`, retains WAL. These are fixed internal choices, not YAML options. Object and shard fills have the same durability policy; disabling frequency eviction does not change it.
+
+Normal Close drains requests, joins sketch workers and persists the final sketch. The native wrapper then waits for a Flush of each data CF before closing the DB. Flush failures are returned even though native resources are still released; concurrent Close callers receive the same final result. Read-only Close does not flush. An abnormal process exit can lose unflushed data-CF writes, which become ordinary cache misses and can be fetched again. WAL/sync settings for default CF are unchanged; neither a successful Fill nor an unflushed sketch checkpoint promises synchronous persistence through power loss.
+
 #### DirectReads
 
 UseDirectReads defaults to true and bypasses the OS page cache for supported data reads.
@@ -372,16 +378,24 @@ It does not mean the process has zero page-cache use, completely self-contained 
 
 ### 4.5 Frequency tracking and disk eviction
 
-Embedded RocksDB maintains a Go Count-Min Sketch. Get/Put touches the key; background compaction invokes the CGO-backed CompactionFilter, which asks ShouldEvict. An estimate **at or below** the threshold (default 1) removes the key.
+Embedded RocksDB maintains a Go Count-Min Sketch. Each Get, including a miss, records an access; a successful Fill or FillShard records another. Background compaction invokes the CGO-backed CompactionFilter, which asks ShouldEvict. An estimate **at or below** the threshold (default 1) removes the key.
 
-This is not capacity enforcement. disk_bytes does not make compaction evict enough to avoid a full disk. Monitor disk use, write failures and compaction behavior independently.
+The same `rocks.disk_bytes` input that sizes BlockCache also supplies a soft aging budget. Successful writes across chunk, manifest and blob CFs accumulate their complete value lengths in the current sketch generation. Shard prefixes and repeated writes of the same key count again; failed writes, reads and default-CF sketch persistence do not add bytes. This measures write turnover, not live data size or physical disk usage.
+
+A generation rolls when its successful-write bytes reach `disk_bytes`, its access count reaches `freq.reset_after`, or an explicitly configured `freq.reset_interval` timer fires. Each rollover clears both count and byte progress. A single write can roll at most one generation, even if larger than the byte budget; progress is not carried across that rollover. Existing Get/Fill frequency accounting is preserved.
+
+Rollover changes eviction eligibility; it does not delete keys or start a compaction. Natural RocksDB compaction visits eligible keys, and blob GC may reclaim their physical storage later. This policy adds no idle scanning, disk-usage polling or forced compaction. It does not enforce a capacity bound: `disk_bytes` cannot guarantee enough reclamation to avoid a full disk. Monitor physical usage, write failures and compaction independently.
 
 ```text
-On Get/Put:
+On Get, including a miss:
     sketch.Touch(key)            # Four rows of packed 4-bit counters
 
-On reset_after touches or reset_interval:
+After a successful data-CF Fill/FillShard:
+    sketch.TouchBytes(key, len(value))
+
+On disk_bytes written, reset_after touches, or a configured reset_interval:
     old active becomes previous; create a fresh active generation
+    clear count and byte progress for the new generation
     Estimate(key) = active estimate + previous estimate / 2
 
 During background compaction on chunk, manifest and blob CFs:
@@ -397,13 +411,13 @@ The filter is attached before DB Open, while its sketch is absent and armed=fals
 
 #### Cold-start protection
 
-Without restored frequency history, old keys have zero estimates and may be removed by compaction. To reduce that problem, the active CMS generation is serialized to the reserved RocksDB key, normally every five minutes and on orderly close. Restart restores the active generation; the previous rolling generation is deliberately not persisted.
+Without restored frequency history, old keys have zero estimates and may be removed by compaction. The active CMS generation is serialized to the reserved default-CF key on orderly close and, when `freq.persist_interval` is explicitly configured, periodically. The existing version-2 format is unchanged: restart restores only the active generation. The previous generation and the access-count and byte progress are not persisted; both progress counters start at zero after reopening.
 
-This is not an unconditional grace period or durable history guarantee. A missing, corrupt or unreadable checkpoint can leave a fresh sketch, after which the filter is still armed. Persist failures are logged. `freq.disable_eviction` keeps the filter unarmed when the deployment intentionally requires no frequency-based eviction.
+This is not an unconditional grace period or durable history guarantee. A missing, malformed or incompatible checkpoint can leave a fresh sketch, after which the filter is armed. A storage error while reading the checkpoint fails Open with the filter still unarmed. Background persist failures are logged; final persistence and data-flush failures are returned by Close. `freq.disable_eviction` keeps the filter unarmed when the deployment intentionally requires no frequency-based eviction.
 
 #### CMS parameter profiles
 
-The following are the documented L1/L2 configuration profiles. L2 values must be configured; choosing shard mode does not itself select all of them.
+The following are explicit L1/L2 configuration profiles. Choosing shard mode does not itself select these values. If `freq` is omitted, the sketch uses 8M counters per row, a 1M access-count limit and threshold 1, together with the byte budget from `disk_bytes`; neither the reset timer nor periodic persistence is enabled. Normal Close still persists the sketch.
 
 | Parameter | L1 profile | L2 profile |
 |---|---|---|
@@ -813,7 +827,7 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
 - **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
 - **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
-- **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
+- **Aging/eviction:** embedded eviction uses frequency history aged by successful-write bytes, access counts and any explicitly configured reset timer (§4.5); `disk_bytes` is not a quota. Even when accesses remain below `reset_after`, successful writes can exhaust the byte budget. Record the value sizes, repeated fills, hot-hit rate and compaction behavior; a once-touched key can already be eligible for removal. Logical eviction and physical blob reclamation are separate observations.
 - **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
 

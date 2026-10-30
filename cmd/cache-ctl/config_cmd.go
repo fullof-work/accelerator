@@ -86,9 +86,7 @@ rpc_timeout: 5s
 # rocksdb/redis gauges); idle periods are silent. Default 30s; "0"/"off" disables.
 # stats_interval: 30s
 
-freq:
-  counters: 1M       # CMS counters for frequency-based compaction eviction
-  reset_after: 100K  # Roll active history into a half-weight previous generation
+# Embedded aging follows disk_bytes with the default frequency settings.
 
 tiers:
   - type: embedded   # rocksdb-backed local L1

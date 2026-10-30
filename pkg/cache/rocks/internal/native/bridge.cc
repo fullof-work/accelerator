@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 #include <rocksdb/cache.h>
 #include <rocksdb/compaction_filter.h>
@@ -14,6 +15,11 @@
 
 namespace {
 using namespace rocksdb;
+
+// These indices match the fixed CF descriptors below and native/db.go.
+constexpr int kChunkCF = 1;
+constexpr int kManifestCF = 2;
+constexpr int kBlobCF = 3;
 
 char* error(const Status& s) {
   return s.ok() ? nullptr : ::strdup(s.ToString().c_str());
@@ -46,6 +52,14 @@ struct cache_rocks {
   std::vector<rocksdb::ColumnFamilyHandle*> cfs;
   const rocksdb::ReadOptions read;
   const rocksdb::WriteOptions write;
+  rocksdb::WriteOptions data_write;
+  bool read_only = false;
+
+  cache_rocks() {
+    // Cache values can be refetched after a crash. Sketch metadata still uses
+    // the original WAL-backed options above.
+    data_write.disableWAL = true;
+  }
 
   ~cache_rocks() {
     for (auto* cf : cfs) delete cf;
@@ -61,6 +75,7 @@ extern "C" char* cache_rocks_open(const char* path, cache_rocks_config cfg,
                                   uintptr_t callback, int readonly, cache_rocks** out) {
   *out = nullptr;
   auto owner = std::make_unique<cache_rocks>();
+  owner->read_only = readonly != 0;
   if (callback) owner->filter = std::make_unique<SketchFilter>(callback);
 
   rocksdb::BlockBasedTableOptions table;
@@ -106,12 +121,27 @@ extern "C" char* cache_rocks_open(const char* path, cache_rocks_config cfg,
 
 extern "C" char* cache_rocks_close(cache_rocks* owner) {
   // All callers and pins have drained at the Go store's lifecycle gate.
+  // WAL-free writes need an explicit flush whose failure reaches the caller;
+  // relying on the DB destructor alone can silently lose unflushed values.
+  std::string first_error;
+  if (!owner->read_only) {
+    rocksdb::FlushOptions flush;
+    flush.wait = true;
+    for (int cf : {kChunkCF, kManifestCF, kBlobCF}) {
+      auto status = owner->db->Flush(flush, owner->cfs[cf]);
+      if (!status.ok() && first_error.empty()) {
+        first_error = "flush " + owner->cfs[cf]->GetName() + ": " + status.ToString();
+      }
+    }
+  }
+  // Even a failed flush must release the DB lock and every native resource.
   // Handles precede DB::Close; filter/callback survive both Close and delete.
   for (auto* cf : owner->cfs) delete cf;
   owner->cfs.clear();
   auto status = owner->db->Close();
+  if (!status.ok() && first_error.empty()) first_error = status.ToString();
   delete owner;
-  return error(status);
+  return first_error.empty() ? nullptr : ::strdup(first_error.c_str());
 }
 
 extern "C" cache_read cache_rocks_get(cache_rocks* owner, int cf, const char* key,
@@ -135,7 +165,9 @@ extern "C" void cache_rocks_unpin(cache_pin* pin) { delete pin; }
 
 extern "C" char* cache_rocks_put(cache_rocks* owner, int cf, const char* key,
                                  size_t key_size, const char* value, size_t value_size) {
-  return error(owner->db->Put(owner->write, owner->cfs[cf],
+  const auto& write = (cf == kChunkCF || cf == kManifestCF || cf == kBlobCF)
+      ? owner->data_write : owner->write;
+  return error(owner->db->Put(write, owner->cfs[cf],
       rocksdb::Slice(key, key_size), rocksdb::Slice(value, value_size)));
 }
 

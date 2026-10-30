@@ -36,19 +36,21 @@ type Config struct {
 	Origin      *OriginConfig `yaml:"origin"` // tiered mode only
 }
 
-// FreqConfig holds CMS frequency sketch parameters.
+// FreqConfig holds CMS frequency sketch parameters. Embedded RocksDB also
+// ages generations when successful value bytes reach RocksConfig.DiskBytes.
 type FreqConfig struct {
-	Counters        string `yaml:"counters"`       // e.g. "8M"
-	ResetAfter      string `yaml:"reset_after"`    // e.g. "1M"
-	ResetInterval   string `yaml:"reset_interval"` // e.g. "1h"
+	Counters        string `yaml:"counters"`       // counters per CMS row; default "8M"
+	ResetAfter      string `yaml:"reset_after"`    // access count per generation; default "1M"
+	ResetInterval   string `yaml:"reset_interval"` // optional timer, e.g. "1h"; unset disables it
 	EvictThreshold  int    `yaml:"evict_threshold"`
-	PersistInterval string `yaml:"persist_interval"` // e.g. "5m"
+	PersistInterval string `yaml:"persist_interval"` // optional timer, e.g. "5m"; Close always persists
 	// DisableEviction turns off the frequency-based compaction filter
 	// entirely. The sketch is still maintained for stats, but the
 	// filter is never armed — no keys are evicted regardless of their
 	// access count. Used when a cache-ctl local daemon plays the
 	// "origin" role for a downstream tiered instance (bench scenarios),
-	// where writes land once and must stay put.
+	// where cold writes should survive frequency compaction. It does not
+	// change the data-CF WAL policy or preserve unflushed values on a crash.
 	DisableEviction bool `yaml:"disable_eviction"`
 }
 
@@ -58,14 +60,17 @@ type FreqConfig struct {
 // parameters (min_blob_size=4 KiB, blob_file_size=256 MiB) — there is
 // no YAML knob to disable or tune it. Large values bypass the LSM main
 // path automatically; small values (< 4 KiB) remain inline in the SST.
+// These three rebuildable data CFs write without WAL; default/sketch keeps
+// WAL. Writable Close waits for data flushes and reports errors. A crash
+// can lose unflushed values, which become ordinary cache misses.
 type RocksConfig struct {
 	Path              string  `yaml:"path"`
-	DiskBytes         string  `yaml:"disk_bytes"`          // e.g. "1TiB"
+	DiskBytes         string  `yaml:"disk_bytes"`          // default "1TiB": BlockCache sizing and soft write-turnover aging; not a quota
 	MemRatio          float64 `yaml:"mem_ratio"`           // BlockCache = disk_bytes * mem_ratio
 	DirectReads       *bool   `yaml:"direct_reads"`        // default true
 	BloomBits         int     `yaml:"bloom_bits"`          // default 15
 	BlockSize         string  `yaml:"block_size"`          // e.g. "64KiB"
-	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB"
+	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB"; default CF only, with four buffers
 	MaxBackgroundJobs int     `yaml:"max_background_jobs"` // default 8
 }
 

@@ -124,7 +124,7 @@ rpc_timeout: ""                # 空/非法/非正数表示不设置请求 conte
                                # 正 Go duration 设置 context 预算,不能中断同步 CGO
 
 freq:
-  counters: 8M                 # 4-bit CMS 计数器;每个 active generation 约 4 MiB
+  counters: 8M                 # CMS 每行的 4-bit 计数器个数
   reset_after: 1M              # 次数触发 rolling decay
   reset_interval: 1h           # 低流量兜底:每小时 halving
   evict_threshold: 1           # CompactionFilter 淘汰阈值
@@ -132,7 +132,7 @@ freq:
 
 rocks:
   path: /var/cache/accel-l1
-  disk_bytes: 1TiB             # BlockCache 大小计算输入,不是强制磁盘配额
+  disk_bytes: 1TiB             # BlockCache 大小与写入周转老化预算,不是磁盘配额
   mem_ratio: 0.01              # 1 TiB × 1% = 10.24 GiB
   direct_reads: true
   bloom_bits: 15
@@ -386,13 +386,13 @@ Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉�
 
 | 参数/选项 | 默认 | 含义 |
 |---|---|---|
-| `disk_bytes` | 1 TiB | 大小计算输入,**不是强制磁盘配额** |
+| `disk_bytes` | 1 TiB | BlockCache 大小计算输入及每个 Sketch generation 的成功写入字节预算(§4.5),**不是强制磁盘配额** |
 | `mem_ratio` | 0.01 | 共享 BlockCache=disk_bytes×mem_ratio,最小 64 MiB |
 | `block_size` | 64 KiB | SST data block 大小 |
 | `bloom_bits` | 15 | 每 key Bloom 位数,实际假阳性率不是固定文档百分比 |
 | compression | none | 固定 RocksDB 选项;加密 chunk 已是高熵 |
 | `direct_reads` | true | 对支持的读取启用 UseDirectReads |
-| `write_buffer_bytes` | 256 MiB | write-buffer 大小配置输入 |
+| `write_buffer_bytes` | 256 MiB | 仅 default CF 的 write-buffer 大小,最多四个缓冲;三个数据 CF 保留引擎默认值 |
 | `max_background_jobs` | 8 | 用于最大 background compactions;实现另设 2 个 background flush |
 | compaction | leveled/default | 实际组织遵守底层配置 |
 | pin L0 filter/index | true | 同时设置 CacheIndexAndFilterBlocks 与 PinL0FilterAndIndexBlocksInCache,不表示所有 level metadata 永久 pin |
@@ -424,6 +424,19 @@ cache 淘汰按频率进行,不等于 store 的 generation 生命周期。
 
 大 value 在 LSM 中留下 key/blob reference，payload 追加到 blob 文件，可减少普通 key compaction 重写的大 value 数据。实际写放大取决于 key、RocksDB 格式、负载、compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O。
 
+#### 写入持久性与关闭
+
+chunk、manifest 和 blob CF 保存可重新获取的缓存值,固定关闭写入 WAL。default CF
+及其中的 `__freq_sketch__` 保留 WAL。这些是内部固定策略,没有对应 YAML 选项。
+Object 和 Shard fill 遵守相同持久性策略;关闭频率淘汰也不会改变它。
+
+正常 Close 排空请求、等待 Sketch 后台任务退出并持久化最终 Sketch,随后 native
+wrapper 等待三个数据 CF 分别 Flush 完成,再关闭 DB。Flush 失败会返回给调用方,
+同时仍释放 native 资源;并发 Close 返回同一个最终结果。只读 Close 不 Flush。
+非正常退出可能丢失尚未 Flush 的数据 CF 写入,重开后表现为普通 cache miss,可以重新
+获取。default CF 的 WAL/sync 设置不变;Fill 成功或尚未 Flush 的 Sketch checkpoint
+都不承诺已同步持久化到能够抵御掉电的程度。
+
 #### DirectReads
 
 UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
@@ -435,18 +448,35 @@ UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
 
 ### 4.5 频率统计与磁盘淘汰
 
-embedded RocksDB 在 Go 中维护 Count-Min Sketch。Get/Put Touch key;后台 compaction
-经 CGO 调用 filter 的 ShouldEvict。估计频率**小于或等于**阈值(默认 1)则删除。
+embedded RocksDB 在 Go 中维护 Count-Min Sketch。每次 Get(包括 miss)记录一次访问,
+成功的 Fill 或 FillShard 再记录一次。后台 compaction 经 CGO 调用 filter 的
+ShouldEvict,估计频率**小于或等于**阈值(默认 1)则删除。
 
-这不是容量执法:disk_bytes 不保证 compaction 清出足够空间避免磁盘写满,仍需单独观察
-使用量、写入错误和 compaction 行为。
+用于计算 BlockCache 大小的 `rocks.disk_bytes` 同时提供软老化预算。chunk、manifest
+和 blob CF 的成功写入按完整 value 长度累计到当前 Sketch generation。Shard 前缀
+计入字节数,重复写同一 key 也重新计数;失败写入、读取及 default CF 的 Sketch
+持久化不增加字节进度。这度量写入周转,不代表存活数据大小或物理磁盘使用量。
+
+成功写入字节达到 `disk_bytes`、访问次数达到 `freq.reset_after`,或显式配置的
+`freq.reset_interval` 定时器触发时,都会轮换 generation。每次轮换清零次数和字节
+两种进度。单次写入即使超过字节预算也最多轮换一代,超出进度不带入下一代。
+Get/Fill 原有的频率记账保持不变。
+
+轮换只改变淘汰资格,不直接删除 key 或发起 compaction。RocksDB 自然 compaction
+访问符合条件的 key 后删除它们,blob GC 可能稍后才回收物理空间。本策略不新增空闲
+扫描、磁盘用量轮询或强制 compaction,也不提供容量上限:`disk_bytes` 不保证清出
+足够空间避免磁盘写满。仍需独立观察物理用量、写入错误和 compaction 行为。
 
 ```text
-Get/Put:
+Get(包括 miss):
     sketch.Touch(key)            # 4 行 packed 4-bit counters
 
-reset_after 次 Touch 或 reset_interval:
+数据 CF 的 Fill/FillShard 成功后:
+    sketch.TouchBytes(key, len(value))
+
+写入达到 disk_bytes、访问达到 reset_after 或已配置的 reset_interval 触发:
     old active → previous;创建新的 active
+    清零新 generation 的次数与字节进度
     Estimate(key) = active estimate + previous estimate / 2
 
 chunk、manifest、blob CF 的后台 compaction:
@@ -465,17 +495,22 @@ filter 在 DB Open 前挂载,此时没有 sketch 且 armed=false,启动/recovery
 
 #### 冷启动保护
 
-未恢复历史时,旧 key 估计为 0,可能被 compaction 删除。为降低影响,active CMS
-generation 通常每 5 分钟及正常 Close 时写入保留 RocksDB key。重启只恢复 active,
-previous rolling generation 有意不持久化。
+未恢复历史时,旧 key 估计为 0,可能被 compaction 删除。active CMS generation
+在正常 Close 时写入 default CF 的保留 key;显式配置 `freq.persist_interval` 时
+也会周期持久化。现有版本 2 格式不变:重启只恢复 active,previous generation、
+访问次数进度和字节进度均不持久化。重开后两种进度都从零开始。
 
-这不是无条件冷启动宽限期或频率历史持久性保证。checkpoint 缺失、损坏或读取失败可留下
-全新 sketch,之后 filter 仍会 arm;持久化失败会记录日志。`freq.disable_eviction`
-可在部署明确需要关闭频率淘汰时保持 filter unarmed。
+这不是无条件冷启动宽限期或频率历史持久性保证。checkpoint 缺失、格式损坏或不兼容
+可留下全新 Sketch,之后 filter 仍会 arm;读取 checkpoint 时发生存储错误则使 Open
+失败,filter 保持 unarmed。后台持久化失败会记录日志;最终持久化及数据 Flush 失败
+由 Close 返回。`freq.disable_eviction` 可在部署明确需要关闭频率淘汰时保持 filter
+unarmed。
 
-#### CMS 默认参数
+#### CMS 配置 profile
 
-下表是文档中的 L1/L2 配置 profile。L2 数值需要显式配置,选择 shard 模式不会自动选中全部值。
+下表是显式配置的 L1/L2 profile,选择 shard 模式不会自动选中这些值。省略 `freq`
+时,Sketch 使用每行 8M counters、1M 次访问上限和阈值 1,同时使用 `disk_bytes`
+提供的字节预算;不启动 reset 定时器或周期持久化。正常 Close 仍持久化 Sketch。
 
 | 参数 | L1 | L2 |
 |---|---|---|
@@ -945,9 +980,10 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   miss/读盘不由该计数体现。看 shard 主机 `rd_iops` 等磁盘指标证明实际落盘。
 - **L3 建模**:`--cold-prefill N` 只写 origin,`--miss-ratio f` 让约 f 比例查询冷
   key。重复冷 key 经 fill-aside 变热,会降低实测回源率;冷池应大于窗口内预期冷读次数。
-- **aging/淘汰**:embedded 是频率式淘汰,不是 disk_bytes 配额。短窗 ops 远小于
-  reset_after 可能不触发次数衰减,但时间重置仍可能发生,一次访问的 key 也可能已在
-  阈值以内。用长窗与偏斜访问,观察实际 sketch/compaction,不能假定短测必不淘汰。
+- **aging/淘汰**:embedded 按频率历史淘汰,由成功写入字节、访问次数及显式配置的
+  reset 定时器推进老化(§4.5);`disk_bytes` 不是配额。访问次数未达到 `reset_after`
+  时,写入仍可能耗尽字节预算。记录 value 大小、重复 fill、热集合命中率和 compaction
+  行为;仅访问一次的 key 也可能已符合淘汰条件。逻辑删除与 blob 物理回收需分别观察。
 - **可能的瓶颈**:RAM-hot 读取可压满协调节点网络/拷贝/CPU,工作集落盘可压满 shard
   随机 I/O 并放大 quorum 尾延迟。EC 的 data shards 合计约一个对象的数据,另有 parity、
   hedge 与协议开销,不是固定 `value-size × data_shards` 个完整对象。

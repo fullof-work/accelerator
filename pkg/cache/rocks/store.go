@@ -65,7 +65,7 @@ func openImpl(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (*impl, error
 		return nil, fmt.Errorf("rocks: restore sketch: %w", getErr)
 	}
 	inst := &impl{db: db, cfh: cfIndexes()}
-	sketch := buildSketch(freqCfg, func(data []byte) {
+	sketch := buildSketch(freqCfg, diskBytes(cfg), func(data []byte) {
 		// No lifecycle lock: Close joins this goroutine before closing db.
 		if err := db.Put(native.Default, []byte(freq.ReservedSketchKey), data); err != nil {
 			log.Printf("rocks: background sketch persist failed: %v", err)
@@ -154,7 +154,10 @@ func (s *impl) put(ctx context.Context, ns string, key, value []byte) error {
 		return fmt.Errorf("rocks: put: %w", err)
 	}
 	if s.sketch != nil {
-		s.sketch.Touch(key)
+		// Successful object/shard payload drives soft frequency aging using
+		// the same disk budget as cache sizing. Overwrites count as writes;
+		// default-CF sketch persistence bypasses this data path.
+		s.sketch.TouchBytes(key, uint64(len(value)))
 	}
 	return nil
 }
@@ -274,14 +277,15 @@ func shardKey(key store.ContentKey) []byte {
 
 // buildSketch constructs a freq.Sketch from runtime.FreqConfig, applying
 // defaults for unset fields. A zero FreqConfig yields a Sketch with all
-// defaults — this is what cache-ctl bench and the test suite rely on.
+// frequency defaults; resetBytes is the existing Rocks disk budget, not
+// another user-selected frequency parameter.
 //
 // persistFn is forwarded directly to freq.Config.PersistFn. freq.New's
 // existing gate (PersistInterval > 0 && PersistFn != nil) decides
 // whether to start the background persistLoop goroutine — so passing
 // nil here (e.g. when persistence is disabled) is safe and keeps
 // behaviour identical to the pre-refactor "Close-only persist" path.
-func buildSketch(cfg runtime.FreqConfig, persistFn func([]byte)) *freq.Sketch {
+func buildSketch(cfg runtime.FreqConfig, resetBytes uint64, persistFn func([]byte)) *freq.Sketch {
 	counters := parseCountWithDefault(cfg.Counters, freq.DefaultCounters)
 	resetAfter := parseCountWithDefault(cfg.ResetAfter, freq.DefaultResetAfter)
 	resetInterval, _ := time.ParseDuration(cfg.ResetInterval)
@@ -293,6 +297,7 @@ func buildSketch(cfg runtime.FreqConfig, persistFn func([]byte)) *freq.Sketch {
 	return freq.New(freq.Config{
 		Counters:        counters,
 		ResetAfter:      resetAfter,
+		ResetBytes:      resetBytes,
 		ResetInterval:   resetInterval,
 		EvictThreshold:  threshold,
 		PersistInterval: persistInterval,
