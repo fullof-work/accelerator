@@ -337,21 +337,11 @@ func (h *PutHandle) Commit(key store.ContentKey, verifyDigest store.ContentKey) 
 		return false, h.fail(fmt.Errorf("fs: sync object parent: %w", err))
 	}
 
-	current, err := h.store.ops.lstat(h.finalPath)
-	if err == nil && os.SameFile(h.identity, current) {
-		return true, nil
-	}
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return false, fmt.Errorf("fs: confirm final object %s: %w", h.finalPath, err)
-	}
-	_, exists, valid, inspectErr := h.store.inspectTarget(h.finalPath, h.expected)
-	if inspectErr != nil {
-		return false, inspectErr
-	}
-	if exists && valid {
-		return false, nil
-	}
-	return false, fmt.Errorf("fs: final path %s no longer identifies the committed file and replacement is invalid", h.finalPath)
+	// Completion belongs to this upload, not to a read-after-write observation
+	// of the shared final path. Another same-key writer may replace that path,
+	// and remote/shared filesystems need not expose current metadata immediately.
+	// Pre-upload dedup handles return false; this handle completed a real write.
+	return true, nil
 }
 
 func (h *PutHandle) fail(primary error) error {

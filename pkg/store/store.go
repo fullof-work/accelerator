@@ -106,7 +106,9 @@ type PutHandle interface {
 	// Commit closes the handle and verifies the streamed bytes against
 	// verifyDigest when the caller requested verification. Concrete
 	// handles also reject a key different from the key bound by OpenPut.
-	// Returns isNew=false when another writer won a dedup race.
+	// Returns isNew=false for a pre-upload dedup hit, or true when this
+	// handle completed a new write. Success does not require an immediate
+	// read-after-write confirmation or exclusive ownership of the final path.
 	Commit(key ContentKey, verifyDigest ContentKey) (isNew bool, err error)
 
 	// Abort discards buffered data or removes a directly written file

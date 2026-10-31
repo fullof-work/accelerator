@@ -221,13 +221,13 @@ The object path is:
 
 The direct-write handle records the final path, created-file identity, generation, partition, key, optional size and actual byte count. Write writes directly to the final descriptor and prohibits overflow when size is known.
 
-Abort, digest mismatch, length errors, and Write/Sync/Close failures first check whether the path still identifies the file created by the handle; only its owner may delete it. Successful Commit performs file Sync, Close and parent-directory synchronization, then confirms identity again. If another writer has replaced the path:
+Abort, digest mismatch, length errors, and Write/Sync/Close failures check whether the path still identifies the file created by the handle before removing it. A changed or absent path is left alone. This identity check and pathname removal are separate operations, not an atomic cross-process ownership protocol.
 
-- If the replacement satisfies optional-size/existence rules, the loser returns `isNew=false`.
-- If the replacement is invalid, missing or cannot be confirmed, the loser returns an error.
-- The loser never deletes another writer's file.
+Successful Commit validates the bound key, received length and supplied streaming digest, then performs file Sync, Close and parent-directory synchronization. It returns `isNew=true` after those operations succeed, without a final-path Lstat, Get or replacement check. The upload protocol accepts eventual consistency: write completion must not depend on immediate read-after-write visibility or on which same-key writer currently owns the path. Real validation, write and synchronization failures remain errors.
 
-This concurrency decision needs no process-wide lock and supports multiple writers competing for the same content key.
+`isNew=false` means a pre-upload dedup hit (including an OpenPut no-op handle); `isNew=true` means this upload completed a real write, not that it is the unique retained copy. Concurrent same-key uploads can therefore both return true. Stored-byte/chunk and dedup counters describe these outcomes, not unique physical occupancy. S3 follows the same completion rule: a pre-upload HEAD may deduplicate, but a successful PutObject is not followed by a confirming HEAD/Get.
+
+No process-local or cross-process serialization, upload replay, temporary file, rename or completion marker is added.
 
 <a id="41-可见性与故障边界"></a>
 ### 4.1 Visibility and failure boundaries
@@ -240,6 +240,7 @@ Direct-final-write does not provide crash-atomic publication or an equivalent gu
 - A later same-size Put can recognize and replace a wrong-size file left by a crash.
 - Size alone cannot distinguish a leftover file that reached full size but was not yet persisted.
 - Without size, an incomplete file can count as existing.
+- Objects used for dedup remain revocable. Another writer can unlink an in-progress inode; that inode's successful Sync/Close does not restore its final pathname. If the replacement later aborts or fails validation and is removed, the object can be genuinely absent, not merely temporarily invisible. The same boundary already applies to a pre-upload dedup hit whose object is subsequently removed. Commit does not wait for another writer, promise permanent retention, or change subsequent Get/verification behavior.
 
 These boundaries follow from writing directly to the final path without adding a separate object-completion marker.
 

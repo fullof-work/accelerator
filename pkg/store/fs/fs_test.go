@@ -264,8 +264,8 @@ func TestConcurrentWritersSameKeyOwnership(t *testing.T) {
 		t.Fatalf("writer B = %v, %v; want new", resultB, errorB)
 	}
 	resultA, err := handleA.Commit(key, key)
-	if err != nil || resultA {
-		t.Fatalf("writer A = %v, %v; want dedup", resultA, err)
+	if err != nil || !resultA {
+		t.Fatalf("writer A = %v, %v; want completed direct write", resultA, err)
 	}
 	found, got, err := backend.Get(context.Background(), testGeneration, store.PartitionChunk, key)
 	if err != nil || !found || !bytes.Equal(got, data) {
@@ -273,7 +273,7 @@ func TestConcurrentWritersSameKeyOwnership(t *testing.T) {
 	}
 }
 
-func TestLoserErrorsWhileReplacementStillInvalid(t *testing.T) {
+func TestCompletedWriteSucceedsWhileReplacementStillInFlight(t *testing.T) {
 	backend, _ := newTestStore(t)
 	data := []byte("complete payload")
 	key := contentKey(data)
@@ -286,8 +286,8 @@ func TestLoserErrorsWhileReplacementStillInvalid(t *testing.T) {
 	}
 	_, _ = handleA.Write(data[1:])
 	_, _ = handleB.Write(data[:1])
-	if isNew, err := handleA.Commit(key, key); err == nil || isNew {
-		t.Fatalf("loser Commit = %v, %v; want invalid replacement error", isNew, err)
+	if isNew, err := handleA.Commit(key, key); err != nil || !isNew {
+		t.Fatalf("completed write Commit = %v, %v; want success independent of replacement", isNew, err)
 	}
 	if _, err := handleB.Write(data[1:]); err != nil {
 		t.Fatal(err)

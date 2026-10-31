@@ -259,15 +259,22 @@ Store `Get` 只执行一次业务读取。失败 stream 会被取消/释放，�
 直接写 handle 记录最终路径、创建后的 identity、generation、partition、key、
 optional size 和实际字节数。Write 直接写最终 fd，已知 size 时禁止越界。
 
-Abort、digest mismatch、长度错误以及 Write/Sync/Close 失败，都先检查路径是否仍
-指向 handle 创建的同一文件；只有 owner 才能删除。成功 Commit 执行文件 Sync、
-Close 和父目录同步，然后再次确认 identity。如果路径已被另一 writer 替换：
+Abort、digest mismatch、长度错误以及 Write/Sync/Close 失败，会先检查路径是否仍
+指向 handle 创建的同一文件，再执行删除；路径已替换或消失时不处理该路径。
+identity 检查和按路径删除是两个操作，不构成跨进程原子的 ownership 协议。
 
-- 替换目标满足 optional size/存在规则：loser 返回 `isNew=false`。
-- 替换目标仍无效、消失或无法确认：loser 返回错误。
-- loser 不删除另一 writer 的文件。
+成功 Commit 校验绑定的 key、接收长度及传入的流式摘要，然后执行文件 Sync、Close
+和父目录同步。这些操作成功后返回 `isNew=true`，不再对最终路径执行 Lstat、Get 或
+替换目标检查。上传协议接受最终一致性：写入完成不依赖写后立即可读，也不依赖此时
+哪个同 key writer 拥有最终路径。真实的校验、写入及同步失败仍返回错误。
 
-该并发判定不依赖进程内全局锁，适用于多个 writer 竞争同一个 content key。
+`isNew=false` 表示上传前 dedup 命中（包括 OpenPut 的 no-op handle）；`isNew=true`
+表示本次上传完成了实际写入，不表示它是唯一保留的副本。因此，并发同 key 上传可以
+都返回 true。stored bytes/chunks 及 dedup 计数描述这些操作结果，而非唯一物理占用。
+S3 使用相同的完成规则：上传前 HEAD 可去重，但 PutObject 成功后不会再执行确认用的
+HEAD/Get。
+
+不新增进程内或跨进程序列化、上传重放、临时文件、rename 或 completion marker。
 
 ### 4.1 可见性与故障边界
 direct-final-write 不提供 crash-atomic publication，也不作等价承诺：
@@ -279,6 +286,10 @@ direct-final-write 不提供 crash-atomic publication，也不作等价承诺：
 - 崩溃留下的大小不一致文件可由后续同 size Put 识别并覆盖。
 - 恰好达到完整大小但尚未持久化的残留，仅凭大小无法区分。
 - 未提供 size 时，不完整文件也可能被当作存在。
+- 用于 dedup 的对象仍可被撤销。另一 writer 可以 unlink 在途 inode；该 inode 的
+  Sync/Close 成功不会恢复其最终路径。如果替换 writer 随后 Abort 或校验失败并清理
+  文件，对象可能真实缺失，而不只是暂时不可见。上传前 dedup 命中的对象随后被删除时，
+  也存在同样边界。Commit 不等待另一 writer、不承诺永久保留，也不改变后续 Get/校验行为。
 
 这些边界来自“最终路径直接写入且不增加额外对象完成标志”的设计选择。
 
